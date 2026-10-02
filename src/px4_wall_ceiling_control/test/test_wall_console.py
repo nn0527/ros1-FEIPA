@@ -205,7 +205,8 @@ class ConsoleTests(unittest.TestCase):
         runtime.state = self.state
         runtime.ros = mock.Mock()
         runtime.ros.get_param.return_value = DEFAULT_CONFIG["fcu_port"] + ":" + str(DEFAULT_CONFIG["baud"])
-        with mock.patch.object(server.threading, "Thread") as thread:
+        with mock.patch.object(server.threading, "Thread") as thread, \
+             mock.patch.object(runtime, "inspect_runtime", return_value={"enabled": True}):
             reply = runtime.start(DEFAULT_CONFIG)
         self.assertIn("无需重复启动", reply["message"])
         self.assertEqual(self.state.launch_error, "")
@@ -216,8 +217,21 @@ class ConsoleTests(unittest.TestCase):
         self.state.update("runtime", {"enabled": False})
         runtime = object.__new__(server.RemoteRuntime)
         runtime.state = self.state
-        with mock.patch.object(server.threading, "Thread") as thread, self.assertRaisesRegex(ValueError, "未解锁"):
+        runtime.ros = None
+        with mock.patch.object(runtime, "nodes", return_value=set()), \
+             mock.patch.object(server.threading, "Thread") as thread, self.assertRaisesRegex(ValueError, "未解锁"):
             runtime.start(DEFAULT_CONFIG)
+        thread.assert_not_called()
+
+    def test_reconnect_start_inspects_existing_nodes_before_first_monitor_tick(self):
+        self.ready()
+        self.state.update("runtime", {"enabled": False})
+        runtime = self.telemetry_runtime()
+        runtime.ros.get_param.return_value = DEFAULT_CONFIG["fcu_port"] + ":" + str(DEFAULT_CONFIG["baud"])
+        with mock.patch.object(runtime, "inspect_runtime", return_value={"enabled": True}) as inspect, \
+             mock.patch.object(server.threading, "Thread") as thread:
+            self.assertIn("无需重复启动", runtime.start(DEFAULT_CONFIG)["message"])
+        inspect.assert_called_once()
         thread.assert_not_called()
 
     def test_lidar_startup_resets_both_measurements_only_while_disarmed(self):

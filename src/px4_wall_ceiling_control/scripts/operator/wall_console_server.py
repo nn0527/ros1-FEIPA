@@ -189,29 +189,32 @@ class RemoteRuntime:
                 self.last_warning = now
                 self.state.event(msg.name + ": " + msg.msg[:350], "error" if msg.level >= 8 else "warning")
 
-    def monitor(self):
+    def inspect_runtime(self):
         required = {"/mavros", "/terminal_operator_node", "/flight_mode_manager_node",
                     "/attachment_output_mux_node", "/wall_perch_decision_node", "/sensor_range_manager_node",
                     "/ceiling_lidar_node", "/front_lidar_node"}
+        nodes = self.nodes()
+        wall_bench = bool(self.ros.get_param("/wall_perch_decision_node/bench_wait_for_ranges", False))
+        manager_bench = bool(self.ros.get_param("/flight_mode_manager_node/wall_bench_wait_for_ranges", False))
+        enabled = (required <= nodes and self.ros.get_param("/flight_mode_manager_node/enabled", False)
+                   and wall_bench == manager_bench
+                   and self.ros.get_param("/attachment_output_mux_node/output_enabled", False)
+                   and self.ros.get_param("/wall_perch_decision_node/decision_enabled", False)
+                   and not self.ros.get_param("/flight_mode_manager_node/require_rc_center", False)
+                   and not self.ros.get_param("/attachment_output_mux_node/rc_assist_enabled", False)
+                   and not (nodes & {"/ceiling_attachment_decision_node", "/ceiling_motor_bench_output_node",
+                                    "/flight_supervisor_node", "/setpoint_mux_node", "/ceiling_attachment_output_node"}))
+        profile = "restrained_bench" if wall_bench and manager_bench else "flight"
+        with self.state.lock:
+            if required <= nodes:
+                self.state.config["test_profile"] = profile
+        return {"enabled": bool(enabled), "test_profile": profile, "nodes": sorted(nodes),
+                "missing": sorted(required - nodes), "logger": "/attachment_flight_logger" in nodes}
+
+    def monitor(self):
         while not self.ros.is_shutdown():
             try:
-                nodes = self.nodes()
-                wall_bench = bool(self.ros.get_param("/wall_perch_decision_node/bench_wait_for_ranges", False))
-                manager_bench = bool(self.ros.get_param("/flight_mode_manager_node/wall_bench_wait_for_ranges", False))
-                enabled = (required <= nodes and self.ros.get_param("/flight_mode_manager_node/enabled", False)
-                           and wall_bench == manager_bench
-                           and self.ros.get_param("/attachment_output_mux_node/output_enabled", False)
-                           and self.ros.get_param("/wall_perch_decision_node/decision_enabled", False)
-                           and not self.ros.get_param("/flight_mode_manager_node/require_rc_center", False)
-                           and not self.ros.get_param("/attachment_output_mux_node/rc_assist_enabled", False)
-                           and not (nodes & {"/ceiling_attachment_decision_node", "/ceiling_motor_bench_output_node",
-                                            "/flight_supervisor_node", "/setpoint_mux_node", "/ceiling_attachment_output_node"}))
-                profile = "restrained_bench" if wall_bench and manager_bench else "flight"
-                with self.state.lock:
-                    if required <= nodes:
-                        self.state.config["test_profile"] = profile
-                self.state.update("runtime", {"enabled": bool(enabled), "test_profile": profile, "nodes": sorted(nodes),
-                    "missing": sorted(required - nodes), "logger": "/attachment_flight_logger" in nodes})
+                self.state.update("runtime", self.inspect_runtime())
                 for name, child in list(self.children.items()):
                     if child.poll() is not None and not self.state.starting:
                         self.state.launch_error = name + " 已退出，请查看启动日志"
@@ -221,9 +224,15 @@ class RemoteRuntime:
 
     def start(self, config):
         config = validate_config(config)
+        # After SSH reconnection, inspect the already-running nodes before
+        # the first monitor tick; never attempt a duplicate launch.
+        if self.ros is None and self.nodes():
+            self.init_ros()
         with self.state.lock:
             if self.state.starting:
                 return {"message": "基础程序正在启动"}
+            if self.ros is not None:
+                self.state.update("runtime", self.inspect_runtime())
             if self.state.snapshot()["status"]["runtime"]["fresh"] and self.state.snapshot()["status"]["runtime"]["value"].get("enabled"):
                 if self.state.config != config:
                     raise ValueError("基础程序正在运行，当前页面不支持在运行中变更配置")
