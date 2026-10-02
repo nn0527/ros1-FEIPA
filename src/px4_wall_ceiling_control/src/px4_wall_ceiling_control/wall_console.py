@@ -7,7 +7,7 @@ import time
 
 
 DEFAULT_CONFIG = {
-    "fcu_port": "/dev/ttyUSB0", "baud": 921600,
+    "fcu_port": "/dev/ttyUSB0", "baud": 230400,
     "ceiling_port": "/dev/ttyUSB1", "front_port": "/dev/ttyUSB2",
     "hover_thrust": 0.45,
 }

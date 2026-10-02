@@ -95,6 +95,23 @@ class RemoteRuntime:
                 pass
             time.sleep(1)
 
+    def configure_telemetry(self):
+        # Lower serial bandwidth scales PX4's default 1 Hz estimator stream
+        # below the existing freshness limit. Request more samples, keeping
+        # the controller's timeout unchanged. Never configure an armed FCU.
+        def require_disarmed():
+            flight = self.state.snapshot()["status"]["state"]
+            if not flight["fresh"] or not flight["value"].get("connected") or flight["value"].get("armed"):
+                raise ValueError("遥测配置要求新鲜、已连接且未解锁的飞控状态")
+        require_disarmed()
+        from mavros_msgs.srv import MessageInterval
+        self.ros.wait_for_service("/mavros/set_message_interval", timeout=3)
+        require_disarmed()
+        request = self.ros.ServiceProxy("/mavros/set_message_interval", MessageInterval)
+        if not request(message_id=230, message_rate=5.0).success:
+            raise ValueError("飞控未确认估计器遥测频率，请查看 MAVROS 日志后重试")
+        self.state.event("已请求 ESTIMATOR_STATUS 5 Hz；实际频率仍由飞控链路带宽决定")
+
     def init_ros(self):
         # Only one thread initializes rospy, including a concurrent start request.
         with self.init_lock:
@@ -198,6 +215,12 @@ class RemoteRuntime:
             if self.state.snapshot()["status"]["runtime"]["fresh"] and self.state.snapshot()["status"]["runtime"]["value"].get("enabled"):
                 if self.state.config != config:
                     raise ValueError("基础程序正在运行，当前页面不支持在运行中变更配置")
+                url = config["fcu_port"] + ":" + str(config["baud"])
+                if self.ros.get_param("/mavros/fcu_url", "") != url:
+                    raise ValueError("已运行 MAVROS 的串口配置与页面不一致")
+                flight = self.state.snapshot()["status"]["state"]
+                if flight["fresh"] and flight["value"].get("connected") and not flight["value"].get("armed"):
+                    self.configure_telemetry()
                 self.state.launch_error = ""
                 return {"message": "基础程序已运行，无需重复启动"}
             flight = self.state.snapshot()["status"]["state"]
@@ -247,6 +270,7 @@ class RemoteRuntime:
                 if time.monotonic() > deadline:
                     raise ValueError("MAVROS 连接超时，检查飞控串口、波特率与心跳")
                 time.sleep(0.2)
+            self.configure_telemetry()
             self.prepare_lidars()
             # Starting sensors takes time; recheck before creating output nodes.
             item = self.state.snapshot()["status"]["state"]

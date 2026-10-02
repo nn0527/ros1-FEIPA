@@ -22,6 +22,31 @@ spec.loader.exec_module(server)
 
 
 class ConsoleTests(unittest.TestCase):
+    def telemetry_runtime(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = self.state
+        runtime.ros = mock.Mock()
+        return runtime
+
+    def test_telemetry_configuration_rechecks_disarmed_after_service_wait(self):
+        runtime = self.telemetry_runtime()
+        self.state.update("state", {"connected": True, "armed": False, "mode": "ALTCTL"})
+        runtime.ros.wait_for_service.side_effect = lambda *a, **k: self.state.update(
+            "state", {"connected": True, "armed": True, "mode": "ALTCTL"})
+        with mock.patch.dict(sys.modules, {"mavros_msgs.srv": SimpleNamespace(MessageInterval=object)}):
+            with self.assertRaises(ValueError):
+                runtime.configure_telemetry()
+        runtime.ros.ServiceProxy.assert_not_called()
+
+    def test_telemetry_configuration_requires_fcu_confirmation(self):
+        runtime = self.telemetry_runtime()
+        self.state.update("state", {"connected": True, "armed": False, "mode": "ALTCTL"})
+        runtime.ros.ServiceProxy.return_value.return_value.success = False
+        with mock.patch.dict(sys.modules, {"mavros_msgs.srv": SimpleNamespace(MessageInterval=object)}):
+            with self.assertRaises(ValueError):
+                runtime.configure_telemetry()
+        runtime.ros.ServiceProxy.return_value.assert_called_once_with(message_id=230, message_rate=5.0)
+
     def test_bridge_keeps_catkin_generated_messages_importable(self):
         # Reproduce a sourced Catkin workspace in a fresh interpreter. Importing
         # the bridge must not shadow its relay with the plain source package.
@@ -152,6 +177,8 @@ class ConsoleTests(unittest.TestCase):
         self.state.launch_error = "上一次失败的启动错误"
         runtime = object.__new__(server.RemoteRuntime)
         runtime.state = self.state
+        runtime.ros = mock.Mock()
+        runtime.ros.get_param.return_value = DEFAULT_CONFIG["fcu_port"] + ":" + str(DEFAULT_CONFIG["baud"])
         with mock.patch.object(server.threading, "Thread") as thread:
             reply = runtime.start(DEFAULT_CONFIG)
         self.assertIn("无需重复启动", reply["message"])
