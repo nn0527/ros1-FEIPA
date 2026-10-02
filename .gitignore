@@ -1,18 +1,37 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+/build/
+/devel/
+/logs/
+*.bag
+*.bag.active
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
-# Other files and folders
-.settings/
+# Archived catkin build outputs
+/build.*/
+/devel.*/
+/install/
+/install.*/
+/log/
+*.log
 
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
+# Generated runtime captures and telemetry
+/runtime/*.json
+/runtime/telemetry_live.html
+/runtime/telemetry-*.png
 
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+# Local credentials and editor state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.vscode/
+.idea/
+
+# Local Python environments
+.venv/
+.venv-*/
+venv/
+env/
+
