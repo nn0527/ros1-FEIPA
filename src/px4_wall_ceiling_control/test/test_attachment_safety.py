@@ -942,6 +942,38 @@ class AttachmentSafetyTest(unittest.TestCase):
         node._update_state_machine(now)
         self.assertEqual(node.state, WallPerchStatus.STATE_EXIT)
 
+    def test_bench_departure_safety_does_not_depend_on_either_radar(self):
+        node = WallDecision.__new__(WallDecision)
+        node.bench_wait_for_ranges = True
+        node._flight_ready = node._odom_fresh = lambda _now: True
+        node._front_fresh = node._top_fresh = lambda _now: False
+        node._rates_safe = lambda _limit: True
+        node._vertical_speed_safe = lambda: True
+        node.recover_max_rate_rps = 3.0
+        node.sensor_health = None
+        node.max_rate_rps = 3.0
+        for state in (WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER,
+                      WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT):
+            node.state = state
+            self.assertTrue(node._safety_ok(rospy.Time.from_sec(10.0)))
+
+    def test_bench_approach_pauses_on_invalid_range_without_flipping(self):
+        node = WallDecision.__new__(WallDecision)
+        node.state = WallPerchStatus.STATE_SLOW_APPROACH
+        node.bench_wait_for_ranges = True
+        node.cancel_requested = False
+        node._mode_requested = lambda _now: True
+        node._safety_ok = lambda _now: True
+        node._bench_ranges_ready = lambda _now: False
+        node._enter_state = mock.Mock()
+        now = rospy.Time.from_sec(10.0)
+        node._update_state_machine(now)
+        self.assertEqual(node.state, WallPerchStatus.STATE_SLOW_APPROACH)
+        node._enter_state.assert_not_called()
+        self.assertTrue(node._candidate(now)[0])
+        self.assertIsNone(node._candidate(now)[1])
+        self.assertIsNone(node.flip_ready_since)
+
     def test_exit_holds_output_until_fcu_leaves_offboard(self):
         node = WallDecision.__new__(WallDecision)
         now = rospy.Time.from_sec(10.0)

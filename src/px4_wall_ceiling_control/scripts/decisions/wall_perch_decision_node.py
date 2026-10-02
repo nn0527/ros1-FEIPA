@@ -729,7 +729,8 @@ class WallPerchDecisionNode:
 
     def _bench_waiting(self):
         return bool(getattr(self, "bench_wait_for_ranges", False) and self.state in (
-            WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_FRONT_WALL_DETECT))
+            WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_FRONT_WALL_DETECT,
+            WallPerchStatus.STATE_SLOW_APPROACH))
 
     def _bench_ranges_ready(self, now):
         return bool(self._sensor_health_fresh(now) and self.sensor_health.front_valid
@@ -1080,6 +1081,10 @@ class WallPerchDecisionNode:
             if not self._safety_ok(now):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "approach safety failure")
+            elif self._bench_waiting() and not self._bench_ranges_ready(now):
+                self.last_reason = "台架接近暂停：等待两路有效距离，不凭无效距离触发翻转"
+                self.state_entered_at = now
+                self.flip_ready_since = self.flip_ready_last_sample_at = None
             elif self._state_age(now) > self.approach_timeout_s:
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "approach timeout")
@@ -1199,6 +1204,9 @@ class WallPerchDecisionNode:
                 self._enter_state(WallPerchStatus.STATE_EXIT, now, "abort recovery complete")
 
     def _candidate(self, now):
+        if (self.state == WallPerchStatus.STATE_SLOW_APPROACH
+                and self._bench_waiting() and not self._bench_ranges_ready(now)):
+            return True, None, math.nan, 0.0
         neutral = self.state in (
             WallPerchStatus.STATE_FRONT_WALL_DETECT,
             WallPerchStatus.STATE_STABILIZE_HOVER,
