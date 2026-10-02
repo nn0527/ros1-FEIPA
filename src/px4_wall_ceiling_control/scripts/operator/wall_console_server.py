@@ -162,6 +162,7 @@ class RemoteRuntime:
                       "front": ("/sensor/front/range", Range), "ceiling": ("/sensor/ceiling/range", Range),
                       "front_diagnostic": ("/sensor/front/diagnostic", String),
                       "ceiling_diagnostic": ("/sensor/ceiling/diagnostic", String),
+                      "kill": ("/attachment/kill_switch", String),
                       "setpoint": ("/mavros/setpoint_raw/attitude", AttitudeTarget), "battery": ("/mavros/battery", BatteryState)}
             self.subscriptions = [rospy.Subscriber(topic, kind, self.callback, callback_args=name,
                                     queue_size=1, tcp_nodelay=True) for name, (topic, kind) in topics.items()]
@@ -183,8 +184,9 @@ class RemoteRuntime:
             value = {key: getattr(msg, key) for key in ("state_name", "reason", "progress", "fault_detected",
                       "front_distance_filtered_m", "top_distance_filtered_m", "thrust_normalized", "top_contact_ready",
                       "altitude_reference_valid", "height_above_takeoff_m", "min_entry_height_m", "entry_height_ready",
-                      "hold_achieved", "reached_state_name", "detach_ready", "detach_completed")}
-        elif name in ("front_diagnostic", "ceiling_diagnostic"):
+                      "hold_achieved", "reached_state_name", "detach_ready", "detach_completed",
+                      "detach_pending", "detach_block_reason")}
+        elif name in ("front_diagnostic", "ceiling_diagnostic", "kill"):
             value = json.loads(msg.data)
         elif name in ("phase", "reason", "owner"):
             value = msg.data
@@ -225,6 +227,9 @@ class RemoteRuntime:
         wall_bench = bool(self.ros.get_param("/wall_perch_decision_node/bench_wait_for_ranges", False))
         manager_bench = bool(self.ros.get_param("/flight_mode_manager_node/wall_bench_wait_for_ranges", False))
         enabled = (required <= nodes and self.ros.get_param("/flight_mode_manager_node/enabled", False)
+                   and all(self.ros.get_param(name + "/kill_guard_enabled", False) for name in
+                           ("/terminal_operator_node", "/flight_mode_manager_node",
+                            "/attachment_output_mux_node", "/wall_perch_decision_node"))
                    and wall_bench == manager_bench
                    and self.ros.get_param("/attachment_output_mux_node/output_enabled", False)
                    and self.ros.get_param("/wall_perch_decision_node/decision_enabled", False)
@@ -357,7 +362,7 @@ class RemoteRuntime:
                 raise ValueError("终端指令节点未订阅，消息未发送")
             self.publisher.publish(command)
         self.state.send_detach(publish)
-        return {"message": "detach 已发送，等待离墙阶段反馈"}
+        return {"message": "离墙请求已发送；控制节点等待连续稳定后旋转，8 秒未满足会取消"}
 
 
 def bridge_main():
@@ -466,19 +471,20 @@ class SSHTransport:
                 if item["age_s"] is not None:
                     item["age_s"] += age or 0
                     item["fresh"] = connected and item["age_s"] <= item["limit_s"]
-            required_feedback = ("runtime", "state", "odom", "estimator", "operator", "phase", "owner", "wall")
+            required_feedback = ("runtime", "state", "odom", "estimator", "operator", "phase", "owner", "wall", "kill")
             if config["test_profile"] != "restrained_bench":
                 required_feedback += ("health",)
             stale = any(not result["status"][n]["fresh"] for n in required_feedback)
             check_sources = {"runtime": ("runtime",), "connected": ("state",), "armed": ("state",),
                              "mode": ("state",), "odom": ("odom",), "estimator": ("estimator",),
+                             "kill": ("kill",),
                              "health": () if config["test_profile"] == "restrained_bench" else ("health",),
                              "height": () if config["test_profile"] == "restrained_bench" else ("wall", "odom"), "idle": ("phase", "owner", "operator")}
             for check in result["checks"]:
                 if any(not result["status"][name]["fresh"] for name in check_sources.get(check["id"], ())):
                     check["ok"] = False
             if stale and connected:
-                labels = {"runtime": "基础程序", "state": "飞控心跳", "odom": "里程计", "estimator": "估计器", "health": "雷达", "operator": "操作节点", "phase": "控制阶段", "owner": "输出归属", "wall": "贴墙决策"}
+                labels = {"runtime": "基础程序", "state": "飞控心跳", "odom": "里程计", "estimator": "估计器", "health": "雷达", "operator": "操作节点", "phase": "控制阶段", "owner": "输出归属", "wall": "贴墙决策", "kill": "急停开关"}
                 stale_reasons = [labels[name] + "反馈缺失或已过期" for name in required_feedback if not result["status"][name]["fresh"]]
                 result["blockers"] = list(dict.fromkeys(result["blockers"] + stale_reasons))
             if not result["status"]["wall"]["fresh"] or not result["status"]["setpoint"]["fresh"]:

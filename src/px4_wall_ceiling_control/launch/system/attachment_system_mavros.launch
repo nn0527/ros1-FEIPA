@@ -41,6 +41,7 @@
   <arg name="hover_thrust" default="0.45" />
   <!-- Passive recording is independent of all flight-control nodes. -->
   <arg name="record_logs" default="true" />
+  <arg name="kill_guard_enabled" default="false" />
   <arg name="test_log_directory" default="$(env HOME)/wall_test_records" />
   <arg name="node_output" default="log" />
 
@@ -81,10 +82,13 @@
         name="operator_gate_node" output="$(arg node_output)" />
   <node if="$(eval arg('operator_source') == 'terminal')"
         pkg="px4_wall_ceiling_control" type="terminal_operator_node.py"
-        name="terminal_operator_node" output="screen" />
+        name="terminal_operator_node" output="screen">
+    <param name="kill_guard_enabled" value="$(arg kill_guard_enabled)" />
+  </node>
 
   <node pkg="px4_wall_ceiling_control" type="flight_mode_manager_node.py"
         name="flight_mode_manager_node" output="$(arg node_output)">
+    <param name="kill_guard_enabled" value="$(arg kill_guard_enabled)" />
     <param name="enabled" value="$(arg flight_mode_enabled)" />
     <param name="wall_bench_wait_for_ranges" value="$(arg wall_bench_wait_for_ranges)" />
     <param name="estimator_timeout_s"
@@ -115,6 +119,7 @@
   <node if="$(arg wall_enabled)"
         pkg="px4_wall_ceiling_control" type="wall_perch_decision_node.py"
         name="wall_perch_decision_node" output="$(arg node_output)">
+    <param name="kill_guard_enabled" value="$(arg kill_guard_enabled)" />
     <param name="decision_enabled" value="true" />
     <param name="hold_time_s" value="$(arg wall_hold_time_s)" />
     <param name="min_altitude_m" value="$(arg wall_min_altitude_m)" />
@@ -127,6 +132,7 @@
 
   <node pkg="px4_wall_ceiling_control" type="attachment_output_mux_node.py"
         name="attachment_output_mux_node" output="$(arg node_output)">
+    <param name="kill_guard_enabled" value="$(arg kill_guard_enabled)" />
     <param name="output_enabled" value="$(arg output_enabled)" />
     <param name="state_timeout_s" value="$(arg flight_state_timeout_s)" />
     <param name="ceiling_output_enabled" value="$(arg ceiling_enabled)" />

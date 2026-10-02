@@ -14,6 +14,7 @@ from mavros_msgs.msg import EstimatorStatus, RCIn, State
 from mavros_msgs.srv import SetMode, SetModeRequest
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, String, UInt8
+from px4_wall_ceiling_control.adapters.kill_switch import install_kill_guard, kill_clear
 
 from px4_wall_ceiling_control.adapters.odometry import (
     odometry_is_finite,
@@ -38,6 +39,7 @@ class FlightModeManagerNode:
     LOCKED = "LOCKED"
 
     def __init__(self):
+        install_kill_guard(self, rospy, String)
         self.enabled = bool(rospy.get_param("~enabled", False))
         self.prestream_s = max(1.2, float(rospy.get_param("~prestream_s", 1.5)))
         self.retry_s = max(1.0, float(rospy.get_param("~retry_s", 2.0)))
@@ -411,6 +413,8 @@ class FlightModeManagerNode:
     def _send_mode_request(self, mode):
         try:
             rospy.wait_for_service("/mavros/set_mode", timeout=0.2)
+            if not kill_clear(self, rospy.Time.now()):
+                return
             if mode == "OFFBOARD":
                 if (
                     self.phase != self.ENTERING
@@ -447,6 +451,12 @@ class FlightModeManagerNode:
 
     def _on_timer(self, _event):
         now = rospy.Time.now()
+        if not kill_clear(self, now):
+            self._reset(lock=True, reason="kill switch active or unavailable")
+            self.prestream_pub.publish(Bool(data=False))
+            self.phase_pub.publish(String(data=self.phase))
+            self.phase_reason_pub.publish(String(data=self.phase_reason))
+            return
         monotonic_now = time.monotonic()
         requested = self._requested_mode(now)
         flight_mode = self.flight.mode.upper() if self.flight else ""

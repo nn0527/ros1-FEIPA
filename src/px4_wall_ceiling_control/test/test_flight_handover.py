@@ -9,7 +9,7 @@ from unittest import mock
 
 import rospy
 from geometry_msgs.msg import Quaternion
-from mavros_msgs.msg import AttitudeTarget, EstimatorStatus, State
+from mavros_msgs.msg import AttitudeTarget, EstimatorStatus, State, RCIn
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
 
@@ -535,6 +535,49 @@ class FlightHandoverTest(unittest.TestCase):
             "minimum altitude gate blocked: z=-1.960 m <= -0.100 m",
         )
 
+    def test_terminal_kill_clears_request_before_fcu_disarms(self):
+        from px4_wall_ceiling_control.adapters.kill_switch import KillSwitchConfig
+        node = Terminal.__new__(Terminal)
+        node.mode = OperatorCommand.MODE_WALL
+        node.detaching = node.detach_pulse = node.was_offboard = True
+        node.kill_guard_enabled = True
+        node.kill_config = KillSwitchConfig(7)
+        with mock.patch.object(rospy.Time, "now", return_value=rospy.Time.from_sec(10.0)):
+            node._on_rc(RCIn(channels=[1500]*6+[1999]))
+        self.assertEqual(node.mode, OperatorCommand.MODE_STANDBY)
+        self.assertFalse(node.detaching or node.detach_pulse or node.was_offboard)
+        with mock.patch.object(rospy.Time, "now", return_value=rospy.Time.from_sec(10.1)):
+            node._on_rc(RCIn(channels=[1500]*6+[999]))
+        self.assertEqual(node.mode, OperatorCommand.MODE_STANDBY)
+
+    def test_kill_guard_blocks_mode_request_even_after_service_wait(self):
+        node = Manager.__new__(Manager)
+        node.kill_guard_enabled = True
+        node.kill_status_at = rospy.Time.from_sec(10.0)
+        node.kill_status = {"valid": True, "active": True}
+        node.set_mode = mock.Mock()
+        node.request_in_flight = True
+        with mock.patch.object(rospy, "wait_for_service"), mock.patch.object(rospy.Time, "now", return_value=node.kill_status_at):
+            node._send_mode_request("OFFBOARD")
+        node.set_mode.assert_not_called()
+
+    def test_active_kill_keeps_locked_phase_feedback_fresh(self):
+        node = Manager.__new__(Manager)
+        node.kill_guard_enabled = True
+        node.kill_status_at = rospy.Time.from_sec(10.0)
+        node.kill_status = {"valid": True, "active": True}
+        node.phase = Manager.LOCKED
+        node.phase_reason = "kill switch active or unavailable"
+        node._reset = mock.Mock()
+        node.prestream_pub = mock.Mock()
+        node.phase_pub = mock.Mock()
+        node.phase_reason_pub = mock.Mock()
+        with mock.patch.object(rospy.Time, "now", return_value=node.kill_status_at):
+            node._on_timer(None)
+        self.assertFalse(node.prestream_pub.publish.call_args[0][0].data)
+        self.assertEqual(node.phase_pub.publish.call_args[0][0].data, Manager.LOCKED)
+        self.assertEqual(node.phase_reason_pub.publish.call_args[0][0].data, node.phase_reason)
+
     def test_terminal_detach_keeps_mode_until_altctl(self):
         node = Terminal.__new__(Terminal)
         node.mode = OperatorCommand.MODE_STANDBY
@@ -565,8 +608,9 @@ class FlightHandoverTest(unittest.TestCase):
         ):
             node._on_timer(None)
         self.assertEqual(node.ceiling_detach_pub.publish.call_count, 2)
-        node._on_state(State(mode="OFFBOARD"))
-        node._on_state(State(mode="ALTCTL"))
+        with mock.patch.object(rospy.Time, "now", return_value=rospy.Time.from_sec(10.3)):
+            node._on_state(State(mode="OFFBOARD"))
+            node._on_state(State(mode="ALTCTL"))
         self.assertEqual(node.mode, OperatorCommand.MODE_STANDBY)
 
 

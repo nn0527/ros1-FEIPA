@@ -75,7 +75,8 @@ class AttachmentSafetyTest(unittest.TestCase):
         node._on_detach(Bool(data=True))
         self.assertFalse(node.detach_requested)
         node.state = WallPerchStatus.STATE_WALL_HOLD
-        node._on_detach(Bool(data=True))
+        with mock.patch.object(rospy.Time, "now", return_value=rospy.Time.from_sec(10.0)):
+            node._on_detach(Bool(data=True))
         self.assertTrue(node.detach_requested)
 
     def test_wall_hold_captures_measured_reference_without_setpoint_step(self):
@@ -142,6 +143,7 @@ class AttachmentSafetyTest(unittest.TestCase):
         node.q_hover = (0.0, 0.0, 0.0, 1.0)
         node.q_detach_start = reference
         node.detach_requested = True
+        node.detach_requested_at = rospy.Time.from_sec(10.0)
         node.cancel_requested = False
         node.detach_stable_since = None
         node.detach_stable_samples = 0
@@ -175,7 +177,7 @@ class AttachmentSafetyTest(unittest.TestCase):
         publish_attitude(10.0, quaternion_multiply(reference, turn))
         self.assertEqual(node.state, WallPerchStatus.STATE_WALL_HOLD)
         self.assertIsNone(node.detach_stable_since)
-        self.assertFalse(node.detach_requested)
+        self.assertTrue(node.detach_requested)
 
         near_reference = quaternion_multiply(
             reference,
@@ -185,9 +187,6 @@ class AttachmentSafetyTest(unittest.TestCase):
         publish_attitude(11.0, near_reference)
         self.assertEqual(node.state, WallPerchStatus.STATE_WALL_HOLD)
         publish_attitude(11.6, near_reference)
-        self.assertEqual(node.state, WallPerchStatus.STATE_WALL_HOLD)
-        node.detach_requested = True
-        node._update_state_machine(rospy.Time.from_sec(11.6))
         self.assertEqual(node.state, WallPerchStatus.STATE_DETACH_ROTATE)
         self.assertAlmostEqual(node.detach_altitude_m, 0.0)
         self.assertAlmostEqual(
@@ -737,6 +736,46 @@ class AttachmentSafetyTest(unittest.TestCase):
         node._enter_state(WallPerchStatus.STATE_RECOVER, now, "detach recovery")
         node._enter_state(WallPerchStatus.STATE_EXIT, now, "recovery complete")
         self.assertTrue(node.detach_completed)
+
+    def test_bench_detach_ignores_finite_vertical_speed_but_keeps_angular_limits(self):
+        node = WallDecision.__new__(WallDecision)
+        node.odom = Odometry()
+        node.odom.pose.pose.orientation.w = 1.0
+        node.odom.twist.twist.linear.z = 0.4
+        node.odom_twist_in_child_frame = True
+        node.q_contact = node.q_hold_reference = (0.0, 0.0, 0.0, 1.0)
+        node.detach_reference_angle_rad = math.radians(10)
+        node.detach_axis_error_rad = math.radians(5)
+        node.detach_max_rate_rps = 0.15
+        node.detach_max_abs_vertical_speed_mps = 0.15
+        self.assertFalse(node._detach_pose_valid())
+        node.bench_wait_for_ranges = True
+        self.assertTrue(node._detach_pose_valid())
+        node.odom.twist.twist.angular.x = 0.2
+        self.assertFalse(node._detach_pose_valid())
+        node.odom.twist.twist.angular.x = 0
+        node.odom.twist.twist.linear.z = float("nan")
+        self.assertFalse(node._detach_pose_valid())
+
+    def test_detach_request_waits_then_expires_without_rotating(self):
+        node = WallDecision.__new__(WallDecision)
+        node.state = WallPerchStatus.STATE_WALL_HOLD
+        node.cancel_requested = False
+        node.detach_requested = True
+        node.detach_requested_at = rospy.Time.from_sec(1)
+        node.top_filtered_m = 0.04
+        node.top_clear_distance_m = 0.10
+        node.hold_time_s = 0
+        node._mode_requested = node._safety_ok = lambda now: True
+        node._pin_triggered = lambda: False
+        node._detach_pose_ready = lambda now: False
+        node._detach_block_reason = lambda now: "角速度未稳定"
+        node._update_state_machine(rospy.Time.from_sec(2))
+        self.assertTrue(node.detach_requested)
+        self.assertEqual(node.state, WallPerchStatus.STATE_WALL_HOLD)
+        node._update_state_machine(rospy.Time.from_sec(10))
+        self.assertFalse(node.detach_requested)
+        self.assertIn("超时", node.last_reason)
 
     def test_wall_pressure_ramps_with_top_range_and_returns_to_nominal(self):
         node = WallDecision.__new__(WallDecision)

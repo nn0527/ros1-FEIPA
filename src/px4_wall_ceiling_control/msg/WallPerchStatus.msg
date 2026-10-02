@@ -52,3 +52,5 @@ bool hold_achieved
 string reached_state_name
 bool detach_ready
 bool detach_completed
+bool detach_pending
+string detach_block_reason

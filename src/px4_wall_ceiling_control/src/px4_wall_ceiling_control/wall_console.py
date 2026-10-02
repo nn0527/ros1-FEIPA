@@ -17,6 +17,7 @@ LIMITS = {"state": 1.5, "odom": 0.5, "estimator": 1.5, "rc": 0.2,
           "owner": 0.3, "operator": 0.5, "setpoint": 0.3,
           "battery": 5.0, "front": 0.6, "ceiling": 0.6, "runtime": 3.0}
 LIMITS.update({"front_diagnostic": 3.0, "ceiling_diagnostic": 3.0})
+LIMITS["kill"] = 0.35
 
 
 def validate_config(values):
@@ -75,6 +76,10 @@ class ConsoleState:
             if name == "state" and (not previous or previous["value"] != value):
                 self.event("飞控: {} / {} / {}".format("已连接" if value["connected"] else "断开",
                            "已解锁" if value["armed"] else "未解锁", value["mode"] or "未知模式"))
+            if name == "kill" and (not previous or previous["value"] != value):
+                self.event("急停开关: " + ("反馈无效，动作禁用" if not value.get("valid") else
+                    "已生效，动作禁用" if value.get("active") else "未触发") +
+                    " · 通道 " + str(value.get("channel")), "warning" if value.get("active") or not value.get("valid") else "info")
 
     def snapshot(self):
         with self.lock:
@@ -89,6 +94,8 @@ class ConsoleState:
                 return status[name]["value"] if status[name]["fresh"] else default
             flight, health, estimator, runtime = (val(n, {}) for n in ("state", "health", "estimator", "runtime"))
             wall = val("wall", {})
+            kill = val("kill", {})
+            kill_ok = kill.get("valid") is True and kill.get("active") is False
             bench = self.config["test_profile"] == "restrained_bench"
             height_reason = ("未建立起飞地面参考；请在未解锁时启动基础程序" if not wall.get("altitude_reference_valid")
                 else "相对起飞高度 {:.2f} m，需大于 {:.2f} m".format(
@@ -107,6 +114,7 @@ class ConsoleState:
             checks = [
                 ("runtime", "实飞链路", bool(runtime.get("enabled")), "基础程序未启动或实飞输出未启用"),
                 ("connected", "飞控连接", bool(flight.get("connected")), "飞控未连接或心跳已过期"),
+                ("kill", "急停开关", kill_ok, "急停开关已生效，动作已禁用" if kill.get("active") else "急停配置或通道反馈缺失／过期"),
                 ("armed", "已解锁", bool(flight.get("armed")), "等待飞手用遥控器解锁、起飞"),
                 ("mode", "ALTCTL 模式", flight.get("mode") == "ALTCTL", "贴墙请求需从 ALTCTL 模式发起"),
                 ("odom", "里程计", bool(val("odom", {}).get("finite")), "里程计缺失、过期或数值无效"),
@@ -122,20 +130,20 @@ class ConsoleState:
                 blockers.insert(0, "贴墙请求已发送，等待节点反馈")
             if self.launch_error:
                 blockers.insert(0, self.launch_error)
-            success = (val("wall", {}).get("state_name") == "WALL_HOLD" and
+            success = (kill_ok and val("wall", {}).get("state_name") == "WALL_HOLD" and
                        not val("wall", {}).get("fault_detected", False) and runtime.get("enabled") and
                        status["setpoint"]["fresh"] and
                        val("phase") == "ACTIVE" and val("owner") == 2 and
                        flight.get("connected") and flight.get("armed") and flight.get("mode") == "OFFBOARD")
-            detach_pending = (self.detach_pending_since is not None and
-                now - self.detach_pending_since < 5)
+            detach_pending = bool(wall.get("detach_pending") or (self.detach_pending_since is not None and
+                now - self.detach_pending_since < 5))
             detach_checks = [
                 (bool(runtime.get("enabled")), "基础程序反馈无效"),
+                (kill_ok, "急停开关已生效，动作已禁用" if kill.get("active") else "急停反馈缺失／过期"),
                 (bool(flight.get("connected") and flight.get("armed") and flight.get("mode") == "OFFBOARD"), "离墙要求已连接、已解锁且处于 OFFBOARD"),
                 (bool(val("odom", {}).get("finite") and estimator.get("attitude") and estimator.get("vertical_velocity")), "里程计或估计器反馈无效／过期"),
                 (bool(health.get("ceiling_valid")), "顶部雷达反馈无效／过期"),
                 (bool(wall.get("state_name") == "WALL_HOLD" and not wall.get("fault_detected")), "仅当前贴墙保持阶段允许离墙"),
-                (bool(wall.get("detach_ready")), "等待离墙条件：姿态回到贴墙参考、角速度和垂直速度稳定"),
                 (bool(val("phase") == "ACTIVE" and val("owner") == 2 and status["setpoint"]["fresh"] and
                     val("operator", {}).get("mode") == 3 and val("operator", {}).get("enabled")), "贴墙控制链路未就绪"),
             ]

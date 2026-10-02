@@ -7,7 +7,8 @@ import rospy
 from geometry_msgs.msg import Quaternion, Vector3Stamped
 from mavros_msgs.msg import AttitudeTarget, RCIn, State
 from nav_msgs.msg import Odometry
-from std_msgs.msg import Bool, Float32, UInt8
+from std_msgs.msg import Bool, Float32, UInt8, String
+from px4_wall_ceiling_control.adapters.kill_switch import install_kill_guard, kill_clear
 
 from px4_wall_ceiling_control.adapters.mavros_setpoint import MavrosSetpointBuilder
 from px4_wall_ceiling_control.adapters.odometry import (
@@ -48,6 +49,7 @@ class AttachmentOutputMuxNode:
     ATTITUDE_AND_THRUST_MASK = MavrosSetpointBuilder.ATTITUDE_AND_THRUST_MASK
 
     def __init__(self):
+        install_kill_guard(self, rospy, String)
         self.output_enabled = bool(rospy.get_param("~output_enabled", False))
         self.ceiling_output_enabled = bool(
             rospy.get_param("~ceiling_output_enabled", False)
@@ -487,6 +489,8 @@ class AttachmentOutputMuxNode:
             rospy.loginfo("attachment owner interlock cleared")
 
     def _flight_ready(self, now):
+        if not kill_clear(self, now):
+            return False
         ready, _reason = flight_state_ready(
             self.flight_state,
             is_fresh(self.flight_state_at, self.state_timeout_s, now),

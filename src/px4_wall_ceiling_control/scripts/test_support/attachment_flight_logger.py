@@ -23,6 +23,7 @@ TOPICS = [
     "/mavros/setpoint_raw/attitude", "/mavros/setpoint_raw/target_attitude",
     "/mavros/state", "/mavros/local_position/odom", "/mavros/local_position/velocity_local",
     "/mavros/imu/data", "/mavros/estimator_status", "/mavros/rc/in", "/mavros/rc/out",
+    "/attachment/kill_switch",
     "/mavros/battery", "/mavros/altitude", "/mavros/global_position/raw/fix",
     "/mavros/global_position/raw/gps_vel", "/mavros/statustext/recv",
     "/sensor/front/raw", "/sensor/front/range", "/sensor/ceiling/raw", "/sensor/ceiling/range",

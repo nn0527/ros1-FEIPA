@@ -8,6 +8,7 @@
     <arg name="ceiling_serial_port" value="$(arg ceiling_serial_port)" />
     <arg name="front_serial_port" value="$(arg front_serial_port)" />
     <arg name="operator_source" value="terminal" />
+    <arg name="kill_guard_enabled" value="true" />
     <arg name="flight_mode_enabled" value="true" />
     <arg name="wall_enabled" value="true" />
     <arg name="ceiling_enabled" value="false" />

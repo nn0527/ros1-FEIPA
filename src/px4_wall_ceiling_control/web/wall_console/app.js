@@ -21,6 +21,7 @@ const translate = {
   , "detach requested":"离墙请求已接受", "detach rotation complete":"离墙旋转完成，正在恢复水平和高度"
   , "recovery complete":"离墙恢复完成，等待交还遥控器", "detach safety input lost":"离墙反馈无效，动作中止"
   , "recovery sensor or flight failure":"恢复阶段反馈或飞行状态无效"
+  , "kill switch active or unavailable":"急停开关已生效或反馈无效，动作已禁用"
   , "bench hover: waiting for valid front/top ranges and wall distance":"台架悬停等待：两路雷达恢复有效，且前向距离满足接近条件后继续"
 };
 const wallNames = {IDLE:"等待贴墙指令", FRONT_WALL_DETECT:"检测墙面", STABILIZE_HOVER:"稳定悬停",
@@ -50,8 +51,12 @@ function paint(s){
   text("startLabel",s.starting?"正在启动…":enabled?"基础程序已启动":"启动基础程序");
   $("wall").disabled=requestBusy || !ssh || !s.can_wall;
   $("detach").disabled=requestBusy || !ssh || !s.can_detach;
-  text("detachBlockReason",s.can_detach?"离墙条件已满足": "离墙："+(s.detach_blockers?.[0] || "等待贴墙保持"));
+  text("detachBlockReason",s.can_detach?"可提交离墙请求；控制节点确认连续稳定后才旋转": "离墙："+(s.detach_blockers?.[0] || "等待贴墙保持"));
   $("detachBlockReason").classList.toggle("ready",!!s.can_detach);
+  const kill=fresh(s,"kill");
+  text("killState",!kill?.valid?"急停：配置或通道反馈无效，动作禁用":kill.active?"急停已生效 · 第 "+kill.channel+" 通道 · 动作禁用":kill.channel?"急停未触发 · 第 "+kill.channel+" 通道":"飞控未配置遥控急停通道");
+  $("killState").classList.toggle("errorText",!kill?.valid || !!kill.active);
+  text("detachCondition",wall?.state_name!=="WALL_HOLD"?"离墙仅在当前贴墙保持阶段接受请求":wall.detach_pending?"离墙请求等待中："+(wall.detach_block_reason || "等待连续稳定"):wall.detach_ready?"旋转条件已满足，可提交离墙请求":"可提交离墙请求，旋转前还需："+(wall.detach_block_reason || "等待姿态和角速度稳定"));
   text("wallBlockReason",s.can_wall?"":s.blockers.join("；"));
   for(const field of form.elements) field.disabled=s.starting || enabled || requestBusy;
   let title="等待启动", reason=s.blockers[0] || "飞行稳定后，可发送贴墙指令", step=0;
@@ -75,8 +80,9 @@ function paint(s){
   if(history?.detach_completed)step=8;
   if(phase==="RETURNING"){title="等待遥控接管";reason="离墙恢复已完成；等待水平姿态、速度和连续输出满足交接条件";}
   if(returned){title="离墙完成，已交还遥控";reason="已回到 ALTCTL，贴墙输出已释放";}
+  if(kill?.active){title="急停已生效";reason=state?.armed?"电机已停，飞控等待自动上锁；动作请求已禁用":"飞控已上锁，急停开关仍生效";}
   text("stageTitle",title);text("stageReason",translate[reason] || reason);
-  document.querySelector(".stage").classList.toggle("error",!!s.launch_error || phase==="LOCKED" || wall?.fault_detected || wall?.state_name==="ABORT");
+  document.querySelector(".stage").classList.toggle("error",!!kill?.active || !!s.launch_error || phase==="LOCKED" || wall?.fault_detected || wall?.state_name==="ABORT");
   $("successNote").hidden=!history?.hold_achieved;
   text("successNote",s.success?"本轮已确认贴墙保持；当前仍在保持。":history?.hold_achieved?"本轮曾成功进入贴墙保持，记录已保留。当前状态见上方；历史结果不代表现在仍贴墙。":"");
   document.querySelectorAll(".steps li").forEach((el,i)=>{el.classList.toggle("done",i<step || (history?.hold_achieved && i===5) || (returned && i===step));el.classList.toggle("current",ssh && !returned && wall?.state_name!=="ABORT" && i===step);});
@@ -95,7 +101,7 @@ function paint(s){
     if(phase==="ACTIVE" && check.id==="idle"){label="贴墙动作";ok=true;value="执行中";}
     const el=pair(label,value,"check"+(ok?" ok":""));el.title=check.reason;return el;
   });
-  const ages=[["飞控心跳","state"],["里程计","odom"],["估计器","estimator"],["遥控输入","rc"],["两路雷达","health"],["贴墙状态","wall"]];
+  const ages=[["飞控心跳","state"],["里程计","odom"],["估计器","estimator"],["遥控输入","rc"],["急停反馈","kill"],["两路雷达","health"],["贴墙状态","wall"]];
   rows($("ages"),ages,([label,key])=>{const item=s.status[key],el=pair(label,item.age_s===null?"未收到":n(item.age_s,2)+" s","ageRow");el.lastChild.classList.toggle("stale",!item.fresh);return el;});
   text("sshError",ssh?"":s.ssh.error);
   text("recording",runtime?.logger?"试飞日志：录制中":enabled?"试飞日志：未检测到录制节点":"试飞日志：等待启动");
@@ -128,6 +134,7 @@ async function poll(){
     text("connectionText","本机服务无响应");$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;
     if(!$("successNote").hidden)text("successNote","本轮曾成功进入贴墙保持；当前反馈中断，不能确认现在的状态。");
     text("stageTitle","反馈中断");text("stageReason","无法确认当前阶段，请核对飞控状态");
+    text("killState","急停反馈中断，动作禁用");text("detachCondition","实时反馈中断，离墙禁用");
     for(const id of ["front","ceiling","angles","thrust","mode","height","velocity","battery","owner","armed","flightConnection"])text(id,"—");
     text("sshError",error.message);document.querySelectorAll(".steps li").forEach(el=>el.classList.remove("current"));
     document.querySelectorAll(".check").forEach(el=>{el.classList.remove("ok");el.lastChild.textContent="待确认";});

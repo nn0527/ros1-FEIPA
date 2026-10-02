@@ -119,6 +119,7 @@ class ConsoleTests(unittest.TestCase):
                    "min_entry_height_m": 0.3, "entry_height_ready": True},
                "phase": "IDLE", "owner": 0, "operator": {"mode": 1, "enabled": False}}.items():
             self.state.update(name, value)
+        self.state.update("kill", {"valid": True, "active": False, "channel": 7})
 
     def test_ready_dispatches_exactly_one_wall(self):
         self.ready()
@@ -131,7 +132,7 @@ class ConsoleTests(unittest.TestCase):
     def test_stale_estimator_blocks_even_when_flag_remains_true(self):
         self.ready()
         self.now += 1.6
-        for name in ("state", "runtime", "health", "odom", "wall", "phase", "owner", "operator"):
+        for name in ("state", "runtime", "health", "odom", "wall", "phase", "owner", "operator", "kill"):
             self.state.update(name, self.state.samples[name]["value"])
         with self.assertRaisesRegex(ValueError, "估计器"):
             self.state.send_wall(self.publisher)
@@ -229,7 +230,7 @@ class ConsoleTests(unittest.TestCase):
     def test_detach_rejects_unsettled_pose_stale_sensor_and_lost_ssh(self):
         self.holding()
         self.state.update("wall", dict(self.state.samples["wall"]["value"], detach_ready=False))
-        self.assertFalse(self.state.snapshot()["can_detach"])
+        self.assertTrue(self.state.snapshot()["can_detach"])
         self.holding()
         self.state.samples["health"]["at"] = 99.0
         self.assertFalse(self.state.snapshot()["can_detach"])
@@ -250,6 +251,22 @@ class ConsoleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.state.send_detach(self.publisher)
         self.assertIsNone(self.state.detach_pending_since)
+
+    def test_kill_switch_blocks_detach_before_armed_flag_catches_up(self):
+        self.holding()
+        self.state.update("kill", {"valid": True, "active": True, "channel": 7})
+        status = self.state.snapshot()
+        self.assertTrue(status["status"]["state"]["value"]["armed"])
+        self.assertFalse(status["success"])
+        self.assertFalse(status["can_detach"])
+        with self.assertRaisesRegex(ValueError, "急停"):
+            self.state.send_detach(self.publisher)
+        self.publisher.assert_not_called()
+
+    def test_controller_queued_detach_blocks_duplicate_after_http_pending_expires(self):
+        self.holding()
+        self.state.update("wall", dict(self.state.samples["wall"]["value"], detach_pending=True))
+        self.assertFalse(self.state.snapshot()["can_detach"])
 
     def test_launch_uses_dedicated_entry_with_explicit_real_output(self):
         args = launch_arguments(DEFAULT_CONFIG)

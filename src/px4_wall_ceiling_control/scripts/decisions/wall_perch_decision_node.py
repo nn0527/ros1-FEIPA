@@ -8,10 +8,11 @@ from geometry_msgs.msg import Quaternion
 from mavros_msgs.msg import State
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Range
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 from px4_wall_ceiling_control.adapters.odometry import vertical_speed_enu_mps
 from px4_wall_ceiling_control.adapters.takeoff_height import TakeoffHeightReference
+from px4_wall_ceiling_control.adapters.kill_switch import install_kill_guard, kill_clear
 from px4_wall_ceiling_control.domain.geometry import (
     euler_from_quaternion,
     follow_rotation_about_body_z,
@@ -50,6 +51,7 @@ class WallPerchDecisionNode:
     }
 
     def __init__(self):
+        install_kill_guard(self, rospy, String)
         self.decision_enabled = bool(rospy.get_param("~decision_enabled", False))
         self.front_ready_distance_m = float(
             rospy.get_param("~front_ready_distance_m", 0.50)
@@ -520,6 +522,7 @@ class WallPerchDecisionNode:
     def _on_detach(self, message):
         if message.data and self.state == WallPerchStatus.STATE_WALL_HOLD:
             self.detach_requested = True
+            self.detach_requested_at = rospy.Time.now()
 
     def _on_cancel(self, message):
         if message.data:
@@ -585,7 +588,8 @@ class WallPerchDecisionNode:
         )
         return bool(
             math.isfinite(velocity_z)
-            and abs(velocity_z) <= self.detach_max_abs_vertical_speed_mps
+            and (getattr(self, "bench_wait_for_ranges", False) or
+                 abs(velocity_z) <= self.detach_max_abs_vertical_speed_mps)
         )
 
     def _detach_pose_ready(self, now):
@@ -600,6 +604,27 @@ class WallPerchDecisionNode:
 
     def _state_age(self, now):
         return max(0.0, (now - self.state_entered_at).to_sec())
+
+    def _detach_block_reason(self, now):
+        if not self._odom_fresh(now) or self._height_feedback() is None:
+            return "离墙高度／速度反馈无效或过期"
+        q = self._current_quaternion()
+        if q is None:
+            return "离墙姿态反馈无效"
+        error = math.degrees(quaternion_angle(q, getattr(self, "q_hold_reference", self.q_contact)))
+        if error > math.degrees(self.detach_reference_angle_rad):
+            return "贴墙参考姿态偏差 {:.1f}°，需 ≤ {:.1f}°".format(error, math.degrees(self.detach_reference_angle_rad))
+        axis = math.degrees(quaternion_angle(q, self._hold_follow_quaternion()))
+        if axis > math.degrees(self.detach_axis_error_rad):
+            return "离墙旋转轴偏差 {:.1f}°，需 ≤ {:.1f}°".format(axis, math.degrees(self.detach_axis_error_rad))
+        omega = self.odom.twist.twist.angular
+        rate = max(abs(omega.x), abs(omega.y), abs(omega.z))
+        if rate > self.detach_max_rate_rps:
+            return "角速度 {:.2f} rad/s，需 ≤ {:.2f} rad/s".format(rate, self.detach_max_rate_rps)
+        speed = vertical_speed_enu_mps(self.odom, self.odom_twist_in_child_frame)
+        if not getattr(self, "bench_wait_for_ranges", False) and abs(speed) > self.detach_max_abs_vertical_speed_mps:
+            return "竖直速度估算 {:+.2f} m/s，需 |v| ≤ {:.2f} m/s".format(speed, self.detach_max_abs_vertical_speed_mps)
+        return "等待姿态和速度连续稳定 {:.2f} 秒".format(self.detach_stable_hold_s)
 
     def _mode_requested(self, now):
         return bool(
@@ -649,6 +674,8 @@ class WallPerchDecisionNode:
         )
 
     def _flight_ready(self, now):
+        if not kill_clear(self, now):
+            return False
         if not is_fresh(self.flight_state_received_at, self.state_timeout_s, now):
             return False
         if self.flight_state is None or not self.flight_state.connected:
@@ -938,6 +965,7 @@ class WallPerchDecisionNode:
             self.detach_requested = False
         elif new_state == WallPerchStatus.STATE_ABORT:
             self.cancel_requested = False
+            self.detach_requested = False
         elif new_state == WallPerchStatus.STATE_EXIT:
             # Require a switch release before another maneuver. The reference
             # level-trigger would otherwise restart immediately after auto-detach.
@@ -1086,10 +1114,12 @@ class WallPerchDecisionNode:
                         WallPerchStatus.STATE_DETACH_ROTATE, now, "detach requested"
                     )
                 elif self.detach_requested:
-                    self.detach_requested = False
-                    self.last_reason = (
-                        "detach rejected: return to reference wall attitude and settle"
-                    )
+                    requested_at = getattr(self, "detach_requested_at", now)
+                    if (now - requested_at).to_sec() > 8.0:
+                        self.detach_requested = False
+                        self.last_reason = "离墙等待超时，请求已取消；" + self._detach_block_reason(now)
+                    else:
+                        self.last_reason = "离墙请求已接收；" + self._detach_block_reason(now)
 
         elif self.state == WallPerchStatus.STATE_WALL_PIN:
             if not self._flight_ready(now):
@@ -1237,6 +1267,8 @@ class WallPerchDecisionNode:
         status.hold_achieved = getattr(self, "hold_achieved", False)
         status.reached_state_name = self.STATE_NAMES[getattr(self, "reached_state", self.state)]
         status.detach_completed = getattr(self, "detach_completed", False)
+        status.detach_pending = bool(getattr(self, "detach_requested", False) and self.state == WallPerchStatus.STATE_WALL_HOLD)
+        status.detach_block_reason = self._detach_block_reason(now) if self.state == WallPerchStatus.STATE_WALL_HOLD and not self._detach_pose_ready(now) else ""
         status.detach_ready = bool(self.state == WallPerchStatus.STATE_WALL_HOLD
             and self._safety_ok(now) and self._detach_pose_ready(now)
             and self.top_filtered_m is not None and self.top_filtered_m <= self.top_clear_distance_m)

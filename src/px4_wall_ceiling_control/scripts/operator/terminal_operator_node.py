@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """One-shot terminal commands for a persistent attachment operator intent."""
 
+import json
+import threading
+import time
 import rospy
-from mavros_msgs.msg import State
+from mavros_msgs.msg import State, RCIn
+from mavros_msgs.srv import ParamGet
 from std_msgs.msg import Bool, String
 
 from px4_wall_ceiling_control.msg import OperatorCommand
+from px4_wall_ceiling_control.adapters.kill_switch import KillSwitchConfig
 
 
 class TerminalOperatorNode:
@@ -15,6 +20,14 @@ class TerminalOperatorNode:
         self.detach_pulse = False
         self.was_offboard = False
         self.flight_mode = ""
+        self.kill_guard_enabled = bool(rospy.get_param("~kill_guard_enabled", False))
+        self.kill_config = None
+        self.kill_config_loading = False
+        self.kill_config_attempt_at = -float("inf")
+        self.rc_channels, self.rc_at = (), None
+        self.flight_at = None
+        self.kill_pub = rospy.Publisher("/attachment/kill_switch", String, queue_size=1)
+        rospy.Subscriber("/mavros/rc/in", RCIn, self._on_rc, queue_size=1)
         self.command_pub = rospy.Publisher(
             "/operator/command", OperatorCommand, queue_size=10
         )
@@ -32,6 +45,11 @@ class TerminalOperatorNode:
 
     def _on_command(self, message):
         command = message.data.strip().lower()
+        if command in ("ceiling", "wall", "detach") and getattr(self, "kill_guard_enabled", False):
+            safety = self._kill_report()
+            if not safety["valid"] or safety["active"]:
+                rospy.logwarn("terminal operator: kill switch active or unavailable; command rejected")
+                return
         if command in ("ceiling", "wall"):
             if self.mode != OperatorCommand.MODE_STANDBY or self.detaching:
                 rospy.logwarn("terminal operator: finish current cycle before %s", command)
@@ -67,6 +85,15 @@ class TerminalOperatorNode:
             rospy.logwarn("terminal operator: use ceiling, wall, detach or cancel")
 
     def _on_state(self, message):
+        self.flight_at = rospy.Time.now()
+        if getattr(self, "kill_guard_enabled", False) and message.connected and not message.armed and not self.kill_config_loading and time.monotonic() - self.kill_config_attempt_at >= 10:
+            self.kill_config_loading = True
+            self.kill_config_attempt_at = time.monotonic()
+            threading.Thread(target=self._load_kill_config, daemon=True).start()
+        if not message.connected:
+            self.kill_config = None
+        if getattr(self, "kill_guard_enabled", False) and not message.armed:
+            self._release_intent()
         self.flight_mode = message.mode.upper()
         if self.flight_mode == "OFFBOARD":
             self.was_offboard = True
@@ -76,7 +103,45 @@ class TerminalOperatorNode:
             self.detach_pulse = False
             self.was_offboard = False
 
+    def _release_intent(self):
+        self.mode = OperatorCommand.MODE_STANDBY
+        self.detaching = self.detach_pulse = self.was_offboard = False
+
+    def _load_kill_config(self):
+        try:
+            get = rospy.ServiceProxy("/mavros/param/get", ParamGet)
+            def read(name, integer=False):
+                result = get(param_id=name)
+                if not result.success:
+                    raise ValueError("FCU parameter unavailable: " + name)
+                return result.value.integer if integer else result.value.real
+            channel = read("RC_MAP_KILL_SW", True)
+            config = (KillSwitchConfig(channel, read("RC_KILLSWITCH_TH"), read("RC%d_MIN" % channel),
+                read("RC%d_MAX" % channel), read("RC%d_REV" % channel)) if channel else KillSwitchConfig(0))
+            self.kill_config = config
+        except Exception as error:
+            rospy.logwarn("kill-switch configuration read failed: %s", error)
+        finally:
+            self.kill_config_loading = False
+
+    def _on_rc(self, message):
+        self.rc_channels, self.rc_at = tuple(message.channels), rospy.Time.now()
+        if self.kill_guard_enabled and self._kill_report().get("active"):
+            self._release_intent()
+
+    def _kill_report(self):
+        now = rospy.Time.now()
+        if self.kill_config is None:
+            return {"valid": False, "active": False, "channel": None}
+        fresh = self.rc_at is not None and 0 <= (now - self.rc_at).to_sec() <= 0.25
+        return self.kill_config.report(self.rc_channels, fresh)
+
     def _on_timer(self, _event):
+        if getattr(self, "kill_guard_enabled", False):
+            safety = self._kill_report()
+            if not safety["valid"] or safety["active"]:
+                self._release_intent()
+            self.kill_pub.publish(String(data=json.dumps(safety)))
         command = OperatorCommand()
         command.header.stamp = rospy.Time.now()
         command.mode = self.mode
