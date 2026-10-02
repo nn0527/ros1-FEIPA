@@ -56,6 +56,7 @@ class ConsoleState:
         self.starting = False
         self.launch_error = ""
         self.pending_since = None
+        self.detach_pending_since = None
         self.sequence = 0
 
     def event(self, text, kind="info"):
@@ -126,9 +127,28 @@ class ConsoleState:
                        status["setpoint"]["fresh"] and
                        val("phase") == "ACTIVE" and val("owner") == 2 and
                        flight.get("connected") and flight.get("armed") and flight.get("mode") == "OFFBOARD")
+            detach_pending = (self.detach_pending_since is not None and
+                now - self.detach_pending_since < 5)
+            detach_checks = [
+                (bool(runtime.get("enabled")), "基础程序反馈无效"),
+                (bool(flight.get("connected") and flight.get("armed") and flight.get("mode") == "OFFBOARD"), "离墙要求已连接、已解锁且处于 OFFBOARD"),
+                (bool(val("odom", {}).get("finite") and estimator.get("attitude") and estimator.get("vertical_velocity")), "里程计或估计器反馈无效／过期"),
+                (bool(health.get("ceiling_valid")), "顶部雷达反馈无效／过期"),
+                (bool(wall.get("state_name") == "WALL_HOLD" and not wall.get("fault_detected")), "仅当前贴墙保持阶段允许离墙"),
+                (bool(wall.get("detach_ready")), "等待离墙条件：姿态回到贴墙参考、角速度和垂直速度稳定"),
+                (bool(val("phase") == "ACTIVE" and val("owner") == 2 and status["setpoint"]["fresh"] and
+                    val("operator", {}).get("mode") == 3 and val("operator", {}).get("enabled")), "贴墙控制链路未就绪"),
+            ]
+            detach_blockers = [reason for ok, reason in detach_checks if not ok]
+            if detach_pending:
+                detach_blockers.insert(0, "离墙请求已发送，等待节点反馈")
+            if self.launch_error or self.starting:
+                detach_blockers.insert(0, "基础程序未就绪")
             return {"status": status, "checks": [{"id": i, "label": label, "ok": ok, "reason": reason}
                     for i, label, ok, reason in checks], "blockers": blockers, "can_wall": not blockers and not self.starting,
                     "success": bool(success), "starting": self.starting, "pending": pending,
+                    "can_detach": not detach_blockers, "detach_blockers": detach_blockers,
+                    "detach_pending": detach_pending,
                     "sensor_warnings": sensor_reasons,
                     "launch_error": self.launch_error, "config": dict(self.config), "events": list(self.events)}
 
@@ -145,6 +165,19 @@ class ConsoleState:
                 self.pending_since = None
                 raise
             self.event("已发送 wall；等待控制节点确认，尚未判定贴墙成功")
+
+    def send_detach(self, publish):
+        with self.lock:
+            current = self.snapshot()
+            if not current["can_detach"]:
+                raise ValueError(current["detach_blockers"][0])
+            self.detach_pending_since = self.clock()
+            try:
+                publish("detach")
+            except Exception:
+                self.detach_pending_since = None
+                raise
+            self.event("已发送 detach；等待离墙、恢复水平和遥控接管反馈")
 
 
 def finite_json(value):

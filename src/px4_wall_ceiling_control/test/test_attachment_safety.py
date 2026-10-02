@@ -713,6 +713,31 @@ class AttachmentSafetyTest(unittest.TestCase):
         self.assertEqual(node.state, WallPerchStatus.STATE_ABORT)
         self.assertEqual(node.fault_count, 1)
 
+    def test_wall_milestones_survive_abort_but_reset_for_next_acquire(self):
+        node = WallDecision.__new__(WallDecision)
+        node.state = WallPerchStatus.STATE_IDLE
+        node._capture_attitude_references = lambda: None
+        node._current_quaternion = lambda: (0.0, 0.0, 0.0, 1.0)
+        node._wall_pressure_start_thrust = lambda: 0.5
+        node._wall_pressure_nominal_thrust = lambda: 0.6
+        node.max_thrust = 0.85
+        node.q_contact = (0.0, 0.0, 0.0, 1.0)
+        now = rospy.Time.from_sec(10)
+        node._enter_state(WallPerchStatus.STATE_FRONT_WALL_DETECT, now, "acquire")
+        node._enter_state(WallPerchStatus.STATE_WALL_HOLD, now, "contact")
+        self.assertTrue(node.hold_achieved)
+        node._enter_state(WallPerchStatus.STATE_ABORT, now, "contact lost")
+        self.assertTrue(node.hold_achieved)
+        self.assertEqual(node.reached_state, WallPerchStatus.STATE_WALL_HOLD)
+        node._enter_state(WallPerchStatus.STATE_EXIT, now, "abort recovered")
+        self.assertFalse(node.detach_completed)
+        node._enter_state(WallPerchStatus.STATE_IDLE, now, "release")
+        node._enter_state(WallPerchStatus.STATE_FRONT_WALL_DETECT, now, "new acquire")
+        self.assertFalse(node.hold_achieved)
+        node._enter_state(WallPerchStatus.STATE_RECOVER, now, "detach recovery")
+        node._enter_state(WallPerchStatus.STATE_EXIT, now, "recovery complete")
+        self.assertTrue(node.detach_completed)
+
     def test_wall_pressure_ramps_with_top_range_and_returns_to_nominal(self):
         node = WallDecision.__new__(WallDecision)
         node.hover_thrust = 0.45

@@ -182,7 +182,8 @@ class RemoteRuntime:
         elif name == "wall":
             value = {key: getattr(msg, key) for key in ("state_name", "reason", "progress", "fault_detected",
                       "front_distance_filtered_m", "top_distance_filtered_m", "thrust_normalized", "top_contact_ready",
-                      "altitude_reference_valid", "height_above_takeoff_m", "min_entry_height_m", "entry_height_ready")}
+                      "altitude_reference_valid", "height_above_takeoff_m", "min_entry_height_m", "entry_height_ready",
+                      "hold_achieved", "reached_state_name", "detach_ready", "detach_completed")}
         elif name in ("front_diagnostic", "ceiling_diagnostic"):
             value = json.loads(msg.data)
         elif name in ("phase", "reason", "owner"):
@@ -350,6 +351,14 @@ class RemoteRuntime:
         self.state.send_wall(publish)
         return {"message": "wall 已发送，等待贴墙阶段反馈"}
 
+    def detach(self):
+        def publish(command):
+            if not self.publisher or self.publisher.get_num_connections() == 0:
+                raise ValueError("终端指令节点未订阅，消息未发送")
+            self.publisher.publish(command)
+        self.state.send_detach(publish)
+        return {"message": "detach 已发送，等待离墙阶段反馈"}
+
 
 def bridge_main():
     output = sys.stdout
@@ -379,6 +388,8 @@ def bridge_main():
                 result = runtime.start(request["config"])
             elif action == "wall":
                 result = runtime.wall()
+            elif action == "detach":
+                result = runtime.detach()
             else:
                 raise ValueError("未知操作")
             send({"type": "reply", "id": request["id"], "ok": True, "data": result})
@@ -479,6 +490,11 @@ class SSHTransport:
                     result["blockers"] = ["SSH 反馈中断；历史数据不能用于判断贴墙成功"]
                     for check in result["checks"]:
                         check["ok"] = False
+            detach_sources = required_feedback + ("health", "setpoint")
+            if not connected or any(not result["status"][n]["fresh"] for n in detach_sources):
+                if not connected or result["can_detach"]:
+                    result["detach_blockers"] = ["离墙所需实时反馈中断或过期"]
+                result["can_detach"] = False
             result["config"] = config
             result["ssh"] = {"connected": connected, "error": self.error, "age_s": age,
                              "host": self.args.ssh_user + "@" + self.args.ssh_host}
@@ -565,6 +581,8 @@ def http_main(args):
                     config = proposed
                 elif self.path == "/api/wall":
                     result = transport.request("wall")
+                elif self.path == "/api/detach":
+                    result = transport.request("detach")
                 else:
                     return self.respond(404, {"error": "Not found"})
                 return self.respond(200, result)

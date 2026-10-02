@@ -194,6 +194,63 @@ class ConsoleTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 validate_config(dict(DEFAULT_CONFIG, **change))
 
+    def holding(self):
+        self.ready()
+        self.state.update("state", {"connected": True, "armed": True, "mode": "OFFBOARD"})
+        self.state.update("phase", "ACTIVE")
+        self.state.update("owner", 2)
+        self.state.update("operator", {"mode": 3, "enabled": True})
+        self.state.update("setpoint", {"thrust": 0.6})
+        self.state.update("wall", dict(self.state.samples["wall"]["value"],
+            state_name="WALL_HOLD", hold_achieved=True, reached_state_name="WALL_HOLD",
+            detach_ready=True, detach_completed=False, fault_detected=False))
+
+    def test_detach_dispatches_once_only_in_current_ready_hold(self):
+        self.holding()
+        self.assertTrue(self.state.snapshot()["can_detach"])
+        self.state.send_detach(self.publisher)
+        self.publisher.assert_called_once_with("detach")
+        with self.assertRaises(ValueError):
+            self.state.send_detach(self.publisher)
+        self.state.update("wall", dict(self.state.samples["wall"]["value"], state_name="DETACH_ROTATE"))
+        self.now += 6
+        self.assertFalse(self.state.snapshot()["can_detach"])
+
+    def test_historical_success_never_authorizes_detach_after_abort(self):
+        self.holding()
+        self.state.update("wall", dict(self.state.samples["wall"]["value"], state_name="ABORT", fault_detected=True))
+        result = self.state.snapshot()
+        self.assertTrue(result["status"]["wall"]["value"]["hold_achieved"])
+        self.assertFalse(result["success"])
+        with self.assertRaises(ValueError):
+            self.state.send_detach(self.publisher)
+        self.publisher.assert_not_called()
+
+    def test_detach_rejects_unsettled_pose_stale_sensor_and_lost_ssh(self):
+        self.holding()
+        self.state.update("wall", dict(self.state.samples["wall"]["value"], detach_ready=False))
+        self.assertFalse(self.state.snapshot()["can_detach"])
+        self.holding()
+        self.state.samples["health"]["at"] = 99.0
+        self.assertFalse(self.state.snapshot()["can_detach"])
+        self.holding()
+        bridge = object.__new__(server.SSHTransport)
+        bridge.lock = threading.RLock()
+        bridge.snapshot = self.state.snapshot()
+        bridge.arrived, bridge.connected, bridge.error = 100.0, True, ""
+        bridge.args = SimpleNamespace(ssh_host="test-host", ssh_user="pi")
+        with mock.patch.object(server.time, "monotonic", return_value=103.0):
+            result = bridge.status(DEFAULT_CONFIG)
+        self.assertFalse(result["can_detach"])
+        self.assertTrue(result["status"]["wall"]["value"]["hold_achieved"])
+
+    def test_failed_detach_publish_is_retryable(self):
+        self.holding()
+        self.publisher.side_effect = ValueError("未订阅")
+        with self.assertRaises(ValueError):
+            self.state.send_detach(self.publisher)
+        self.assertIsNone(self.state.detach_pending_since)
+
     def test_launch_uses_dedicated_entry_with_explicit_real_output(self):
         args = launch_arguments(DEFAULT_CONFIG)
         self.assertEqual(args[:3], ["roslaunch", "px4_wall_ceiling_control", "wall_console_flight.launch"])

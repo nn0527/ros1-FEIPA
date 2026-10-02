@@ -47,3 +47,8 @@ bool altitude_reference_valid
 float32 height_above_takeoff_m
 float32 min_entry_height_m
 bool entry_height_ready
+# Per-maneuver milestones survive abort/release; reset on the next wall acquire.
+bool hold_achieved
+string reached_state_name
+bool detach_ready
+bool detach_completed

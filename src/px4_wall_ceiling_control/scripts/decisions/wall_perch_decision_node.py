@@ -265,6 +265,9 @@ class WallPerchDecisionNode:
         self.q_hold_reference = self.q_contact
         self.q_detach_start = self.q_contact
         self.detach_altitude_m = None
+        self.hold_achieved = False
+        self.reached_state = WallPerchStatus.STATE_IDLE
+        self.detach_completed = False
         self.detach_stable_since = None
         self.detach_stable_samples = 0
         self.wall_pressure_thrust_command = self._wall_pressure_start_thrust()
@@ -877,6 +880,17 @@ class WallPerchDecisionNode:
             self.STATE_NAMES[new_state],
             reason,
         )
+        if new_state == WallPerchStatus.STATE_FRONT_WALL_DETECT:
+            self.hold_achieved = False
+            self.detach_completed = False
+            self.reached_state = new_state
+        elif new_state not in (WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT):
+            self.reached_state = max(getattr(self, "reached_state", 0), new_state)
+        if new_state == WallPerchStatus.STATE_WALL_HOLD:
+            self.hold_achieved = True
+        if new_state == WallPerchStatus.STATE_EXIT and self.state == WallPerchStatus.STATE_RECOVER:
+            self.detach_completed = True
+            self.reached_state = new_state
         self.state = new_state
         self.state_entered_at = now
         self.last_reason = reason
@@ -1150,6 +1164,7 @@ class WallPerchDecisionNode:
             quaternion = self.q_contact
             thrust = self._wall_pressure_thrust()
         elif self.state == WallPerchStatus.STATE_WALL_HOLD:
+            progress = 1.0
             followed = self._hold_follow_quaternion()
             entry = self._smoothstep5(
                 self._state_age(now) / self.hold_entry_blend_s
@@ -1219,6 +1234,12 @@ class WallPerchDecisionNode:
         status.height_above_takeoff_m = height if height is not None else math.nan
         status.min_entry_height_m = self.min_altitude_m
         status.entry_height_ready = self._entry_height_ready()
+        status.hold_achieved = getattr(self, "hold_achieved", False)
+        status.reached_state_name = self.STATE_NAMES[getattr(self, "reached_state", self.state)]
+        status.detach_completed = getattr(self, "detach_completed", False)
+        status.detach_ready = bool(self.state == WallPerchStatus.STATE_WALL_HOLD
+            and self._safety_ok(now) and self._detach_pose_ready(now)
+            and self.top_filtered_m is not None and self.top_filtered_m <= self.top_clear_distance_m)
         status.flight_state_fresh = self._flight_ready(now)
         status.front_ready = self._held_status(
             status.front_range_fresh

@@ -451,6 +451,28 @@ class FlightHandoverTest(unittest.TestCase):
         self.assertTrue(node.fault_seen)
         self.assertFalse(node.completed)
 
+    def test_wall_successful_detach_requires_recovery_before_release(self):
+        node = Manager.__new__(Manager)
+        now = rospy.Time.from_sec(10.0)
+        node.selected_mode = OperatorCommand.MODE_WALL
+        node.owner = 2
+        node.owner_at = now
+        node.owner_seen = False
+        node.output_timeout_s = 0.3
+        node.status_timeout_s = 0.5
+        node.detach_seen = node.recovery_seen = node.completed = False
+        node.fault_seen = False
+        node.wall_at = now
+        node.wall = WallPerchStatus(state=WallPerchStatus.STATE_WALL_HOLD)
+        for state in (WallPerchStatus.STATE_WALL_HOLD, WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER):
+            node.wall.state = state
+            node._observe_completion(now)
+            self.assertFalse(node.completed)
+        node.wall.state = WallPerchStatus.STATE_IDLE
+        node._observe_completion(now)
+        self.assertTrue(node.completed)
+        self.assertTrue(node.owner_seen)
+
     def test_altctl_is_requested_only_after_completion_and_owner_release(self):
         node = Manager.__new__(Manager)
         now = rospy.Time.from_sec(10.0)
