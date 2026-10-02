@@ -7,6 +7,9 @@ from unittest import mock
 import xml.etree.ElementTree as ET
 import importlib.util
 import threading
+import os
+import subprocess
+import tempfile
 from types import SimpleNamespace
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
@@ -19,6 +22,23 @@ spec.loader.exec_module(server)
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_bridge_keeps_catkin_generated_messages_importable(self):
+        # Reproduce a sourced Catkin workspace in a fresh interpreter. Importing
+        # the bridge must not shadow its relay with the plain source package.
+        source = server_path.parents[2] / "src/px4_wall_ceiling_control"
+        with tempfile.TemporaryDirectory() as directory:
+            relay = pathlib.Path(directory) / "px4_wall_ceiling_control"
+            (relay / "msg").mkdir(parents=True)
+            (relay / "__init__.py").write_text(
+                "__path__ = [" + repr(str(relay)) + ", " + repr(str(source)) + "]\n",
+                encoding="utf-8")
+            (relay / "msg/__init__.py").write_text("generated = True\n", encoding="utf-8")
+            code = ("import runpy; runpy.run_path(" + repr(str(server_path)) + "); "
+                    "from px4_wall_ceiling_control.msg import generated; assert generated")
+            result = subprocess.run([sys.executable, "-c", code],
+                env=dict(os.environ, PYTHONPATH=directory), capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def setUp(self):
         self.now = 100.0
         self.state = ConsoleState(clock=lambda: self.now)
@@ -129,11 +149,13 @@ class ConsoleTests(unittest.TestCase):
 
     def test_running_pipeline_is_not_restarted(self):
         self.ready()
+        self.state.launch_error = "上一次失败的启动错误"
         runtime = object.__new__(server.RemoteRuntime)
         runtime.state = self.state
         with mock.patch.object(server.threading, "Thread") as thread:
             reply = runtime.start(DEFAULT_CONFIG)
         self.assertIn("无需重复启动", reply["message"])
+        self.assertEqual(self.state.launch_error, "")
         thread.assert_not_called()
 
     def test_armed_vehicle_blocks_new_pipeline_start(self):

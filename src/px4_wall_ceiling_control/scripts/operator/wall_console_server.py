@@ -14,7 +14,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PACKAGE = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(PACKAGE / "src"))
+# Keep Catkin's relay package first: it exposes both generated msg/ and source
+# modules. The source fallback is only needed on the Windows HTTP host.
+sys.path.append(str(PACKAGE / "src"))
 from px4_wall_ceiling_control.wall_console import ConsoleState, DEFAULT_CONFIG, finite_json, launch_arguments, validate_config
 
 
@@ -143,7 +145,7 @@ class RemoteRuntime:
                 self.state.update("runtime", {"enabled": bool(enabled), "nodes": sorted(nodes),
                     "missing": sorted(required - nodes), "logger": "/attachment_flight_logger" in nodes})
                 for name, child in list(self.children.items()):
-                    if child.poll() is not None:
+                    if child.poll() is not None and not self.state.starting:
                         self.state.launch_error = name + " 已退出，请查看启动日志"
             except Exception as error:
                 self.state.update("runtime", {"enabled": False, "error": str(error)[:200]})
@@ -157,6 +159,7 @@ class RemoteRuntime:
             if self.state.snapshot()["status"]["runtime"]["fresh"] and self.state.snapshot()["status"]["runtime"]["value"].get("enabled"):
                 if self.state.config != config:
                     raise ValueError("基础程序正在运行，当前页面不支持在运行中变更配置")
+                self.state.launch_error = ""
                 return {"message": "基础程序已运行，无需重复启动"}
             flight = self.state.snapshot()["status"]["state"]
             if flight["value"] and (not flight["fresh"] or flight["value"].get("armed")):
@@ -214,6 +217,7 @@ class RemoteRuntime:
                 if time.monotonic() > deadline:
                     raise ValueError("贴墙节点启动未完成，请查看缺失节点和启动日志")
                 time.sleep(0.3)
+            self.state.launch_error = ""
             self.state.event("基础程序已就绪；等待飞手在 ALTCTL 起飞并稳定")
         except Exception as error:
             self.state.launch_error = str(error)
