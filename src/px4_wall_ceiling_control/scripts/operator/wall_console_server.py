@@ -46,6 +46,45 @@ class RemoteRuntime:
             self.children[name] = subprocess.Popen(args, stdout=out, stderr=out, start_new_session=True)
         self.state.event("启动 " + name + "；日志 " + str(log))
 
+    @staticmethod
+    def port_owners(port):
+        owners = set()
+        port = str(Path(port).resolve())
+        for fd in Path("/proc").glob("[0-9]*/fd/*"):
+            try:
+                if os.readlink(str(fd)) == port:
+                    owners.add(int(fd.parts[2]))
+            except OSError:
+                continue
+        return sorted(owners)
+
+    def prepare_lidars(self):
+        # Only the disarmed startup path may reset a measurement. Old readers
+        # can survive a ROS master restart, so node names alone are insufficient.
+        ports = [("ceiling_port", "ceiling_lidar_node"), ("front_port", "front_lidar_node")]
+        for key, _ in ports:
+            owners = self.port_owners(self.state.config[key])
+            if owners:
+                raise ValueError("雷达串口仍被旧进程占用，请结束整个旧 roslaunch: "
+                                 + self.state.config[key] + " PID " + str(owners))
+        import yaml
+        import serial
+        sensors = yaml.safe_load((PACKAGE / "config/sensors.yaml").read_text(encoding="utf-8"))
+        for key, node in ports:
+            flight = self.state.snapshot()["status"]["state"]
+            if not flight["fresh"] or not flight["value"].get("connected") or flight["value"].get("armed"):
+                raise ValueError("雷达启动复位要求新鲜、已连接且未解锁的飞控状态")
+            settings = sensors[node]
+            if settings.get("input_format", "l1_ascii") != "l1_ascii":
+                continue
+            with serial.Serial(self.state.config[key], int(settings.get("baudrate", 38400)),
+                               timeout=0.2, exclusive=True) as device:
+                device.write(b"iHALT")
+                device.flush()
+                time.sleep(0.2)
+                device.reset_input_buffer()
+            self.state.event("已复位雷达测量: " + self.state.config[key] + "；新节点将重新启动测距")
+
     def observe_existing(self):
         while self.ros is None:
             try:
@@ -208,6 +247,11 @@ class RemoteRuntime:
                 if time.monotonic() > deadline:
                     raise ValueError("MAVROS 连接超时，检查飞控串口、波特率与心跳")
                 time.sleep(0.2)
+            self.prepare_lidars()
+            # Starting sensors takes time; recheck before creating output nodes.
+            item = self.state.snapshot()["status"]["state"]
+            if not item["fresh"] or not item["value"]["connected"] or item["value"]["armed"]:
+                raise ValueError("飞控状态已变化，贴墙基础链路未启动；请在未解锁状态重试")
             self.spawn("wall_flight", launch_arguments(self.state.config))
             deadline = time.monotonic() + 15
             while not (self.state.snapshot()["status"]["runtime"]["value"] or {}).get("enabled", False):

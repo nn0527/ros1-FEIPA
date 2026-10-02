@@ -167,6 +167,37 @@ class ConsoleTests(unittest.TestCase):
             runtime.start(DEFAULT_CONFIG)
         thread.assert_not_called()
 
+    def test_lidar_startup_resets_both_measurements_only_while_disarmed(self):
+        self.ready()
+        self.state.update("state", {"connected": True, "armed": False, "mode": "ALTCTL"})
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = self.state
+        factory = mock.MagicMock()
+        yaml = SimpleNamespace(safe_load=lambda text: {
+            name: {"input_format": "l1_ascii", "baudrate": 38400}
+            for name in ("ceiling_lidar_node", "front_lidar_node")})
+        with mock.patch.object(runtime, "port_owners", return_value=[]), \
+             mock.patch.dict(sys.modules, {"serial": SimpleNamespace(Serial=factory), "yaml": yaml}), \
+             mock.patch.object(server.time, "sleep"):
+            runtime.prepare_lidars()
+            self.assertEqual(factory.call_count, 2)
+            self.assertEqual([call.args[0] for call in factory.call_args_list],
+                             ["/dev/ttyUSB1", "/dev/ttyUSB2"])
+            device = factory.return_value.__enter__.return_value
+            self.assertEqual(device.write.call_args_list, [mock.call(b"iHALT"), mock.call(b"iHALT")])
+            self.state.update("state", {"connected": True, "armed": True, "mode": "ALTCTL"})
+            factory.reset_mock()
+            with self.assertRaisesRegex(ValueError, "未解锁"):
+                runtime.prepare_lidars()
+            factory.assert_not_called()
+
+    def test_orphan_serial_reader_blocks_startup_reset(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = self.state
+        with mock.patch.object(runtime, "port_owners", return_value=[1234]), \
+             self.assertRaisesRegex(ValueError, "旧 roslaunch.*1234"):
+            runtime.prepare_lidars()
+
 
 if __name__ == "__main__":
     unittest.main()
