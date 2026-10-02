@@ -1,0 +1,21 @@
+<launch>
+  <!-- Dedicated ALTCTL -> wall-only entry. No RC attitude mixing or auto takeoff. -->
+  <arg name="ceiling_serial_port" default="/dev/ttyUSB1" />
+  <arg name="front_serial_port" default="/dev/ttyUSB2" />
+  <arg name="hover_thrust" default="0.45" />
+  <include file="$(find px4_wall_ceiling_control)/launch/system/attachment_system_mavros.launch">
+    <arg name="ceiling_serial_port" value="$(arg ceiling_serial_port)" />
+    <arg name="front_serial_port" value="$(arg front_serial_port)" />
+    <arg name="operator_source" value="terminal" />
+    <arg name="flight_mode_enabled" value="true" />
+    <arg name="wall_enabled" value="true" />
+    <arg name="ceiling_enabled" value="false" />
+    <arg name="output_enabled" value="true" />
+    <arg name="mechanism_output_enabled" value="false" />
+    <arg name="require_mechanism_ack" value="false" />
+    <arg name="wall_hold_time_s" value="0.0" />
+    <arg name="rc_assist_enabled" value="false" />
+    <arg name="require_rc_center" value="false" />
+    <arg name="hover_thrust" value="$(arg hover_thrust)" />
+  </include>
+</launch>

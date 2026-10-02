@@ -56,6 +56,7 @@ catkin_install_python(PROGRAMS
   scripts/operator/operator_gate_node.py
   scripts/operator/terminal_operator_node.py
   scripts/operator/flight_mode_manager_node.py
+  scripts/operator/wall_console_server.py
   scripts/outputs/attachment_mechanism_output_node.py
   scripts/outputs/attachment_output_mux_node.py
   scripts/sensors/lidar_distance_node.py
@@ -76,7 +77,7 @@ catkin_install_python(PROGRAMS
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
-install(DIRECTORY config docs launch
+install(DIRECTORY config docs launch web
   DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )
 
@@ -90,4 +91,5 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_ceiling_state_monitor.py)
   catkin_add_nosetests(test/test_flight_handover.py)
   catkin_add_nosetests(test/test_attachment_flight_logger.py)
+  catkin_add_nosetests(test/test_wall_console.py)
 endif()

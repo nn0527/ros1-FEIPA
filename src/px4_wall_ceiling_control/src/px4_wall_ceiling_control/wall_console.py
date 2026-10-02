@@ -1,0 +1,134 @@
+"""HTTP-console state and admission checks; independent of ROS and the browser."""
+import collections
+import math
+import re
+import threading
+import time
+
+
+DEFAULT_CONFIG = {
+    "fcu_port": "/dev/ttyUSB0", "baud": 921600,
+    "ceiling_port": "/dev/ttyUSB1", "front_port": "/dev/ttyUSB2",
+    "hover_thrust": 0.45,
+}
+LIMITS = {"state": 1.5, "odom": 0.5, "estimator": 1.5, "rc": 0.2,
+          "health": 0.3, "wall": 0.5, "phase": 0.5, "reason": 0.5,
+          "owner": 0.3, "operator": 0.5, "setpoint": 0.3,
+          "battery": 5.0, "front": 0.6, "ceiling": 0.6, "runtime": 3.0}
+
+
+def validate_config(values):
+    if not isinstance(values, dict) or set(values) - set(DEFAULT_CONFIG):
+        raise ValueError("配置字段无效")
+    result = dict(DEFAULT_CONFIG, **values)
+    for name in ("fcu_port", "ceiling_port", "front_port"):
+        if not isinstance(result[name], str) or not re.fullmatch(
+                r"/dev/(?:tty(?:USB|ACM|AMA)[0-9]+|serial/by-(?:id|path)/[\w.:+\-]+)", result[name]):
+            raise ValueError("串口必须是 /dev/ttyUSB*、ttyACM*、ttyAMA* 或稳定的 serial 路径")
+    if len({result[n] for n in ("fcu_port", "ceiling_port", "front_port")}) != 3:
+        raise ValueError("飞控和两路雷达必须使用三个不同的串口")
+    if type(result["baud"]) is not int or result["baud"] not in (57600, 115200, 230400, 460800, 921600):
+        raise ValueError("飞控波特率无效")
+    if type(result["hover_thrust"]) not in (int, float) or not math.isfinite(result["hover_thrust"]) or not 0 < result["hover_thrust"] <= 0.85:
+        raise ValueError("悬停推力需为 0 到 0.85 之间的标定值")
+    return result
+
+
+def launch_arguments(config):
+    c = validate_config(config)
+    return ["roslaunch", "px4_wall_ceiling_control", "wall_console_flight.launch",
+            "ceiling_serial_port:=" + c["ceiling_port"], "front_serial_port:=" + c["front_port"],
+            "hover_thrust:=" + str(c["hover_thrust"])]
+
+
+class ConsoleState:
+    def __init__(self, clock=time.monotonic):
+        self.clock = clock
+        self.lock = threading.RLock()
+        self.samples = {}
+        self.events = collections.deque(maxlen=100)
+        self.config = dict(DEFAULT_CONFIG)
+        self.starting = False
+        self.launch_error = ""
+        self.pending_since = None
+        self.sequence = 0
+
+    def event(self, text, kind="info"):
+        with self.lock:
+            self.sequence += 1
+            self.events.append({"id": self.sequence, "time": time.time(), "text": text, "kind": kind})
+
+    def update(self, name, value):
+        with self.lock:
+            previous = self.samples.get(name)
+            self.samples[name] = {"at": self.clock(), "value": value}
+            if name in ("phase", "reason", "owner") and (not previous or previous["value"] != value):
+                self.event({"phase": "控制阶段", "reason": "阶段反馈", "owner": "输出归属"}[name] + ": " + str(value))
+            if name == "wall" and (not previous or previous["value"]["state_name"] != value["state_name"]):
+                self.event("贴墙阶段: " + value["state_name"] + " · " + value["reason"])
+            if name == "state" and (not previous or previous["value"] != value):
+                self.event("飞控: {} / {} / {}".format("已连接" if value["connected"] else "断开",
+                           "已解锁" if value["armed"] else "未解锁", value["mode"] or "未知模式"))
+
+    def snapshot(self):
+        with self.lock:
+            now = self.clock()
+            status = {}
+            for name, limit in LIMITS.items():
+                item = self.samples.get(name)
+                age = now - item["at"] if item else None
+                status[name] = {"value": item["value"] if item else None, "age_s": age,
+                                "fresh": age is not None and 0 <= age <= limit, "limit_s": limit}
+            def val(name, default=None):
+                return status[name]["value"] if status[name]["fresh"] else default
+            flight, health, estimator, runtime = (val(n, {}) for n in ("state", "health", "estimator", "runtime"))
+            checks = [
+                ("runtime", "实飞链路", bool(runtime.get("enabled")), "基础程序未启动或实飞输出未启用"),
+                ("connected", "飞控连接", bool(flight.get("connected")), "飞控未连接或心跳已过期"),
+                ("armed", "已解锁", bool(flight.get("armed")), "等待飞手用遥控器解锁、起飞"),
+                ("mode", "ALTCTL 模式", flight.get("mode") == "ALTCTL", "贴墙请求需从 ALTCTL 模式发起"),
+                ("odom", "里程计", bool(val("odom", {}).get("finite")), "里程计缺失、过期或数值无效"),
+                ("estimator", "估计器", bool(estimator.get("attitude") and estimator.get("vertical_velocity")), "估计器状态缺失、过期或竖直速度无效"),
+                ("health", "两路雷达", bool(health.get("ceiling_valid") and health.get("front_valid")), "顶部或前向雷达无效／过期"),
+                ("idle", "待命状态", val("phase") == "IDLE" and val("owner") == 0 and
+                 val("operator", {}).get("mode") == 1 and not val("operator", {}).get("enabled", True), "已有动作请求，等待当前流程结束"),
+            ]
+            pending = self.pending_since is not None and now - self.pending_since < 5
+            blockers = [reason for _, _, ok, reason in checks if not ok]
+            if pending:
+                blockers.insert(0, "贴墙请求已发送，等待节点反馈")
+            if self.launch_error:
+                blockers.insert(0, self.launch_error)
+            success = (val("wall", {}).get("state_name") == "WALL_HOLD" and
+                       not val("wall", {}).get("fault_detected", False) and runtime.get("enabled") and
+                       status["setpoint"]["fresh"] and
+                       val("phase") == "ACTIVE" and val("owner") == 2 and
+                       flight.get("connected") and flight.get("armed") and flight.get("mode") == "OFFBOARD")
+            return {"status": status, "checks": [{"id": i, "label": label, "ok": ok, "reason": reason}
+                    for i, label, ok, reason in checks], "blockers": blockers, "can_wall": not blockers and not self.starting,
+                    "success": bool(success), "starting": self.starting, "pending": pending,
+                    "launch_error": self.launch_error, "config": dict(self.config), "events": list(self.events)}
+
+    def send_wall(self, publish):
+        # Serialize the preflight check and dispatch across tabs and double clicks.
+        with self.lock:
+            current = self.snapshot()
+            if not current["can_wall"]:
+                raise ValueError(current["blockers"][0] if current["blockers"] else "程序正在启动")
+            self.pending_since = self.clock()
+            try:
+                publish("wall")
+            except Exception:
+                self.pending_since = None
+                raise
+            self.event("已发送 wall；等待控制节点确认，尚未判定贴墙成功")
+
+
+def finite_json(value):
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {k: finite_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [finite_json(v) for v in value]
+    return value
