@@ -48,6 +48,7 @@ class FlightModeManagerNode:
         self.estimator_timeout_s = float(rospy.get_param("~estimator_timeout_s", 1.5))
         self.operator_timeout_s = float(rospy.get_param("~operator_timeout_s", 0.5))
         self.sensor_timeout_s = float(rospy.get_param("~sensor_timeout_s", 0.5))
+        self.wall_bench_wait_for_ranges = bool(rospy.get_param("~wall_bench_wait_for_ranges", False))
         self.output_timeout_s = float(rospy.get_param("~output_timeout_s", 0.3))
         self.status_timeout_s = float(rospy.get_param("~status_timeout_s", 0.5))
         self.require_rc_center = bool(rospy.get_param("~require_rc_center", False))
@@ -251,6 +252,8 @@ class FlightModeManagerNode:
             return "attitude or vertical velocity estimate invalid"
         if getattr(self, "require_rc_center", False) and not self._rc_fresh(now):
             return "RC input unavailable or invalid"
+        if selected == OperatorCommand.MODE_WALL and getattr(self, "wall_bench_wait_for_ranges", False):
+            return None  # The wall decision holds neutral until real ranges recover.
         if self.sensor is None:
             return "sensor health unavailable"
         if not is_fresh(self.sensor_at, self.sensor_timeout_s, now):

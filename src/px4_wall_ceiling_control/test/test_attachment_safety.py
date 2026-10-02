@@ -21,6 +21,7 @@ from sensor_msgs.msg import Range
 from std_msgs.msg import Bool
 
 from px4_wall_ceiling_control.adapters.odometry import vertical_speed_enu_mps
+from px4_wall_ceiling_control.adapters.takeoff_height import TakeoffHeightReference
 from px4_wall_ceiling_control.domain.geometry import (
     follow_rotation_about_body_z,
     quaternion_angle,
@@ -503,6 +504,28 @@ class AttachmentSafetyTest(unittest.TestCase):
         self.assertEqual(node.state, WallPerchStatus.STATE_IDLE)
         self.assertIn("minimum altitude gate blocked", node.last_reason)
 
+    def test_wall_uses_arming_ground_height_for_entry(self):
+        node = WallDecision.__new__(WallDecision)
+        node.state = WallPerchStatus.STATE_IDLE
+        node.rearm_required = node.cancel_requested = node.detach_requested = False
+        node.odom = Odometry()
+        node.odom.pose.pose.position.z = -0.149
+        node.min_altitude_m = 0.3
+        node.require_min_altitude = True
+        node.altitude_reference = "arming_ground"
+        node.takeoff_height = TakeoffHeightReference()
+        node.takeoff_height.observe_state(True, False, 1)
+        node.takeoff_height.observe_odom(-1.50466, 1.1, True)
+        node.takeoff_height.observe_state(True, True, 1.2)
+        node._mode_requested = node._safety_ok = lambda now: True
+        node._enter_state = lambda state, now, reason: setattr(node, "state", state)
+        node._update_state_machine(rospy.Time.from_sec(2))
+        self.assertEqual(node.state, WallPerchStatus.STATE_FRONT_WALL_DETECT)
+        node.state = WallPerchStatus.STATE_IDLE
+        node.odom.pose.pose.position.z = -1.3
+        node._update_state_machine(rospy.Time.from_sec(2))
+        self.assertEqual(node.state, WallPerchStatus.STATE_IDLE)
+
     def test_wall_front_ready_enters_three_degree_approach_directly(self):
         node = WallDecision.__new__(WallDecision)
         node.state = WallPerchStatus.STATE_FRONT_WALL_DETECT
@@ -517,6 +540,22 @@ class AttachmentSafetyTest(unittest.TestCase):
 
         node._update_state_machine(rospy.Time.from_sec(2.0))
 
+        self.assertEqual(node.state, WallPerchStatus.STATE_SLOW_APPROACH)
+
+    def test_bench_detection_waits_for_real_ranges_before_approach(self):
+        node = WallDecision.__new__(WallDecision)
+        node.state = WallPerchStatus.STATE_FRONT_WALL_DETECT
+        node.bench_wait_for_ranges = True
+        node.cancel_requested = False
+        node.fault_count = 0
+        node._mode_requested = node._safety_ok = node._front_ready = lambda now: True
+        node._bench_ranges_ready = lambda now: False
+        node._enter_state = lambda state, now, reason: setattr(node, "state", state)
+        node._update_state_machine(rospy.Time.from_sec(2))
+        self.assertEqual(node.state, WallPerchStatus.STATE_FRONT_WALL_DETECT)
+        self.assertIn("bench hover", node.last_reason)
+        node._bench_ranges_ready = lambda now: True
+        node._update_state_machine(rospy.Time.from_sec(3))
         self.assertEqual(node.state, WallPerchStatus.STATE_SLOW_APPROACH)
         node.q_hover = (0.0, 0.0, 0.0, 1.0)
         node.approach_pitch_rad = math.radians(3.0)
@@ -601,6 +640,8 @@ class AttachmentSafetyTest(unittest.TestCase):
 
     def test_wall_status_does_not_flag_stale_front_after_flip(self):
         node = WallDecision.__new__(WallDecision)
+        node.odom = None
+        node.min_altitude_m = 0.3
         node.state = WallPerchStatus.STATE_WALL_CAPTURE
         node.front_range = None
         node.front_filtered_m = None

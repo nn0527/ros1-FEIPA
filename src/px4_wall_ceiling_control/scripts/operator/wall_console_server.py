@@ -133,6 +133,8 @@ class RemoteRuntime:
                       "phase": ("/attachment/flight_phase", String), "reason": ("/attachment/flight_phase_reason", String),
                       "owner": ("/attachment/output_owner", UInt8), "operator": ("/operator/command", OperatorCommand),
                       "front": ("/sensor/front/range", Range), "ceiling": ("/sensor/ceiling/range", Range),
+                      "front_diagnostic": ("/sensor/front/diagnostic", String),
+                      "ceiling_diagnostic": ("/sensor/ceiling/diagnostic", String),
                       "setpoint": ("/mavros/setpoint_raw/attitude", AttitudeTarget), "battery": ("/mavros/battery", BatteryState)}
             self.subscriptions = [rospy.Subscriber(topic, kind, self.callback, callback_args=name,
                                     queue_size=1, tcp_nodelay=True) for name, (topic, kind) in topics.items()]
@@ -152,7 +154,10 @@ class RemoteRuntime:
                      "ceiling_age_s": msg.ceiling_age_s, "front_age_s": msg.front_age_s}
         elif name == "wall":
             value = {key: getattr(msg, key) for key in ("state_name", "reason", "progress", "fault_detected",
-                      "front_distance_filtered_m", "top_distance_filtered_m", "thrust_normalized", "top_contact_ready")}
+                      "front_distance_filtered_m", "top_distance_filtered_m", "thrust_normalized", "top_contact_ready",
+                      "altitude_reference_valid", "height_above_takeoff_m", "min_entry_height_m", "entry_height_ready")}
+        elif name in ("front_diagnostic", "ceiling_diagnostic"):
+            value = json.loads(msg.data)
         elif name in ("phase", "reason", "owner"):
             value = msg.data
         elif name == "operator":
@@ -191,14 +196,21 @@ class RemoteRuntime:
         while not self.ros.is_shutdown():
             try:
                 nodes = self.nodes()
+                wall_bench = bool(self.ros.get_param("/wall_perch_decision_node/bench_wait_for_ranges", False))
+                manager_bench = bool(self.ros.get_param("/flight_mode_manager_node/wall_bench_wait_for_ranges", False))
                 enabled = (required <= nodes and self.ros.get_param("/flight_mode_manager_node/enabled", False)
+                           and wall_bench == manager_bench
                            and self.ros.get_param("/attachment_output_mux_node/output_enabled", False)
                            and self.ros.get_param("/wall_perch_decision_node/decision_enabled", False)
                            and not self.ros.get_param("/flight_mode_manager_node/require_rc_center", False)
                            and not self.ros.get_param("/attachment_output_mux_node/rc_assist_enabled", False)
                            and not (nodes & {"/ceiling_attachment_decision_node", "/ceiling_motor_bench_output_node",
                                             "/flight_supervisor_node", "/setpoint_mux_node", "/ceiling_attachment_output_node"}))
-                self.state.update("runtime", {"enabled": bool(enabled), "nodes": sorted(nodes),
+                profile = "restrained_bench" if wall_bench and manager_bench else "flight"
+                with self.state.lock:
+                    if required <= nodes:
+                        self.state.config["test_profile"] = profile
+                self.state.update("runtime", {"enabled": bool(enabled), "test_profile": profile, "nodes": sorted(nodes),
                     "missing": sorted(required - nodes), "logger": "/attachment_flight_logger" in nodes})
                 for name, child in list(self.children.items()):
                     if child.poll() is not None and not self.state.starting:
@@ -406,16 +418,20 @@ class SSHTransport:
                 if item["age_s"] is not None:
                     item["age_s"] += age or 0
                     item["fresh"] = connected and item["age_s"] <= item["limit_s"]
-            stale = any(not result["status"][n]["fresh"] for n in ("runtime", "state", "odom", "estimator", "health", "operator", "phase", "owner"))
+            required_feedback = ("runtime", "state", "odom", "estimator", "operator", "phase", "owner", "wall")
+            if config["test_profile"] != "restrained_bench":
+                required_feedback += ("health",)
+            stale = any(not result["status"][n]["fresh"] for n in required_feedback)
             check_sources = {"runtime": ("runtime",), "connected": ("state",), "armed": ("state",),
                              "mode": ("state",), "odom": ("odom",), "estimator": ("estimator",),
-                             "health": ("health",), "idle": ("phase", "owner", "operator")}
+                             "health": () if config["test_profile"] == "restrained_bench" else ("health",),
+                             "height": () if config["test_profile"] == "restrained_bench" else ("wall", "odom"), "idle": ("phase", "owner", "operator")}
             for check in result["checks"]:
                 if any(not result["status"][name]["fresh"] for name in check_sources.get(check["id"], ())):
                     check["ok"] = False
             if stale and connected:
-                labels = {"runtime": "基础程序", "state": "飞控心跳", "odom": "里程计", "estimator": "估计器", "health": "雷达", "operator": "操作节点", "phase": "控制阶段", "owner": "输出归属"}
-                stale_reasons = [label + "反馈缺失或已过期" for name, label in labels.items() if not result["status"][name]["fresh"]]
+                labels = {"runtime": "基础程序", "state": "飞控心跳", "odom": "里程计", "estimator": "估计器", "health": "雷达", "operator": "操作节点", "phase": "控制阶段", "owner": "输出归属", "wall": "贴墙决策"}
+                stale_reasons = [labels[name] + "反馈缺失或已过期" for name in required_feedback if not result["status"][name]["fresh"]]
                 result["blockers"] = list(dict.fromkeys(result["blockers"] + stale_reasons))
             if not result["status"]["wall"]["fresh"] or not result["status"]["setpoint"]["fresh"]:
                 result["success"] = False

@@ -88,6 +88,8 @@ wall_perch_decision_node:
   recover_max_rate_rps: 3.0
   max_down_velocity_mps: 0.80
   min_altitude_m: 0.30
+  # Local ENU z can drift below zero on the ground; freeze ground z on arming.
+  altitude_reference: arming_ground
   recover_angle_deg: 15.0
   sensor_timeout_s: 0.60
   sensor_health_timeout_s: 0.30

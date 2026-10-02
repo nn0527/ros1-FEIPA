@@ -306,6 +306,15 @@ class FlightHandoverTest(unittest.TestCase):
             node._preflight_failure_reason(now, OperatorCommand.MODE_WALL),
             "front sensor invalid",
         )
+        node.wall_bench_wait_for_ranges = True
+        self.assertTrue(node._preflight_ready(now, OperatorCommand.MODE_WALL))
+        node.flight.armed = False
+        self.assertFalse(node._preflight_ready(now, OperatorCommand.MODE_WALL))
+        node.flight.armed = True
+        node.estimator.velocity_vert_status_flag = False
+        self.assertFalse(node._preflight_ready(now, OperatorCommand.MODE_WALL))
+        node.estimator.velocity_vert_status_flag = True
+        node.wall_bench_wait_for_ranges = False
         node.sensor.front_valid = True
         self.assertTrue(node._preflight_ready(now, OperatorCommand.MODE_WALL))
         node.sensor_at = rospy.Time.from_sec(9.0)

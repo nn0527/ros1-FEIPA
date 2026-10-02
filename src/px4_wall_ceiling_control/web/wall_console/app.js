@@ -18,6 +18,7 @@ const translate = {
   "wall capture timeout":"确认墙面接触超时", "wall contact or safety lost":"墙面接触丢失或输入无效",
   "capture safety failure":"确认接触时输入或飞行状态无效", "cancel or wall mode released":"贴墙请求已取消或释放",
   "control released":"贴墙控制已释放", "sensor health unavailable":"未收到雷达健康状态"
+  , "bench hover: waiting for valid front/top ranges and wall distance":"台架悬停等待：两路雷达恢复有效，且前向距离满足接近条件后继续"
 };
 const wallNames = {IDLE:"等待贴墙指令", FRONT_WALL_DETECT:"检测墙面", STABILIZE_HOVER:"稳定悬停",
   SLOW_APPROACH:"缓慢接近墙面", FLIP_TO_WALL:"翻转贴墙", WALL_CAPTURE:"确认墙面接触",
@@ -45,6 +46,7 @@ function paint(s){
   $("start").disabled=requestBusy || !ssh || s.starting || (state?.armed && !enabled);
   text("startLabel",s.starting?"正在启动…":enabled?"基础程序已启动":"启动基础程序");
   $("wall").disabled=requestBusy || !ssh || !s.can_wall;
+  text("wallBlockReason",s.can_wall?"":s.blockers.join("；"));
   for(const field of form.elements) field.disabled=s.starting || enabled || requestBusy;
   let title="等待启动", reason=s.blockers[0] || "飞行稳定后，可发送贴墙指令", step=0;
   if(!ssh){title="SSH 反馈中断";reason=s.ssh.error || "正在重新连接树莓派";}
@@ -69,6 +71,9 @@ function paint(s){
   text("angles",odom?.angles ? n(odom.angles[0],1)+" / "+n(odom.angles[1],1) : "—");
   const thrust=fresh(s,"setpoint")?.thrust;text("thrust",typeof thrust==="number"?n(thrust*100,1):"—");
   text("velocity",n(odom?.vertical_speed));text("battery",n(fresh(s,"battery")?.voltage,1));
+  text("height",n(wall?.height_above_takeoff_m));
+  text("rangeWarning",(s.sensor_warnings || []).join("；") +
+    (s.config.test_profile==="restrained_bench"?"　有约束台架：高度和雷达入口门槛关闭；距离恢复前悬停等待，接近／翻转仍需有效雷达。":""));
   const owner=fresh(s,"owner");text("owner",owner===2?"侧吸":owner===1?"吸顶":owner===0?"无":"—");
   rows($("checks"),s.checks,check=>{
     let label=check.label,ok=check.ok,value=ok?"就绪":"待满足";
@@ -107,7 +112,7 @@ async function poll(){
   }catch(error){
     text("connectionText","本机服务无响应");$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;
     $("successNote").hidden=true;text("stageTitle","反馈中断");text("stageReason","无法确认当前阶段，请核对飞控状态");
-    for(const id of ["front","ceiling","angles","thrust","mode","velocity","battery","owner","armed","flightConnection"])text(id,"—");
+    for(const id of ["front","ceiling","angles","thrust","mode","height","velocity","battery","owner","armed","flightConnection"])text(id,"—");
     text("sshError",error.message);document.querySelectorAll(".steps li").forEach(el=>el.classList.remove("done","current"));
     document.querySelectorAll(".check").forEach(el=>{el.classList.remove("ok");el.lastChild.textContent="待确认";});
     document.querySelectorAll(".ageRow").forEach(el=>{el.lastChild.textContent="反馈中断";el.lastChild.classList.add("stale");});

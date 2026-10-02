@@ -3,9 +3,11 @@
 
 import math
 import re
+import json
 
 import rospy
 from sensor_msgs.msg import Range
+from std_msgs.msg import String
 
 
 class LidarDistanceNode:
@@ -39,6 +41,8 @@ class LidarDistanceNode:
         self.range_publisher = rospy.Publisher(
             self.range_topic, Range, queue_size=10
         )
+        diagnostic_topic = self.range_topic.rsplit("/", 1)[0] + "/diagnostic"
+        self.diagnostic_publisher = rospy.Publisher(diagnostic_topic, String, queue_size=10, latch=True)
         if self.input_format == "legacy_pair":
             ceiling_topic = rospy.get_param(
                 "~ceiling_range_topic", "/sensor/ceiling/raw"
@@ -182,7 +186,16 @@ class LidarDistanceNode:
                                 continue
                             try:
                                 self._handle_line(raw_line)
+                                self.diagnostic_publisher.publish(String(data=json.dumps(
+                                    {"valid": True, "error": ""})))
                             except (UnicodeError, ValueError) as exc:
+                                self.diagnostic_publisher.publish(String(data=json.dumps(
+                                    {"valid": False, "error": str(exc)})))
+                                # A sensor error is an invalid measurement, not
+                                # a new sample of the last successful distance.
+                                if self.input_format == "l1_ascii":
+                                    self.range_publisher.publish(self._make_range(
+                                        math.nan, self.frame_id, rospy.Time.now()))
                                 rospy.logwarn_throttle(2.0, "invalid lidar frame: %s", exc)
                     finally:
                         if self.input_format == "l1_ascii" and self.halt_on_shutdown:

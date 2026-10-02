@@ -72,7 +72,10 @@ class ConsoleTests(unittest.TestCase):
     def ready(self):
         for name, value in {"runtime": {"enabled": True}, "state": {"connected": True, "armed": True, "mode": "ALTCTL"},
                "health": {"ceiling_valid": True, "front_valid": True}, "estimator": {"attitude": True, "vertical_velocity": True},
-               "odom": {"finite": True}, "phase": "IDLE", "owner": 0, "operator": {"mode": 1, "enabled": False}}.items():
+               "odom": {"finite": True}, "wall": {"state_name": "IDLE", "reason": "initialized",
+                   "altitude_reference_valid": True, "height_above_takeoff_m": 1.2,
+                   "min_entry_height_m": 0.3, "entry_height_ready": True},
+               "phase": "IDLE", "owner": 0, "operator": {"mode": 1, "enabled": False}}.items():
             self.state.update(name, value)
 
     def test_ready_dispatches_exactly_one_wall(self):
@@ -86,11 +89,34 @@ class ConsoleTests(unittest.TestCase):
     def test_stale_estimator_blocks_even_when_flag_remains_true(self):
         self.ready()
         self.now += 1.6
-        for name in ("state", "runtime", "health", "odom", "phase", "owner", "operator"):
+        for name in ("state", "runtime", "health", "odom", "wall", "phase", "owner", "operator"):
             self.state.update(name, self.state.samples[name]["value"])
         with self.assertRaisesRegex(ValueError, "估计器"):
             self.state.send_wall(self.publisher)
         self.publisher.assert_not_called()
+
+    def test_height_and_sensor_failures_are_visible_and_block_dispatch(self):
+        self.ready()
+        self.state.update("wall", dict(self.state.samples["wall"]["value"],
+                                      height_above_takeoff_m=0.2, entry_height_ready=False))
+        with self.assertRaisesRegex(ValueError, "相对起飞高度"):
+            self.state.send_wall(self.publisher)
+        self.ready()
+        self.state.update("health", {"front_valid": False, "ceiling_valid": True})
+        self.state.update("front_diagnostic", {"valid": False, "error": "L1 error 255 (weak reflection)"})
+        with self.assertRaisesRegex(ValueError, "前向雷达.*E255"):
+            self.state.send_wall(self.publisher)
+        self.publisher.assert_not_called()
+
+    def test_restrained_bench_ignores_entry_height_and_sensor_not_flight_feedback(self):
+        self.ready()
+        self.state.config["test_profile"] = "restrained_bench"
+        self.state.update("health", {"front_valid": False, "ceiling_valid": False})
+        self.state.update("wall", dict(self.state.samples["wall"]["value"], entry_height_ready=False))
+        self.assertTrue(self.state.snapshot()["can_wall"])
+        self.state.update("state", {"connected": False, "armed": False, "mode": ""})
+        self.assertFalse(self.state.snapshot()["can_wall"])
+        self.assertIn("restrained_bench:=true", launch_arguments(self.state.config))
 
     def test_disarmed_wrong_mode_invalid_sensor_and_existing_intent_block(self):
         mutations = [("state", {"connected": True, "armed": False, "mode": "ALTCTL"}),

@@ -9,7 +9,7 @@
 <section class="panel operations"><h2>试飞操作</h2><div class="actions">
 <button id="start" class="start" disabled><span>01</span><strong id="startLabel">启动基础程序</strong></button>
 <button id="wall" class="wall" disabled><span>02</span><strong>一键贴墙</strong></button></div>
-<p class="helper">飞行稳定后再发送贴墙指令</p><p id="actionMessage" role="status" aria-live="polite"></p></section>
+<p class="helper">飞行稳定后再发送贴墙指令</p><p id="wallBlockReason" class="errorText" role="status"></p><p id="actionMessage" role="status" aria-live="polite"></p></section>
 <section class="panel stage"><h2>当前阶段</h2><div class="stageContent"><h3 id="stageTitle">等待连接</h3>
 <p id="stageReason" aria-live="polite">正在建立 SSH 反馈通道</p></div>
 <ol class="steps"><li>待命</li><li>预发送</li><li>进入控制</li><li>接近墙面</li><li>翻转贴墙</li><li>贴墙保持</li></ol>
@@ -19,13 +19,14 @@
 <div><label>顶部距离</label><strong id="ceiling">—</strong><small>m</small></div>
 <div><label>横滚 / 俯仰</label><strong id="angles">—</strong><small>°</small></div>
 <div><label>输出推力</label><strong id="thrust">—</strong><small>%</small></div></div>
-<div class="secondaryReadings"><span>模式 <b id="mode">—</b></span><span>竖直速度 <b id="velocity">—</b> m/s</span><span>电池 <b id="battery">—</b> V</span><span>输出归属 <b id="owner">—</b></span></div></section>
+<div class="secondaryReadings"><span>模式 <b id="mode">—</b></span><span>相对起飞高度 <b id="height">—</b> m</span><span>竖直速度 <b id="velocity">—</b> m/s</span><span>电池 <b id="battery">—</b> V</span><span>输出归属 <b id="owner">—</b></span></div><p id="rangeWarning" class="errorText" role="status"></p></section>
 <section class="panel records"><h2>操作记录</h2><div class="tableHead"><span>时间</span><span>事件</span></div>
 <div id="events" role="log" aria-live="off"><p class="empty">等待树莓派实时反馈</p></div></section>
 </div><aside>
 <section class="panel configuration"><h2>启动配置</h2><form id="config">
 <label for="fcu_port">FCU 串口</label><input id="fcu_port" name="fcu_port" value="/dev/ttyUSB0" required>
 <label for="baud">波特率</label><select id="baud" name="baud"><option>57600</option><option>115200</option><option selected>230400</option><option>460800</option><option>921600</option></select>
+<label for="test_profile">测试配置</label><select id="test_profile" name="test_profile"><option value="flight">普通实飞</option><option value="restrained_bench">有约束台架</option></select>
 <label for="ceiling_port">顶部雷达</label><input id="ceiling_port" name="ceiling_port" value="/dev/ttyUSB1" required>
 <label for="front_port">前向雷达</label><input id="front_port" name="front_port" value="/dev/ttyUSB2" required>
 <label for="hover_thrust">悬停推力</label><input id="hover_thrust" name="hover_thrust" type="number" min="0.01" max="0.85" step="0.01" value="0.45" required>

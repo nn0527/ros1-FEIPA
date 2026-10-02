@@ -11,6 +11,7 @@ from sensor_msgs.msg import Range
 from std_msgs.msg import Bool
 
 from px4_wall_ceiling_control.adapters.odometry import vertical_speed_enu_mps
+from px4_wall_ceiling_control.adapters.takeoff_height import TakeoffHeightReference
 from px4_wall_ceiling_control.domain.geometry import (
     euler_from_quaternion,
     follow_rotation_about_body_z,
@@ -191,6 +192,11 @@ class WallPerchDecisionNode:
             rospy.get_param("~max_down_velocity_mps", 0.80)
         )
         self.min_altitude_m = float(rospy.get_param("~min_altitude_m", 0.30))
+        self.altitude_reference = rospy.get_param("~altitude_reference", "arming_ground")
+        self.bench_wait_for_ranges = bool(rospy.get_param("~bench_wait_for_ranges", False))
+        if self.altitude_reference not in ("arming_ground", "local_origin"):
+            raise ValueError("altitude_reference must be arming_ground or local_origin")
+        self.takeoff_height = TakeoffHeightReference()
         self.require_min_altitude = bool(
             rospy.get_param("~require_min_altitude", True)
         )
@@ -470,6 +476,11 @@ class WallPerchDecisionNode:
         self.odom = message
         now = rospy.Time.now()
         self.odom_received_at = now
+        if hasattr(self, "takeoff_height"):
+            flight = self.flight_state
+            confirmed = bool(flight is not None and flight.connected and not flight.armed
+                and is_fresh(self.flight_state_received_at, self.state_timeout_s, now))
+            self.takeoff_height.observe_odom(message.pose.pose.position.z, now.to_sec(), confirmed)
         if self.state == WallPerchStatus.STATE_WALL_HOLD:
             if self._detach_pose_valid():
                 if self.detach_stable_since is None:
@@ -482,6 +493,22 @@ class WallPerchDecisionNode:
     def _on_state(self, message):
         self.flight_state = message
         self.flight_state_received_at = rospy.Time.now()
+        if hasattr(self, "takeoff_height"):
+            self.takeoff_height.observe_state(message.connected, message.armed,
+                                              self.flight_state_received_at.to_sec())
+
+    def _entry_height(self):
+        if self.odom is None:
+            return None
+        z = self.odom.pose.pose.position.z
+        if getattr(self, "altitude_reference", "local_origin") == "arming_ground":
+            return self.takeoff_height.height(z)
+        return z if math.isfinite(z) else None
+
+    def _entry_height_ready(self):
+        height = self._entry_height()
+        return bool(not getattr(self, "require_min_altitude", True) or
+                    (height is not None and height > self.min_altitude_m))
 
     def _on_operator(self, message):
         self.operator = message
@@ -603,6 +630,8 @@ class WallPerchDecisionNode:
         )
 
     def _top_preflight_ready(self, now):
+        if self._bench_waiting():
+            return True
         if not self.require_top_sensor_on_acquire:
             return True
         return bool(
@@ -638,6 +667,8 @@ class WallPerchDecisionNode:
         )
 
     def _front_required(self):
+        if self._bench_waiting():
+            return False
         # The forward-facing lidar is only a decision/safety input until the
         # flip starts.  After rotation it may no longer face the wall.
         return self.state in (
@@ -656,6 +687,15 @@ class WallPerchDecisionNode:
             math.isfinite(value) and abs(value) <= limit
             for value in (rate.x, rate.y, rate.z)
         )
+
+    def _bench_waiting(self):
+        return bool(getattr(self, "bench_wait_for_ranges", False) and self.state in (
+            WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_FRONT_WALL_DETECT))
+
+    def _bench_ranges_ready(self, now):
+        return bool(self._sensor_health_fresh(now) and self.sensor_health.front_valid
+                    and self.sensor_health.ceiling_valid and self._front_fresh(now)
+                    and self._top_fresh(now))
 
     def _vertical_speed_safe(self):
         if self.odom is None:
@@ -716,6 +756,8 @@ class WallPerchDecisionNode:
         if not self._top_preflight_ready(now):
             return False
         if self._front_required() and not self._front_fresh(now):
+            return False
+        if self._front_required() and self._sensor_health_fresh(now) and not self.sensor_health.front_valid:
             return False
         if self._top_required() and not self._top_fresh(now):
             return False
@@ -925,14 +967,7 @@ class WallPerchDecisionNode:
                 self.rearm_required = False
                 self.detach_requested = False
                 self.cancel_requested = False
-            altitude_ok = bool(
-                not getattr(self, "require_min_altitude", True)
-                or (
-                    self.odom is not None
-                    and math.isfinite(self.odom.pose.pose.position.z)
-                    and self.odom.pose.pose.position.z > self.min_altitude_m
-                )
-            )
+            altitude_ok = self._entry_height_ready()
             safety_ok = self._safety_ok(now)
             if mode_requested and not self.rearm_required and altitude_ok and safety_ok:
                 self._enter_state(
@@ -944,14 +979,11 @@ class WallPerchDecisionNode:
                 if self.rearm_required:
                     self.last_reason = "waiting for operator release before rearm"
                 elif not altitude_ok:
-                    altitude = (
-                        self.odom.pose.pose.position.z
-                        if self.odom is not None
-                        else math.nan
-                    )
-                    self.last_reason = (
-                        "minimum altitude gate blocked: z={:.3f} m <= {:.3f} m"
-                    ).format(altitude, self.min_altitude_m)
+                    altitude = self._entry_height()
+                    self.last_reason = ("takeoff ground reference unavailable; restart while disarmed"
+                        if altitude is None else
+                        "minimum altitude gate blocked: height={:.3f} m <= {:.3f} m".format(
+                            altitude, self.min_altitude_m))
                 elif not safety_ok:
                     self.last_reason = "waiting for fresh wall safety inputs"
 
@@ -959,12 +991,14 @@ class WallPerchDecisionNode:
             if not self._safety_ok(now):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "front detect safety failure")
-            elif self._front_ready(now):
+            elif self._front_ready(now) and (not self._bench_waiting() or self._bench_ranges_ready(now)):
                 self._enter_state(
                     WallPerchStatus.STATE_SLOW_APPROACH,
                     now,
                     "front wall ready; begin 3 deg approach",
                 )
+            elif self._bench_waiting():
+                self.last_reason = "bench hover: waiting for valid front/top ranges and wall distance"
 
         elif self.state == WallPerchStatus.STATE_STABILIZE_HOVER:
             if not self._safety_ok(now):
@@ -1180,6 +1214,11 @@ class WallPerchDecisionNode:
         status.sensor_health_fresh = self._sensor_health_fresh(now)
         status.top_preflight_ready = self._top_preflight_ready(now)
         status.odom_fresh = self._odom_fresh(now)
+        height = self._entry_height()
+        status.altitude_reference_valid = height is not None
+        status.height_above_takeoff_m = height if height is not None else math.nan
+        status.min_entry_height_m = self.min_altitude_m
+        status.entry_height_ready = self._entry_height_ready()
         status.flight_state_fresh = self._flight_ready(now)
         status.front_ready = self._held_status(
             status.front_range_fresh

@@ -42,3 +42,8 @@ geometry_msgs/Quaternion attitude_setpoint
 float32 thrust_normalized
 uint32 fault_count
 string reason
+# Entry height uses the frozen ground reference from before arming (ENU up).
+bool altitude_reference_valid
+float32 height_above_takeoff_m
+float32 min_entry_height_m
+bool entry_height_ready

@@ -23,6 +23,7 @@
        any sensor, MAVROS, decision, operator or output node. -->
   <arg name="wall_min_altitude_m" default="0.30" />
   <arg name="wall_require_min_altitude" default="true" />
+  <arg name="wall_bench_wait_for_ranges" default="false" />
   <arg name="output_max_thrust" default="0.85" />
   <arg name="match_fcu_thrust_on_handover" default="false" />
   <arg name="thrust_handover_ramp_s" default="1.0" />
@@ -85,6 +86,7 @@
   <node pkg="px4_wall_ceiling_control" type="flight_mode_manager_node.py"
         name="flight_mode_manager_node" output="$(arg node_output)">
     <param name="enabled" value="$(arg flight_mode_enabled)" />
+    <param name="wall_bench_wait_for_ranges" value="$(arg wall_bench_wait_for_ranges)" />
     <param name="estimator_timeout_s"
            value="$(arg flight_estimator_timeout_s)" />
     <param name="state_timeout_s"
@@ -118,6 +120,7 @@
     <param name="min_altitude_m" value="$(arg wall_min_altitude_m)" />
     <param name="require_min_altitude"
            value="$(arg wall_require_min_altitude)" />
+    <param name="bench_wait_for_ranges" value="$(arg wall_bench_wait_for_ranges)" />
     <param name="hover_thrust" value="$(arg hover_thrust)" />
     <param name="state_timeout_s" value="$(arg flight_state_timeout_s)" />
   </node>

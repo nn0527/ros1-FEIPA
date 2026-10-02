@@ -10,17 +10,21 @@ DEFAULT_CONFIG = {
     "fcu_port": "/dev/ttyUSB0", "baud": 230400,
     "ceiling_port": "/dev/ttyUSB1", "front_port": "/dev/ttyUSB2",
     "hover_thrust": 0.45,
+    "test_profile": "flight",
 }
 LIMITS = {"state": 1.5, "odom": 0.5, "estimator": 1.5, "rc": 0.2,
           "health": 0.3, "wall": 0.5, "phase": 0.5, "reason": 0.5,
           "owner": 0.3, "operator": 0.5, "setpoint": 0.3,
           "battery": 5.0, "front": 0.6, "ceiling": 0.6, "runtime": 3.0}
+LIMITS.update({"front_diagnostic": 3.0, "ceiling_diagnostic": 3.0})
 
 
 def validate_config(values):
     if not isinstance(values, dict) or set(values) - set(DEFAULT_CONFIG):
         raise ValueError("配置字段无效")
     result = dict(DEFAULT_CONFIG, **values)
+    if result["test_profile"] not in ("flight", "restrained_bench"):
+        raise ValueError("测试配置必须为普通实飞或有约束台架")
     for name in ("fcu_port", "ceiling_port", "front_port"):
         if not isinstance(result[name], str) or not re.fullmatch(
                 r"/dev/(?:tty(?:USB|ACM|AMA)[0-9]+|serial/by-(?:id|path)/[\w.:+\-]+)", result[name]):
@@ -38,7 +42,8 @@ def launch_arguments(config):
     c = validate_config(config)
     return ["roslaunch", "px4_wall_ceiling_control", "wall_console_flight.launch",
             "ceiling_serial_port:=" + c["ceiling_port"], "front_serial_port:=" + c["front_port"],
-            "hover_thrust:=" + str(c["hover_thrust"])]
+            "hover_thrust:=" + str(c["hover_thrust"]),
+            "restrained_bench:=" + ("true" if c["test_profile"] == "restrained_bench" else "false")]
 
 
 class ConsoleState:
@@ -82,14 +87,31 @@ class ConsoleState:
             def val(name, default=None):
                 return status[name]["value"] if status[name]["fresh"] else default
             flight, health, estimator, runtime = (val(n, {}) for n in ("state", "health", "estimator", "runtime"))
+            wall = val("wall", {})
+            bench = self.config["test_profile"] == "restrained_bench"
+            height_reason = ("未建立起飞地面参考；请在未解锁时启动基础程序" if not wall.get("altitude_reference_valid")
+                else "相对起飞高度 {:.2f} m，需大于 {:.2f} m".format(
+                    wall.get("height_above_takeoff_m", 0), wall.get("min_entry_height_m", 0.3)))
+            if bench:
+                height_reason = "有约束台架：高度入口门槛已关闭"
+            sensor_reasons = []
+            for name, label in (("front", "前向"), ("ceiling", "顶部")):
+                if not health.get(name + "_valid"):
+                    diagnostic = val(name + "_diagnostic", {})
+                    error = diagnostic.get("error")
+                    explanation = ("E255：反射弱／测量失败，请检查光点和反射面" if error and "L1 error 255" in error else
+                        "E258：超出量程，请检查目标距离和光路" if error and "L1 error 258" in error else
+                        error or "距离数据缺失或过期")
+                    sensor_reasons.append(label + "雷达：" + explanation)
             checks = [
                 ("runtime", "实飞链路", bool(runtime.get("enabled")), "基础程序未启动或实飞输出未启用"),
                 ("connected", "飞控连接", bool(flight.get("connected")), "飞控未连接或心跳已过期"),
                 ("armed", "已解锁", bool(flight.get("armed")), "等待飞手用遥控器解锁、起飞"),
                 ("mode", "ALTCTL 模式", flight.get("mode") == "ALTCTL", "贴墙请求需从 ALTCTL 模式发起"),
                 ("odom", "里程计", bool(val("odom", {}).get("finite")), "里程计缺失、过期或数值无效"),
+                ("height", "高度门槛（台架关闭）" if bench else "相对起飞高度", bench or bool(wall.get("entry_height_ready")), height_reason),
                 ("estimator", "估计器", bool(estimator.get("attitude") and estimator.get("vertical_velocity")), "估计器状态缺失、过期或竖直速度无效"),
-                ("health", "两路雷达", bool(health.get("ceiling_valid") and health.get("front_valid")), "顶部或前向雷达无效／过期"),
+                ("health", "雷达入口门槛（台架关闭）" if bench else "两路雷达", bench or bool(health.get("ceiling_valid") and health.get("front_valid")), "；".join(sensor_reasons) or "顶部或前向雷达无效／过期"),
                 ("idle", "待命状态", val("phase") == "IDLE" and val("owner") == 0 and
                  val("operator", {}).get("mode") == 1 and not val("operator", {}).get("enabled", True), "已有动作请求，等待当前流程结束"),
             ]
@@ -107,6 +129,7 @@ class ConsoleState:
             return {"status": status, "checks": [{"id": i, "label": label, "ok": ok, "reason": reason}
                     for i, label, ok, reason in checks], "blockers": blockers, "can_wall": not blockers and not self.starting,
                     "success": bool(success), "starting": self.starting, "pending": pending,
+                    "sensor_warnings": sensor_reasons,
                     "launch_error": self.launch_error, "config": dict(self.config), "events": list(self.events)}
 
     def send_wall(self, publish):

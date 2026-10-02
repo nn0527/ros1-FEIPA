@@ -3,6 +3,7 @@
   <arg name="ceiling_serial_port" default="/dev/ttyUSB1" />
   <arg name="front_serial_port" default="/dev/ttyUSB2" />
   <arg name="hover_thrust" default="0.45" />
+  <arg name="restrained_bench" default="false" />
   <include file="$(find px4_wall_ceiling_control)/launch/system/attachment_system_mavros.launch">
     <arg name="ceiling_serial_port" value="$(arg ceiling_serial_port)" />
     <arg name="front_serial_port" value="$(arg front_serial_port)" />
@@ -17,5 +18,7 @@
     <arg name="rc_assist_enabled" value="false" />
     <arg name="require_rc_center" value="false" />
     <arg name="hover_thrust" value="$(arg hover_thrust)" />
+    <arg name="wall_require_min_altitude" value="$(eval not arg('restrained_bench'))" />
+    <arg name="wall_bench_wait_for_ranges" value="$(arg restrained_bench)" />
   </include>
 </launch>
