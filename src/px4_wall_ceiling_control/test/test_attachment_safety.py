@@ -917,6 +917,51 @@ class AttachmentSafetyTest(unittest.TestCase):
         node._update_state_machine(rospy.Time.from_sec(2.2))
         self.assertEqual(node.state, WallPerchStatus.STATE_EXIT)
 
+    def test_bench_recovery_ignores_radar_and_height_drift(self):
+        node = WallDecision.__new__(WallDecision)
+        node.bench_wait_for_ranges = True
+        node.state = WallPerchStatus.STATE_RECOVER
+        node.state_entered_at = rospy.Time.from_sec(1.0)
+        node.recover_time_s = 1.0
+        node.recover_max_rate_rps = 3.0
+        node.cancel_requested = False
+        node.fault_count = 0
+        node.odom_twist_in_child_frame = False
+        node.odom = Odometry()
+        node.odom.pose.pose.position.z = -20.0
+        node.odom.twist.twist.linear.z = -2.0
+        node._mode_requested = lambda _now: True
+        node._safety_ok = lambda _now: True
+        node._attitude_recovered = lambda: True
+        node._rates_safe = lambda _limit=None: True
+        node._top_clear_ready = lambda _now: False
+        node._enter_state = lambda state, _now, _reason: setattr(node, "state", state)
+        now = rospy.Time.from_sec(2.0)
+        self.assertTrue(node._top_preflight_ready(now))
+        self.assertFalse(node._top_required())
+        node._update_state_machine(now)
+        self.assertEqual(node.state, WallPerchStatus.STATE_EXIT)
+
+    def test_exit_holds_output_until_fcu_leaves_offboard(self):
+        node = WallDecision.__new__(WallDecision)
+        now = rospy.Time.from_sec(10.0)
+        node.state = WallPerchStatus.STATE_EXIT
+        node.cancel_requested = False
+        node._mode_requested = lambda _now: False
+        node._flight_ready = lambda _now: True
+        node._enter_state = mock.Mock()
+        node._update_state_machine(now)
+        node._enter_state.assert_not_called()
+        node.q_hover = (0.0, 0.0, 0.0, 1.0)
+        node.hover_thrust = 0.45
+        node.max_thrust = 0.85
+        self.assertEqual(node._candidate(now)[1:3], (node.q_hover, 0.45))
+        node._flight_ready = lambda _now: False
+        node.flight_state_received_at = now
+        node.state_timeout_s = 1.5
+        node._update_state_machine(now)
+        self.assertEqual(node._enter_state.call_args[0][0], WallPerchStatus.STATE_IDLE)
+
     def test_stale_top_range_cannot_confirm_contact(self):
         node = WallDecision.__new__(WallDecision)
         node.top_filtered_m = 0.04

@@ -578,6 +578,94 @@ class FlightHandoverTest(unittest.TestCase):
         self.assertEqual(node.phase_pub.publish.call_args[0][0].data, Manager.LOCKED)
         self.assertEqual(node.phase_reason_pub.publish.call_args[0][0].data, node.phase_reason)
 
+    def test_abort_recovery_can_handover_while_owner_is_retained(self):
+        node = Manager.__new__(Manager)
+        now = rospy.Time.from_sec(10.0)
+        node.selected_mode = OperatorCommand.MODE_WALL
+        node.owner = 2
+        node.owner_at = now
+        node.owner_seen = False
+        node.output_timeout_s = 0.3
+        node.status_timeout_s = 0.5
+        node.completed = False
+        node.fault_seen = True
+        node.detach_seen = node.recovery_seen = True
+        node.wall_at = now
+        node.wall = WallPerchStatus(state=WallPerchStatus.STATE_EXIT, fault_detected=True, recovery_completed=True)
+        node._observe_completion(now)
+        self.assertTrue(node.completed)
+        self.assertTrue(node.owner_seen)
+        self.assertTrue(node.fault_seen)
+
+    def test_return_waits_in_offboard_when_handover_not_ready(self):
+        node = Manager.__new__(Manager)
+        now = rospy.Time.from_sec(10.0)
+        node.phase = Manager.RETURNING
+        node.flight = State(mode="OFFBOARD", armed=True, connected=True)
+        node.flight_at = now
+        node.state_timeout_s = 1.5
+        node._requested_mode = lambda _now: OperatorCommand.MODE_WALL
+        node._handover_ready = lambda _now: False
+        node._reset = mock.Mock()
+        node._request_mode = mock.Mock()
+        node.prestream_pub = mock.Mock()
+        node.phase_pub = mock.Mock()
+        with mock.patch.object(rospy.Time, "now", return_value=now):
+            node._on_timer(None)
+        self.assertEqual(node.phase, Manager.RETURNING)
+        self.assertTrue(node.prestream_pub.publish.call_args[0][0].data)
+        node._reset.assert_not_called()
+        node._request_mode.assert_not_called()
+
+    def test_wall_retained_owner_handover_waits_for_altctl_confirmation(self):
+        node = Manager.__new__(Manager)
+        now = rospy.Time.from_sec(10.0)
+        node.phase = Manager.ACTIVE
+        node.phase_since = time.monotonic()
+        node.selected_mode = OperatorCommand.MODE_WALL
+        node.flight = State(mode="OFFBOARD", armed=True, connected=True)
+        node.flight_at = node.owner_at = now
+        node.state_timeout_s = 1.5
+        node.output_timeout_s = 0.3
+        node.owner = 2
+        node.owner_seen = node.completed = True
+        node._requested_mode = lambda _now: OperatorCommand.MODE_WALL
+        node._observe_completion = lambda _now: None
+        node._handover_ready = lambda _now: True
+        node._request_mode = mock.Mock()
+        node.prestream_pub = mock.Mock()
+        node.phase_pub = mock.Mock()
+        with mock.patch.object(rospy.Time, "now", return_value=now):
+            node._on_timer(None)
+            self.assertEqual(node.phase, Manager.RETURNING)
+            node._on_timer(None)
+            node._request_mode.assert_called_once_with("ALTCTL")
+            self.assertEqual(node.phase, Manager.RETURNING)
+            self.assertTrue(node.prestream_pub.publish.call_args[0][0].data)
+            node.flight.mode = "ALTCTL"
+            node._on_timer(None)
+        self.assertEqual(node.phase, Manager.LOCKED)
+        self.assertFalse(node.prestream_pub.publish.call_args[0][0].data)
+
+    def test_bench_handover_allows_velocity_drift_but_rejects_motion(self):
+        node = Manager.__new__(Manager)
+        now = rospy.Time.from_sec(10.0)
+        node.output_mode = 2
+        node.output_at = node.estimator_at = node.odom_at = now
+        node.output_timeout_s = node.estimator_timeout_s = node.odom_timeout_s = 0.5
+        node.estimator = EstimatorStatus(attitude_status_flag=True, velocity_vert_status_flag=True)
+        node.odom = Odometry()
+        node.odom.pose.pose.orientation.w = 1.0
+        node.odom.twist.twist.linear.z = 2.0
+        node.odom_twist_in_child_frame = False
+        node.handover_max_tilt_deg = 10.0
+        node.handover_max_vertical_speed_mps = 0.2
+        self.assertFalse(node._handover_ready(now))
+        node.wall_bench_wait_for_ranges = True
+        self.assertTrue(node._handover_ready(now))
+        node.odom.twist.twist.angular.y = 0.5
+        self.assertFalse(node._handover_ready(now))
+
     def test_terminal_detach_keeps_mode_until_altctl(self):
         node = Terminal.__new__(Terminal)
         node.mode = OperatorCommand.MODE_STANDBY

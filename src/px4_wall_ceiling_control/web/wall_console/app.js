@@ -76,10 +76,11 @@ function paint(s){
   const history=s.status.wall?.value;
   const reached={SLOW_APPROACH:3,FLIP_TO_WALL:4,WALL_CAPTURE:4,WALL_HOLD:5,WALL_PIN:4,DETACH_ROTATE:6,RECOVER:7,EXIT:7};
   step=Math.max(step,reached[history?.reached_state_name] || 0,history?.hold_achieved?5:0);
-  const returned=!!(history?.detach_completed && state?.mode==="ALTCTL" && fresh(s,"owner")===0 && ["IDLE","LOCKED"].includes(phase));
-  if(history?.detach_completed)step=8;
-  if(phase==="RETURNING"){title="等待遥控接管";reason="离墙恢复已完成；等待水平姿态、速度和连续输出满足交接条件";}
-  if(returned){title="离墙完成，已交还遥控";reason="已回到 ALTCTL，贴墙输出已释放";}
+  const recovered=history?.recovery_completed || history?.detach_completed;
+  const returned=!!(recovered && state?.mode==="ALTCTL" && fresh(s,"owner")===0 && ["IDLE","LOCKED"].includes(phase));
+  if(recovered)step=8;
+  if(phase==="RETURNING"){title="等待遥控接管";reason="保持水平控制输出，等待飞控确认 ALTCTL；未确认前不结束交接";}
+  if(returned){title=history?.fault_detected?"异常恢复完成，已交还遥控":"离墙完成，已交还遥控";reason="已确认 ALTCTL，输出已释放；飞手降低油门落地，再按正常流程上锁";}
   if(kill?.active){title="急停已生效";reason=state?.armed?"电机已停，飞控等待自动上锁；动作请求已禁用":"飞控已上锁，急停开关仍生效";}
   text("stageTitle",title);text("stageReason",translate[reason] || reason);
   document.querySelector(".stage").classList.toggle("error",!!kill?.active || !!s.launch_error || phase==="LOCKED" || wall?.fault_detected || wall?.state_name==="ABORT");

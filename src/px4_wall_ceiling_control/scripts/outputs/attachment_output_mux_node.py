@@ -757,7 +757,7 @@ class AttachmentOutputMuxNode:
             rospy.loginfo("attachment output owner=%d", self.owner)
 
         output_mode = self.OUTPUT_NONE
-        if self.output_enabled and self.owner == self.OWNER_NONE:
+        if self.output_enabled and kill_clear(self, now) and self.owner == self.OWNER_NONE:
             # The mode manager requests this stream before asking PX4 for
             # OFFBOARD, and keeps it alive through the return to ALTCTL.
             if (

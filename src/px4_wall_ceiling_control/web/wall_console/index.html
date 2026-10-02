@@ -21,7 +21,7 @@
 <div><label>横滚 / 俯仰</label><strong id="angles">—</strong><small>°</small></div>
 <div><label>输出推力</label><strong id="thrust">—</strong><small>%</small></div></div>
 <div class="secondaryReadings"><span>模式 <b id="mode">—</b></span><span>相对起飞高度 <b id="height">—</b> m</span><span>竖直速度 <b id="velocity">—</b> m/s</span><span>电池 <b id="battery">—</b> V</span><span>输出归属 <b id="owner">—</b></span></div><p id="rangeWarning" class="errorText" role="status"></p></section>
-<section class="panel"><h2>急停与离墙条件</h2><p id="killState" role="status">等待急停反馈</p><p id="detachCondition" role="status">等待贴墙保持</p><p class="configHelp">竖直速度为飞控估算的世界坐标上下速度，不是爬墙速度。台架仅显示该值，不用它限制离墙入口；恢复飞行仍使用高度／速度反馈。</p></section>
+<section class="panel"><h2>急停与离墙条件</h2><p id="killState" role="status">等待急停反馈</p><p id="detachCondition" role="status">等待贴墙保持</p><p class="configHelp">竖直速度为飞控估算的世界坐标上下速度，不是爬墙速度。台架离墙恢复不由顶部雷达、估计高度偏差或速度幅值阻挡；普通实飞保留检查。确认 ALTCTL 后，由飞手降低油门落地，再正常上锁。</p></section>
 <section class="panel records"><h2>操作记录</h2><div class="tableHead"><span>时间</span><span>事件</span></div>
 <div id="events" role="log" aria-live="off"><p class="empty">等待树莓派实时反馈</p></div></section>
 </div><aside>

@@ -658,6 +658,11 @@ class WallPerchDecisionNode:
         )
 
     def _top_preflight_ready(self, now):
+        if getattr(self, "bench_wait_for_ranges", False) and self.state in (
+            WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER,
+            WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT,
+        ):
+            return True
         if self._bench_waiting():
             return True
         if not self.require_top_sensor_on_acquire:
@@ -687,6 +692,10 @@ class WallPerchDecisionNode:
         return True
 
     def _top_required(self):
+        if getattr(self, "bench_wait_for_ranges", False) and self.state in (
+            WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER,
+        ):
+            return False
         return self.state in (
             WallPerchStatus.STATE_FLIP_TO_WALL,
             WallPerchStatus.STATE_WALL_CAPTURE,
@@ -734,6 +743,11 @@ class WallPerchDecisionNode:
             self.odom,
             getattr(self, "odom_twist_in_child_frame", True),
         )
+        if getattr(self, "bench_wait_for_ranges", False) and self.state in (
+            WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER,
+            WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT,
+        ):
+            return math.isfinite(velocity_z)
         return math.isfinite(velocity_z) and velocity_z >= -self.max_down_velocity_mps
 
     def _height_feedback(self):
@@ -755,6 +769,8 @@ class WallPerchDecisionNode:
             return math.nan
         altitude, speed = feedback
         vertical_fraction = max(0.0, rotate_vector(attitude, (0.0, 0.0, 1.0))[2])
+        if getattr(self, "bench_wait_for_ranges", False):
+            return clamp(self.hover_thrust / max(vertical_fraction, 1.0e-3), 0.1, self.max_thrust)
         vertical_demand = (
             self.hover_thrust
             + self.detach_altitude_kp * (self.detach_altitude_m - altitude)
@@ -765,6 +781,8 @@ class WallPerchDecisionNode:
         return clamp(vertical_demand / max(vertical_fraction, 1.0e-3), 0.1, self.max_thrust)
 
     def _detach_height_settled(self):
+        if getattr(self, "bench_wait_for_ranges", False):
+            return self._height_feedback() is not None
         feedback = self._height_feedback()
         return bool(
             self.detach_altitude_m is not None
@@ -918,10 +936,15 @@ class WallPerchDecisionNode:
         if new_state == WallPerchStatus.STATE_EXIT and self.state == WallPerchStatus.STATE_RECOVER:
             self.detach_completed = True
             self.reached_state = new_state
+        if new_state == WallPerchStatus.STATE_EXIT and self.state in (
+            WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT,
+        ):
+            self.recovery_completed = True
         self.state = new_state
         self.state_entered_at = now
         self.last_reason = reason
         if new_state == WallPerchStatus.STATE_FRONT_WALL_DETECT:
+            self.recovery_completed = False
             self.detach_altitude_m = None
             self.front_ready_since = None
             self.front_ready_last_sample_at = None
@@ -1152,13 +1175,18 @@ class WallPerchDecisionNode:
             if (
                 self._state_age(now) >= self.recover_time_s
                 and stable
-                and self._top_clear_ready(now)
+                and (getattr(self, "bench_wait_for_ranges", False) or self._top_clear_ready(now))
                 and self._detach_height_settled()
             ):
                 self._enter_state(WallPerchStatus.STATE_EXIT, now, "recovery complete")
 
         elif self.state == WallPerchStatus.STATE_EXIT:
-            self._enter_state(WallPerchStatus.STATE_IDLE, now, "control released")
+            # Keep a bounded level target until fresh FCU feedback confirms
+            # OFFBOARD has ended. Owner release alone is not RC handover.
+            if self._flight_ready(now):
+                self.last_reason = "recovery complete; waiting for ALTCTL handover"
+            elif is_fresh(self.flight_state_received_at, self.state_timeout_s, now):
+                self._enter_state(WallPerchStatus.STATE_IDLE, now, "control released")
 
         elif self.state == WallPerchStatus.STATE_ABORT:
             stable = (
@@ -1227,6 +1255,9 @@ class WallPerchDecisionNode:
         elif self.state == WallPerchStatus.STATE_RECOVER:
             quaternion = self.q_hover
             thrust = self._height_hold_thrust()
+        elif self.state == WallPerchStatus.STATE_EXIT:
+            quaternion = self.q_hover
+            thrust = self.hover_thrust
         elif self.state == WallPerchStatus.STATE_ABORT:
             quaternion = self.q_hover
             thrust = (
@@ -1244,10 +1275,7 @@ class WallPerchDecisionNode:
         status.header.stamp = now
         status.state = self.state
         status.state_name = self.STATE_NAMES[self.state]
-        status.enabled = self.state not in (
-            WallPerchStatus.STATE_IDLE,
-            WallPerchStatus.STATE_EXIT,
-        )
+        status.enabled = self.state != WallPerchStatus.STATE_IDLE
         status.acquire_request = bool(
             self.state == WallPerchStatus.STATE_FRONT_WALL_DETECT
             and self._mode_requested(now)
@@ -1267,6 +1295,7 @@ class WallPerchDecisionNode:
         status.hold_achieved = getattr(self, "hold_achieved", False)
         status.reached_state_name = self.STATE_NAMES[getattr(self, "reached_state", self.state)]
         status.detach_completed = getattr(self, "detach_completed", False)
+        status.recovery_completed = getattr(self, "recovery_completed", False)
         status.detach_pending = bool(getattr(self, "detach_requested", False) and self.state == WallPerchStatus.STATE_WALL_HOLD)
         status.detach_block_reason = self._detach_block_reason(now) if self.state == WallPerchStatus.STATE_WALL_HOLD and not self._detach_pose_ready(now) else ""
         status.detach_ready = bool(self.state == WallPerchStatus.STATE_WALL_HOLD

@@ -184,7 +184,7 @@ class RemoteRuntime:
             value = {key: getattr(msg, key) for key in ("state_name", "reason", "progress", "fault_detected",
                       "front_distance_filtered_m", "top_distance_filtered_m", "thrust_normalized", "top_contact_ready",
                       "altitude_reference_valid", "height_above_takeoff_m", "min_entry_height_m", "entry_height_ready",
-                      "hold_achieved", "reached_state_name", "detach_ready", "detach_completed",
+                      "hold_achieved", "reached_state_name", "detach_ready", "detach_completed", "recovery_completed",
                       "detach_pending", "detach_block_reason")}
         elif name in ("front_diagnostic", "ceiling_diagnostic", "kill"):
             value = json.loads(msg.data)

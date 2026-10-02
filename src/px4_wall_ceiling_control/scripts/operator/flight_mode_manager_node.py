@@ -319,10 +319,14 @@ class FlightModeManagerNode:
         vertical_speed = vertical_speed_enu_mps(
             self.odom, self.odom_twist_in_child_frame
         )
+        angular = self.odom.twist.twist.angular
+        if any(not math.isfinite(v) or abs(v) > 0.3 for v in (angular.x, angular.y, angular.z)):
+            return False
         if (
             abs(roll) > limit or abs(pitch) > limit
             or not math.isfinite(vertical_speed)
-            or abs(vertical_speed) > self.handover_max_vertical_speed_mps
+            or (not getattr(self, "wall_bench_wait_for_ranges", False)
+                and abs(vertical_speed) > self.handover_max_vertical_speed_mps)
         ):
             return False
         if not getattr(self, "require_rc_center", False):
@@ -369,6 +373,8 @@ class FlightModeManagerNode:
             status, received_at = self.wall, self.wall_at
             if status is None or not is_fresh(received_at, self.status_timeout_s, now):
                 return
+            if status.state == WallPerchStatus.STATE_EXIT and getattr(status, "recovery_completed", False):
+                self.completed = True
             if status.state == WallPerchStatus.STATE_ABORT:
                 self.fault_seen = True
             if status.state == WallPerchStatus.STATE_DETACH_ROTATE:
@@ -538,7 +544,9 @@ class FlightModeManagerNode:
                 self._reset(lock=True, reason=failure_reason)
             else:
                 self._observe_completion(now)
-                if self.completed and self.owner_seen and self.owner == 0 and is_fresh(self.owner_at, self.output_timeout_s, now):
+                if (self.completed and self.owner_seen
+                    and (self.owner == 0 or (self.selected_mode == OperatorCommand.MODE_WALL and self.owner == 2))
+                    and is_fresh(self.owner_at, self.output_timeout_s, now)):
                     self._set_phase(self.RETURNING)
                 elif (
                     not self.owner_seen
@@ -558,6 +566,8 @@ class FlightModeManagerNode:
                 )
             elif flight_fresh and flight_mode == "OFFBOARD" and self._handover_ready(now):
                 self._request_mode("ALTCTL")
+            elif flight_fresh and flight_mode == "OFFBOARD":
+                self.phase_reason = "waiting for stable attitude and continuous output before ALTCTL"
             elif flight_fresh:
                 failure_reason = "unexpected flight mode during return: {}".format(
                     flight_mode or "unknown"
