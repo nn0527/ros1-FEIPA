@@ -27,6 +27,9 @@ class RemoteRuntime:
         self.children = {}
         self.ros = None
         self.init_lock = threading.Lock()
+        self.telemetry_lock = threading.Lock()
+        self.telemetry_attempt_at = -math.inf
+        self.telemetry_connected = False
         self.publisher = None
         self.subscriptions = []
         self.log_dir = Path.home() / ".ros" / "wall_console"
@@ -96,6 +99,11 @@ class RemoteRuntime:
             time.sleep(1)
 
     def configure_telemetry(self):
+        with self.telemetry_lock:
+            self.telemetry_attempt_at = time.monotonic()
+            self._configure_telemetry()
+
+    def _configure_telemetry(self):
         # Lower serial bandwidth scales PX4's default 1 Hz estimator stream
         # below the existing freshness limit. Request more samples, keeping
         # the controller's timeout unchanged. Never configure an armed FCU.
@@ -111,6 +119,25 @@ class RemoteRuntime:
         if not request(message_id=230, message_rate=5.0).success:
             raise ValueError("飞控未确认估计器遥测频率，请查看 MAVROS 日志后重试")
         self.state.event("已请求 ESTIMATOR_STATUS 5 Hz；实际频率仍由飞控链路带宽决定")
+
+    def maintain_telemetry(self):
+        """Restore the volatile stream request after FCU/SSH reconnect, disarmed only."""
+        status = self.state.snapshot()["status"]
+        flight = status["state"]
+        connected = bool(flight["fresh"] and flight["value"].get("connected"))
+        reconnected = connected and not self.telemetry_connected
+        self.telemetry_connected = connected
+        if not connected or flight["value"].get("armed"):
+            return
+        # Retry a rejected/lost request or a stream that fell back to its low
+        # default rate. Do not flood commands while the FCU is booting.
+        if time.monotonic() - self.telemetry_attempt_at < 10.0:
+            return
+        if reconnected or not status["estimator"]["fresh"]:
+            try:
+                self.configure_telemetry()
+            except Exception as error:
+                self.state.event("估计器遥测频率恢复失败，将在未解锁时重试: " + str(error)[:200])
 
     def init_ros(self):
         # Only one thread initializes rospy, including a concurrent start request.
@@ -215,6 +242,7 @@ class RemoteRuntime:
         while not self.ros.is_shutdown():
             try:
                 self.state.update("runtime", self.inspect_runtime())
+                self.maintain_telemetry()
                 for name, child in list(self.children.items()):
                     if child.poll() is not None and not self.state.starting:
                         self.state.launch_error = name + " 已退出，请查看启动日志"

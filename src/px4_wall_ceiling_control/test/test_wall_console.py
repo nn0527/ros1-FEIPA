@@ -26,7 +26,49 @@ class ConsoleTests(unittest.TestCase):
         runtime = object.__new__(server.RemoteRuntime)
         runtime.state = self.state
         runtime.ros = mock.Mock()
+        runtime.telemetry_lock = threading.Lock()
+        runtime.telemetry_attempt_at = -float("inf")
+        runtime.telemetry_connected = False
         return runtime
+
+    def test_reconnect_restores_telemetry_without_start_button(self):
+        runtime = self.telemetry_runtime()
+        self.state.update("state", {"connected": True, "armed": False, "mode": "ALTCTL"})
+        self.state.update("estimator", {"attitude": True, "vertical_velocity": True})
+        runtime.configure_telemetry = mock.Mock()
+        runtime.maintain_telemetry()
+        runtime.configure_telemetry.assert_called_once()
+        runtime.configure_telemetry.reset_mock()
+        runtime.maintain_telemetry()
+        runtime.configure_telemetry.assert_not_called()
+        self.state.update("state", {"connected": False, "armed": False, "mode": "ALTCTL"})
+        runtime.maintain_telemetry()
+        self.state.update("state", {"connected": True, "armed": False, "mode": "ALTCTL"})
+        runtime.maintain_telemetry()
+        runtime.configure_telemetry.assert_called_once()
+
+    def test_stale_stream_retries_disarmed_with_backoff(self):
+        runtime = self.telemetry_runtime()
+        self.state.update("state", {"connected": True, "armed": False, "mode": "ALTCTL"})
+        runtime.telemetry_connected = True
+        runtime.configure_telemetry = mock.Mock()
+        with mock.patch.object(server.time, "monotonic", return_value=100):
+            runtime.telemetry_attempt_at = 95
+            runtime.maintain_telemetry()
+            runtime.configure_telemetry.assert_not_called()
+            runtime.telemetry_attempt_at = 89
+            runtime.maintain_telemetry()
+            runtime.configure_telemetry.assert_called_once()
+
+    def test_telemetry_maintenance_never_configures_armed_or_stale_state(self):
+        runtime = self.telemetry_runtime()
+        runtime.configure_telemetry = mock.Mock()
+        self.state.update("state", {"connected": True, "armed": True, "mode": "ALTCTL"})
+        runtime.maintain_telemetry()
+        self.state.update("state", {"connected": True, "armed": False, "mode": "ALTCTL"})
+        self.now += 2
+        runtime.maintain_telemetry()
+        runtime.configure_telemetry.assert_not_called()
 
     def test_telemetry_configuration_rechecks_disarmed_after_service_wait(self):
         runtime = self.telemetry_runtime()
