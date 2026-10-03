@@ -31,6 +31,8 @@ Windows 使用根目录 `Start-WallConsole.ps1`；macOS/Linux 可用下面的 Py
    `src/px4_wall_ceiling_control`（其中包括 Python 服务、状态模块和 web 目录）。
    本机不用复制 ROS build/devel 或试飞记录。树莓派仍使用已编译的 `/root/ros_ws`；
    更新消息定义后需先在树莓派 `catkin_make`，再在未解锁时重启基础链路。
+   拉取前先检查并备份树莓派本地修改，合并保留现场参数，不使用 `git reset --hard`。
+   本机和树莓派代码应保持同一版本；仅更新本机不能获得新版远程配置读取逻辑。
 2. 有 Codex 捆绑 Python 时可直接使用；否则安装 Python 3.10+，并安装本机依赖：
 
    ```powershell
