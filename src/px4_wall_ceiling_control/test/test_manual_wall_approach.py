@@ -353,16 +353,19 @@ class BenchDetachSupportTests(unittest.TestCase):
         n._current_quaternion = lambda: (0, math.sin(math.pi/4), 0, math.cos(math.pi/4))
         self.assertAlmostEqual(n._height_hold_thrust(), .45)
 
-    def test_bench_detach_target_is_level_and_progress_tracks_actual_pose(self):
+    def test_bench_detach_uses_five_second_curve_and_progress_tracks_actual_pose(self):
         n = self.node()
         n.state = WallPerchStatus.STATE_DETACH_ROTATE
         n.q_detach_start = (0, math.sin(math.pi/4), 0, math.cos(math.pi/4))
         n._current_quaternion = lambda: n.q_detach_start
-        n._state_age = lambda now: 100
-        _, target, thrust, progress = n._candidate(rospy.Time.from_sec(100))
-        self.assertEqual(target, n.q_hover)
-        self.assertAlmostEqual(thrust, .45)
-        self.assertAlmostEqual(progress, 0)
+        n.detach_time_s = 5
+        for elapsed, target_degrees in [(0, 90), (2.5, 45), (5, 0), (7, 0)]:
+            n._state_age = lambda now: elapsed
+            _, target, thrust, progress = n._candidate(rospy.Time.from_sec(100))
+            actual_target = math.degrees(2 * math.atan2(abs(target[1]), abs(target[3])))
+            self.assertAlmostEqual(actual_target, target_degrees)
+            self.assertAlmostEqual(thrust, .45)
+            self.assertAlmostEqual(progress, 0)
         n._current_quaternion = lambda: n.q_hover
         self.assertAlmostEqual(n._candidate(rospy.Time.from_sec(101))[3], 1)
 
@@ -387,6 +390,8 @@ class BenchDetachSupportTests(unittest.TestCase):
         n.state = WallPerchStatus.STATE_DETACH_ROTATE
         n.q_detach_start = (0, math.sin(math.pi/4), 0, math.cos(math.pi/4))
         n._current_quaternion = lambda: n.q_detach_start
+        n.detach_time_s = 5
+        n._state_age = lambda now: 0
         n.bench_detach_thrust_value, n.bench_detach_thrust_at = .675, rospy.Time.from_sec(10)
         n.bench_detach_thrust_slew_per_s = .45
         self.assertAlmostEqual(n._candidate(rospy.Time.from_sec(10.1))[2], .63)

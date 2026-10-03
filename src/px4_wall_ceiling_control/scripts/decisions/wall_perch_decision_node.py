@@ -1295,7 +1295,10 @@ class WallPerchDecisionNode:
             quaternion = self.q_contact
             thrust = self.pin_thrust
         elif self.state == WallPerchStatus.STATE_DETACH_ROTATE and getattr(self, "bench_wait_for_ranges", False):
-            quaternion = self.q_hover
+            trajectory_progress = clamp(self._state_age(now) / self.detach_time_s, 0.0, 1.0)
+            quaternion = self._quat_slerp(
+                self.q_detach_start, self.q_hover, self._smoothstep5(trajectory_progress)
+            )
             thrust = self._height_hold_thrust()
             attitude = self._current_quaternion()
             if attitude is not None:
