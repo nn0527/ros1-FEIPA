@@ -53,6 +53,7 @@ class WallPerchDecisionNode:
     def __init__(self):
         install_kill_guard(self, rospy, String)
         self.manual_approach = bool(rospy.get_param("~manual_approach", False))
+        self.flip_thrust_follow_tilt = bool(rospy.get_param("~flip_thrust_follow_tilt", False))
         self.decision_enabled = bool(rospy.get_param("~decision_enabled", False))
         self.front_ready_distance_m = float(
             rospy.get_param("~front_ready_distance_m", 0.50)
@@ -1206,6 +1207,19 @@ class WallPerchDecisionNode:
             if self._state_age(now) >= self.recover_time_s and stable:
                 self._enter_state(WallPerchStatus.STATE_EXIT, now, "abort recovery complete")
 
+    def _flip_thrust(self):
+        if not getattr(self, "flip_thrust_follow_tilt", False):
+            return self.hover_thrust * self.flip_thrust_multiplier
+        attitude = self._current_quaternion()
+        if attitude is None:
+            return self.hover_thrust  # Invalid pose is rejected by the safety gate.
+        # Use the measured thrust-axis tilt, not elapsed trajectory time or yaw.
+        # A vehicle still level must not receive the full wall-facing thrust.
+        up = rotate_vector(attitude, (0.0, 0.0, 1.0))
+        angle = math.acos(clamp(up[2], -1.0, 1.0))
+        blend = self._smoothstep5(clamp(angle / max(abs(self.wall_angle_rad), 1e-6), 0.0, 1.0))
+        return self.hover_thrust * (1.0 + (self.flip_thrust_multiplier - 1.0) * blend)
+
     def _candidate(self, now):
         if (self.state == WallPerchStatus.STATE_SLOW_APPROACH
                 and self._bench_waiting() and not self._bench_ranges_ready(now)):
@@ -1227,7 +1241,7 @@ class WallPerchDecisionNode:
             quaternion = self._quat_slerp(
                 self.q_hover, self.q_wall, self._smoothstep5(progress)
             )
-            thrust = self.hover_thrust * self.flip_thrust_multiplier
+            thrust = self._flip_thrust()
         elif self.state == WallPerchStatus.STATE_WALL_CAPTURE:
             progress = clamp(self._state_age(now) / self.capture_time_s, 0.0, 1.0)
             quaternion = self.q_contact

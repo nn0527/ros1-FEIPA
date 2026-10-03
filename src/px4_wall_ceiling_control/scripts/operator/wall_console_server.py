@@ -118,7 +118,11 @@ class RemoteRuntime:
         request = self.ros.ServiceProxy("/mavros/set_message_interval", MessageInterval)
         if not request(message_id=230, message_rate=5.0).success:
             raise ValueError("飞控未确认估计器遥测频率，请查看 MAVROS 日志后重试")
+        require_disarmed()
+        if not request(message_id=83, message_rate=10.0).success:
+            raise ValueError("飞控未确认推力目标遥测频率，无法确认平滑接管所需反馈")
         self.state.event("已请求 ESTIMATOR_STATUS 5 Hz；实际频率仍由飞控链路带宽决定")
+        self.state.event("已请求 ATTITUDE_TARGET 10 Hz，用于匹配 ALTCTL 接管推力")
 
     def maintain_telemetry(self):
         """Restore the volatile stream request after FCU/SSH reconnect, disarmed only."""

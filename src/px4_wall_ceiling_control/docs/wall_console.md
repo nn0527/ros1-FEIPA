@@ -265,3 +265,9 @@ Windows EXE 经 SSH 启动轻量 relay，容器内 `--shared-service` 用文件�
 `flight_mode_manager_node/manual_wall_wait_timeout_s=60.0` 是请求后的最大手动等待时间；包括距离条件反复失效后的等待，不重复延长。手动接近期间并行建立默认1.5秒连续预发送，在 ALTCTL 下仍由飞手操控。距离条件满足且预发送已就绪，即请求 OFFBOARD，不再额外等待1.5秒。距离条件反复变化不重置预发送计时；控制目标流中断则重新计时。飞控确认 OFFBOARD 后跳过3°自动接近，直接进入 FLIP_TO_WALL 并申请输出归属。确认接管时距离条件丢失则进入交回 ALTCTL 的路径。
 
 “取消等待”使用专用 `/wall_perch/cancel_wait`，模式管理器只在 WAITING_WALL 接受；晚到的消息不打断接管／翻转。超时释放终端意图，不请求 OFFBOARD。原 `approach_timeout_s=20` 只用于保留的自动接近入口；`flip_time_s=2` 翻转耗时、`capture_timeout_s=8` 接触确认超时不变。其他旧入口默认维持自动接近。
+
+### 翻转初段推力衔接
+
+页面入口启用 `match_fcu_thrust_on_handover=true`，预发送匹配新鲜的 PX4 ATTITUDE_TARGET 推力；首次接管保持捕获值，随后用1秒平滑曲线衔接到行为推力。未解锁启动时请求 ATTITUDE_TARGET 10 Hz，反馈缺失或过期时不生成匹配预发送，不能跳过此确认直接接管。
+
+同时启用 `flip_thrust_follow_tilt=true`：翻转额外推力随实测机体推力轴相对竖直方向的倾角，经五次平滑曲线增加；水平时为悬停推力，90°时达到原翻转倍率。以0.45、1.35为例，水平为0.45、45°为0.52875、90°为0.6075；航向转动不会增加推力。目标姿态仍采用2秒翻转曲线，角速度及其他保护保留。旧入口默认保留原固定翻转推力。本改动需台架实测验证，不代表已确认实际爬升消除。

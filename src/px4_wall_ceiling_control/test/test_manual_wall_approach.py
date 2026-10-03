@@ -1,11 +1,12 @@
 """Mode ownership and timing regression tests using ROS messages, no flight."""
 import unittest
+import math
 from unittest import mock
 import rospy
 from mavros_msgs.msg import State
 from std_msgs.msg import Bool
 from px4_wall_ceiling_control.msg import OperatorCommand, SensorHealth, WallPerchStatus
-from test_flight_handover import Manager
+from test_flight_handover import Manager, OutputMux
 from test_attachment_safety import WallDecision
 
 
@@ -191,6 +192,54 @@ class ManualApproachTests(unittest.TestCase):
         self.assertTrue(n._acquire_requested(self.now))
         n._safety_ok = lambda *_: False
         self.assertFalse(n._acquire_requested(self.now))
+
+
+class FlipThrustTests(unittest.TestCase):
+    def node(self, degrees):
+        n = WallDecision.__new__(WallDecision)
+        n.hover_thrust, n.flip_thrust_multiplier = .45, 1.35
+        n.wall_angle_rad = math.pi / 2
+        n.flip_thrust_follow_tilt = True
+        angle = math.radians(degrees)
+        n._current_quaternion = lambda: (0, math.sin(angle/2), 0, math.cos(angle/2))
+        return n
+
+    def test_level_vehicle_does_not_receive_flip_boost(self):
+        self.assertAlmostEqual(self.node(0)._flip_thrust(), .45)
+        self.assertLess(self.node(6)._flip_thrust(), .451)
+
+    def test_boost_follows_actual_tilt_and_is_bounded(self):
+        values = [self.node(angle)._flip_thrust() for angle in [0, 10, 20, 45, 70, 90, 120]]
+        self.assertEqual(values, sorted(values))
+        self.assertAlmostEqual(values[3], .52875)
+        self.assertAlmostEqual(values[-1], .6075)
+
+    def test_yaw_alone_does_not_increase_flip_thrust(self):
+        n = self.node(0)
+        n._current_quaternion = lambda: (0, 0, math.sin(.7), math.cos(.7))
+        self.assertAlmostEqual(n._flip_thrust(), .45)
+
+    def test_invalid_attitude_does_not_request_flip_boost(self):
+        n = self.node(0)
+        n._current_quaternion = lambda: None
+        self.assertAlmostEqual(n._flip_thrust(), .45)
+
+    def test_legacy_entry_retains_existing_flip_thrust(self):
+        n = self.node(0)
+        n.flip_thrust_follow_tilt = False
+        self.assertAlmostEqual(n._flip_thrust(), .6075)
+
+    def test_takeover_first_output_matches_altctl_and_blends_without_jump(self):
+        mux = OutputMux.__new__(OutputMux)
+        mux.match_fcu_thrust_on_handover = True
+        mux.handover_start_thrust, mux.handover_started_at = .46, None
+        mux.thrust_handover_ramp_s = 1
+        first = mux._apply_thrust_handover(rospy.Time.from_sec(10), self.node(0)._flip_thrust())
+        midpoint = mux._apply_thrust_handover(rospy.Time.from_sec(10.5), self.node(6)._flip_thrust())
+        final = mux._apply_thrust_handover(rospy.Time.from_sec(11), self.node(20)._flip_thrust())
+        self.assertAlmostEqual(first, .46)
+        self.assertLess(abs(midpoint-first), .01)
+        self.assertLess(final, .47)
 
 
 if __name__ == "__main__": unittest.main()

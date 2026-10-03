@@ -12,6 +12,9 @@
     <arg name="flight_mode_enabled" value="true" />
     <arg name="wall_enabled" value="true" />
     <arg name="wall_manual_approach" value="true" />
+    <arg name="wall_flip_thrust_follow_tilt" value="true" />
+    <arg name="match_fcu_thrust_on_handover" value="true" />
+    <arg name="thrust_handover_ramp_s" value="1.0" />
     <arg name="ceiling_enabled" value="false" />
     <arg name="output_enabled" value="true" />
     <arg name="mechanism_output_enabled" value="false" />

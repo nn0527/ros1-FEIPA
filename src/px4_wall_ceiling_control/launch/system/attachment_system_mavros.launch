@@ -25,6 +25,7 @@
   <arg name="wall_require_min_altitude" default="true" />
   <arg name="wall_bench_wait_for_ranges" default="false" />
   <arg name="wall_manual_approach" default="false" />
+  <arg name="wall_flip_thrust_follow_tilt" default="false" />
   <arg name="output_max_thrust" default="0.85" />
   <arg name="match_fcu_thrust_on_handover" default="false" />
   <arg name="thrust_handover_ramp_s" default="1.0" />
@@ -124,6 +125,7 @@
     <param name="kill_guard_enabled" value="$(arg kill_guard_enabled)" />
     <param name="decision_enabled" value="true" />
     <param name="manual_approach" value="$(arg wall_manual_approach)" />
+    <param name="flip_thrust_follow_tilt" value="$(arg wall_flip_thrust_follow_tilt)" />
     <param name="hold_time_s" value="$(arg wall_hold_time_s)" />
     <param name="min_altitude_m" value="$(arg wall_min_altitude_m)" />
     <param name="require_min_altitude"

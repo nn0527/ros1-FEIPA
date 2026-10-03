@@ -138,6 +138,27 @@ class ConsoleTests(unittest.TestCase):
                 runtime.configure_telemetry()
         runtime.ros.ServiceProxy.return_value.assert_called_once_with(message_id=230, message_rate=5.0)
 
+    def test_telemetry_requests_attitude_target_for_smooth_thrust_takeover(self):
+        runtime = self.telemetry_runtime()
+        self.state.update("state", {"connected": True, "armed": False, "mode": "ALTCTL"})
+        runtime.ros.ServiceProxy.return_value.return_value.success = True
+        with mock.patch.dict(sys.modules, {"mavros_msgs.srv": SimpleNamespace(MessageInterval=object)}):
+            runtime.configure_telemetry()
+        self.assertEqual(runtime.ros.ServiceProxy.return_value.call_args_list,
+                         [mock.call(message_id=230, message_rate=5.0), mock.call(message_id=83, message_rate=10.0)])
+
+    def test_telemetry_rechecks_disarmed_before_attitude_stream_request(self):
+        runtime = self.telemetry_runtime()
+        self.state.update("state", {"connected": True, "armed": False, "mode": "ALTCTL"})
+        def arm_after_estimator(**unused):
+            self.state.update("state", {"connected": True, "armed": True, "mode": "ALTCTL"})
+            return SimpleNamespace(success=True)
+        runtime.ros.ServiceProxy.return_value.side_effect = arm_after_estimator
+        with mock.patch.dict(sys.modules, {"mavros_msgs.srv": SimpleNamespace(MessageInterval=object)}):
+            with self.assertRaises(ValueError):
+                runtime.configure_telemetry()
+        runtime.ros.ServiceProxy.return_value.assert_called_once_with(message_id=230, message_rate=5.0)
+
     def test_bridge_keeps_catkin_generated_messages_importable(self):
         # Reproduce a sourced Catkin workspace in a fresh interpreter. Importing
         # the bridge must not shadow its relay with the plain source package.
