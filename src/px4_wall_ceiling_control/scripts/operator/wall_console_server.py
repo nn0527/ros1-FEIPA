@@ -265,11 +265,20 @@ class RemoteRuntime:
     def monitor(self):
         while not self.ros.is_shutdown():
             try:
-                self.state.update("runtime", self.inspect_runtime())
+                runtime = self.inspect_runtime()
+                self.state.update("runtime", runtime)
                 self.maintain_telemetry()
                 for name, child in list(self.children.items()):
                     if child.poll() is not None and not self.state.starting:
-                        self.state.launch_error = name + " 已退出，请查看启动日志"
+                        error = name + " 已退出，请查看启动日志"
+                        if name == "wall_flight" and runtime.get("enabled"):
+                            # A disarmed deployment may replace our launcher.
+                            # The complete live ROS chain supersedes the old PID.
+                            self.children.pop(name, None)
+                            if self.state.launch_error == error:
+                                self.state.launch_error = ""
+                        else:
+                            self.state.launch_error = error
             except Exception as error:
                 self.state.update("runtime", {"enabled": False, "error": str(error)[:200]})
             time.sleep(1)
