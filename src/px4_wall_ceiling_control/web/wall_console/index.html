@@ -12,7 +12,7 @@
 <button id="wall" class="wall" disabled><span>02</span><strong>一键贴墙</strong></button>
 <button id="detach" class="wall" disabled><span>03</span><strong>一键离墙</strong></button></div>
 <p class="helper">飞行稳定后贴墙；当前贴墙保持且离墙条件满足后，可请求离墙</p><p id="wallBlockReason" class="errorText" role="status"></p><p id="detachBlockReason" class="errorText" role="status"></p><p id="actionMessage" role="status" aria-live="polite"></p></section>
-<section class="panel stage"><h2>当前阶段</h2><div class="stageContent"><h3 id="stageTitle">等待连接</h3>
+<section class="panel stage"><div class="stageHeading"><h2>当前阶段</h2><button id="resetObservation" type="button">重置本轮观测</button></div><p id="observationNote" class="configHelp" role="status">重置本机进度与显示记录，飞行状态和树莓派日志继续保留。</p><div class="stageContent"><h3 id="stageTitle">等待连接</h3>
 <p id="stageReason" aria-live="polite">正在建立 SSH 反馈通道</p></div>
 <ol class="steps"><li>待命</li><li>预发送</li><li>进入控制</li><li>接近墙面</li><li>翻转贴墙</li><li>贴墙保持</li><li>离墙旋转</li><li>恢复水平</li><li>遥控接管</li></ol>
 <div id="successNote" class="successNote" hidden>控制节点已确认 WALL_HOLD，飞控仍在 OFFBOARD 贴墙保持。</div></section>

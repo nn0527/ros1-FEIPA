@@ -3,3 +3,5 @@
 #detachBlockReason.ready{color:var(--ok)}
 
 .sessionActions{display:flex;gap:12px;flex-wrap:wrap}.sessionActions button{height:auto;min-height:46px;padding:12px 20px;font-size:16px;background:#17475c;color:white;border:0;border-radius:5px;cursor:pointer}.sessionActions button:disabled{opacity:.45;cursor:not-allowed}.sessionActions button:focus-visible{outline:3px solid #19aaa5;outline-offset:3px}
+
+.stageHeading{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}.stageHeading h2{margin-bottom:0}.stageHeading button{height:auto;min-height:40px;padding:8px 14px;font-size:14px;border:1px solid #c2d0dc;border-radius:5px;background:#fff;color:#17475c;cursor:pointer}.stageHeading button:disabled{opacity:.45;cursor:not-allowed}
