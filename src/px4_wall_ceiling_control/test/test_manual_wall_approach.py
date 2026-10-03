@@ -343,16 +343,98 @@ class BenchDetachSupportTests(unittest.TestCase):
             n.state = state
             self.assertAlmostEqual(n._candidate(rospy.Time.from_sec(10))[2], .48)
 
-    def test_bench_support_ignores_height_drift_and_respects_tilt_and_cap(self):
+    def test_bench_support_ignores_height_drift_and_stays_bounded_at_vertical(self):
         n = self.node()
         n._height_feedback = lambda: (-100, 20)
         self.assertAlmostEqual(n._height_hold_thrust(), .48)
         a = math.radians(60)
         n._current_quaternion = lambda: (0, math.sin(a/2), 0, math.cos(a/2))
-        self.assertAlmostEqual(n._height_hold_thrust(), .85)
+        self.assertAlmostEqual(n._height_hold_thrust(), .465)
+        n._current_quaternion = lambda: (0, math.sin(math.pi/4), 0, math.cos(math.pi/4))
+        self.assertAlmostEqual(n._height_hold_thrust(), .45)
+
+    def test_bench_detach_target_is_level_and_progress_tracks_actual_pose(self):
+        n = self.node()
+        n.state = WallPerchStatus.STATE_DETACH_ROTATE
+        n.q_detach_start = (0, math.sin(math.pi/4), 0, math.cos(math.pi/4))
+        n._current_quaternion = lambda: n.q_detach_start
+        n._state_age = lambda now: 100
+        _, target, thrust, progress = n._candidate(rospy.Time.from_sec(100))
+        self.assertEqual(target, n.q_hover)
+        self.assertAlmostEqual(thrust, .45)
+        self.assertAlmostEqual(progress, 0)
+        n._current_quaternion = lambda: n.q_hover
+        self.assertAlmostEqual(n._candidate(rospy.Time.from_sec(101))[3], 1)
+
+    def test_elapsed_time_cannot_finish_bench_detach_but_recovered_pose_can(self):
+        n = self.node()
+        n.state = WallPerchStatus.STATE_DETACH_ROTATE
+        n.cancel_requested = False
+        n._mode_requested = n._safety_ok = lambda now: True
+        n._state_age = lambda now: 100
+        n._attitude_recovered = lambda: False
+        n._rates_safe = lambda *args: True
+        n.recover_max_rate_rps = 3
+        n._enter_state = mock.Mock()
+        n._update_state_machine(rospy.Time.from_sec(100))
+        n._enter_state.assert_not_called()
+        n._attitude_recovered = lambda: True
+        n._update_state_machine(rospy.Time.from_sec(101))
+        self.assertEqual(n._enter_state.call_args[0][0], WallPerchStatus.STATE_RECOVER)
+
+    def test_thrust_slew_is_continuous_across_detach_and_recover(self):
+        n = self.node()
+        n.state = WallPerchStatus.STATE_DETACH_ROTATE
+        n.q_detach_start = (0, math.sin(math.pi/4), 0, math.cos(math.pi/4))
+        n._current_quaternion = lambda: n.q_detach_start
+        n.bench_detach_thrust_value, n.bench_detach_thrust_at = .675, rospy.Time.from_sec(10)
+        n.bench_detach_thrust_slew_per_s = .45
+        self.assertAlmostEqual(n._candidate(rospy.Time.from_sec(10.1))[2], .63)
+        n.state = WallPerchStatus.STATE_RECOVER
+        n._current_quaternion = lambda: n.q_hover
+        self.assertAlmostEqual(n._candidate(rospy.Time.from_sec(10.2))[2], .585)
+        self.assertAlmostEqual(n._candidate(rospy.Time.from_sec(11))[2], .48)
+
+
+class PitchRateAndMotorTelemetryTests(unittest.TestCase):
+    def test_only_pitch_is_relaxed_during_flip_and_capture(self):
+        from nav_msgs.msg import Odometry
+        n = WallDecision.__new__(WallDecision)
+        n.odom = Odometry()
+        n.max_rate_rps = 3
+        n.flip_max_pitch_rate_rps = n.capture_max_pitch_rate_rps = 9
+        for state, limit in [(WallPerchStatus.STATE_FLIP_TO_WALL, 6), (WallPerchStatus.STATE_WALL_CAPTURE, 4.5)]:
+            n.state = state
+            n.odom.twist.twist.angular.y = -8.1
+            self.assertTrue(n._rates_safe(limit))
+            n.odom.twist.twist.angular.y = 9.01
+            self.assertFalse(n._rates_safe(limit))
+            n.odom.twist.twist.angular.y = 8.1
+            n.odom.twist.twist.angular.x = limit + .01
+            self.assertFalse(n._rates_safe(limit))
+            n.odom.twist.twist.angular.x = 0
+        n.state = WallPerchStatus.STATE_RECOVER
+        self.assertFalse(n._rates_safe(3))
+
+    def test_motor_telemetry_requires_fresh_disarmed_state_and_rechecks_after_wait(self):
+        n = Manager.__new__(Manager)
+        n.flight = State(connected=True, armed=False)
+        n.flight_at, n.state_timeout_s = rospy.Time.from_sec(10), 1.5
+        with mock.patch.object(rospy.Time, 'now', return_value=rospy.Time.from_sec(10.1)), mock.patch.object(rospy, 'wait_for_service') as wait, mock.patch.object(rospy, 'ServiceProxy') as proxy, mock.patch.object(rospy, 'loginfo'):
+            proxy.return_value.return_value.success = True
+            self.assertTrue(n._request_motor_telemetry())
+            proxy.return_value.assert_called_once_with(message_id=36, message_rate=10.0)
+            proxy.reset_mock()
+            n.flight.armed = True
+            self.assertFalse(n._request_motor_telemetry())
+            proxy.assert_not_called()
+            n.flight.armed = False
+            wait.side_effect = lambda *args, **kwargs: setattr(n.flight, 'armed', True)
+            self.assertFalse(n._request_motor_telemetry())
+            proxy.assert_not_called()
 
     def test_normal_flight_and_pre_detach_exit_retain_hover_setting(self):
-        n = self.node()
+        n = BenchDetachSupportTests().node()
         n.state = WallPerchStatus.STATE_EXIT
         n.bench_wait_for_ranges = False
         self.assertAlmostEqual(n._candidate(rospy.Time.from_sec(10))[2], .45)

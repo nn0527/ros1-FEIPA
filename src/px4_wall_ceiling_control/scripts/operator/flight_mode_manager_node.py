@@ -172,8 +172,40 @@ class FlightModeManagerNode:
         )
         self.set_mode = rospy.ServiceProxy("/mavros/set_mode", SetMode)
         self.timer = rospy.Timer(rospy.Duration(0.1), self._on_timer)
+        if rospy.get_param("~motor_output_telemetry_enabled", False):
+            threading.Thread(target=self._motor_telemetry_loop, daemon=True).start()
         if not self.enabled:
             rospy.logwarn("automatic flight mode handover is disabled")
+
+    def _request_motor_telemetry(self):
+        # Run only from the telemetry worker, never block the control timer.
+        def disarmed():
+            flight = self.flight
+            return (flight is not None and is_fresh(self.flight_at, self.state_timeout_s, rospy.Time.now())
+                    and flight.connected and not flight.armed)
+        if not disarmed():
+            return False
+        from mavros_msgs.srv import MessageInterval
+        rospy.wait_for_service('/mavros/set_message_interval', timeout=2)
+        if not disarmed():
+            return False
+        result = rospy.ServiceProxy('/mavros/set_message_interval', MessageInterval)(message_id=36, message_rate=10.0)
+        if result.success:
+            rospy.loginfo('Requested SERVO_OUTPUT_RAW 10 Hz; reception must be checked in /mavros/rc/out')
+        return result.success
+
+    def _motor_telemetry_loop(self):
+        # Requests are volatile across FCU reboot. Retry while disarmed;
+        # acknowledgement alone does not prove the FCU emits output samples.
+        next_attempt = 0.0
+        while not rospy.is_shutdown():
+            if time.monotonic() >= next_attempt:
+                try:
+                    if self._request_motor_telemetry():
+                        next_attempt = time.monotonic() + 30.0
+                except (rospy.ROSException, rospy.ServiceException) as exc:
+                    rospy.logwarn_throttle(30, 'Motor output telemetry unavailable: %s', exc)
+            time.sleep(2)
 
     def _on_flight(self, message):
         self.flight, self.flight_at = message, rospy.Time.now()

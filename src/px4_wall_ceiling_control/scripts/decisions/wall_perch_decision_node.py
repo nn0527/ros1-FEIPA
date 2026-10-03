@@ -149,6 +149,12 @@ class WallPerchDecisionNode:
         if self.max_thrust <= self.hover_thrust:
             raise ValueError("wall detach max_thrust must exceed hover_thrust")
         self.bench_detach_hover_thrust = float(rospy.get_param("~bench_detach_hover_thrust", self.hover_thrust))
+        self.bench_detach_release_thrust = float(rospy.get_param("~bench_detach_release_thrust", self.hover_thrust))
+        self.bench_detach_thrust_slew_per_s = float(rospy.get_param("~bench_detach_thrust_slew_per_s", 0.45))
+        if not math.isfinite(self.bench_detach_release_thrust) or not 0.1 <= self.bench_detach_release_thrust <= self.bench_detach_hover_thrust:
+            raise ValueError("bench detach release thrust must be finite and no greater than level support")
+        if not math.isfinite(self.bench_detach_thrust_slew_per_s) or self.bench_detach_thrust_slew_per_s <= 0:
+            raise ValueError("bench detach thrust slew must be finite and positive")
         if not math.isfinite(self.bench_detach_hover_thrust) or not 0.1 <= self.bench_detach_hover_thrust < self.max_thrust:
             raise ValueError("bench_detach_hover_thrust must be finite and below max_thrust")
         pressure_floor = min(
@@ -192,6 +198,10 @@ class WallPerchDecisionNode:
         self.capture_max_rate_rps = float(
             rospy.get_param("~capture_max_rate_rps", 4.5)
         )
+        self.flip_max_pitch_rate_rps = float(rospy.get_param("~flip_max_pitch_rate_rps", self.flip_max_rate_rps))
+        self.capture_max_pitch_rate_rps = float(rospy.get_param("~capture_max_pitch_rate_rps", self.capture_max_rate_rps))
+        if not all(math.isfinite(value) and value > 0 for value in (self.flip_max_pitch_rate_rps, self.capture_max_pitch_rate_rps)):
+            raise ValueError("pitch rate limits must be finite and positive")
         self.recover_max_rate_rps = float(
             rospy.get_param("~recover_max_rate_rps", 3.0)
         )
@@ -739,9 +749,14 @@ class WallPerchDecisionNode:
             return False
         limit = self.max_rate_rps if limit is None else limit
         rate = self.odom.twist.twist.angular
+        pitch_limit = limit
+        if getattr(self, "state", None) == WallPerchStatus.STATE_FLIP_TO_WALL:
+            pitch_limit = getattr(self, "flip_max_pitch_rate_rps", limit)
+        elif getattr(self, "state", None) == WallPerchStatus.STATE_WALL_CAPTURE:
+            pitch_limit = getattr(self, "capture_max_pitch_rate_rps", limit)
         return all(
-            math.isfinite(value) and abs(value) <= limit
-            for value in (rate.x, rate.y, rate.z)
+            math.isfinite(value) and abs(value) <= axis_limit
+            for value, axis_limit in ((rate.x, limit), (rate.y, pitch_limit), (rate.z, limit))
         )
 
     def _bench_waiting(self):
@@ -789,7 +804,8 @@ class WallPerchDecisionNode:
         vertical_fraction = max(0.0, rotate_vector(attitude, (0.0, 0.0, 1.0))[2])
         if getattr(self, "bench_wait_for_ranges", False):
             base = getattr(self, "bench_detach_hover_thrust", self.hover_thrust)
-            return clamp(base / max(vertical_fraction, 1.0e-3), 0.1, self.max_thrust)
+            release = getattr(self, "bench_detach_release_thrust", self.hover_thrust)
+            return release + self._smoothstep5(clamp(vertical_fraction, 0.0, 1.0)) * (base - release)
         vertical_demand = (
             self.hover_thrust
             + self.detach_altitude_kp * (self.detach_altitude_m - altitude)
@@ -1005,6 +1021,9 @@ class WallPerchDecisionNode:
             feedback = self._height_feedback()
             self.detach_altitude_m = feedback[0] if feedback is not None else None
             self.detach_requested = False
+            if getattr(self, "bench_wait_for_ranges", False):
+                self.bench_detach_thrust_value = self._wall_pressure_thrust()
+                self.bench_detach_thrust_at = now
         elif new_state == WallPerchStatus.STATE_ABORT:
             self.cancel_requested = False
             self.detach_requested = False
@@ -1180,8 +1199,10 @@ class WallPerchDecisionNode:
             if not self._safety_ok(now) or self._height_feedback() is None:
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "detach safety input lost")
-            elif self._state_age(now) >= self.detach_time_s:
-                self._enter_state(WallPerchStatus.STATE_RECOVER, now, "detach rotation complete")
+            elif ((self._attitude_recovered() and self._rates_safe(self.recover_max_rate_rps))
+                  if getattr(self, "bench_wait_for_ranges", False)
+                  else self._state_age(now) >= self.detach_time_s):
+                self._enter_state(WallPerchStatus.STATE_RECOVER, now, "detach attitude recovered" if getattr(self, "bench_wait_for_ranges", False) else "detach rotation complete")
 
         elif self.state == WallPerchStatus.STATE_RECOVER:
             if not self._safety_ok(now) or self._height_feedback() is None:
@@ -1273,6 +1294,14 @@ class WallPerchDecisionNode:
         elif self.state == WallPerchStatus.STATE_WALL_PIN:
             quaternion = self.q_contact
             thrust = self.pin_thrust
+        elif self.state == WallPerchStatus.STATE_DETACH_ROTATE and getattr(self, "bench_wait_for_ranges", False):
+            quaternion = self.q_hover
+            thrust = self._height_hold_thrust()
+            attitude = self._current_quaternion()
+            if attitude is not None:
+                start_tilt = math.acos(clamp(rotate_vector(self.q_detach_start, (0, 0, 1))[2], -1, 1))
+                tilt = math.acos(clamp(rotate_vector(attitude, (0, 0, 1))[2], -1, 1))
+                progress = clamp(1.0 - tilt / max(start_tilt, 1.0e-3), 0, 1)
         elif self.state == WallPerchStatus.STATE_DETACH_ROTATE:
             progress = clamp(self._state_age(now) / self.detach_time_s, 0.0, 1.0)
             smoothed = self._smoothstep5(progress)
@@ -1310,6 +1339,11 @@ class WallPerchDecisionNode:
             )
 
         if quaternion is not None:
+            if (getattr(self, "bench_wait_for_ranges", False) and getattr(self, "detach_altitude_m", None) is not None
+                    and hasattr(self, "bench_detach_thrust_at") and math.isfinite(thrust)):
+                delta = max(0.0, (now - self.bench_detach_thrust_at).to_sec()) * self.bench_detach_thrust_slew_per_s
+                thrust = clamp(thrust, self.bench_detach_thrust_value - delta, self.bench_detach_thrust_value + delta)
+                self.bench_detach_thrust_value, self.bench_detach_thrust_at = thrust, now
             thrust = clamp(thrust, 0.1, self.max_thrust)
         return neutral, quaternion, thrust, progress
 

@@ -95,6 +95,7 @@
     <param name="kill_guard_enabled" value="$(arg kill_guard_enabled)" />
     <param name="enabled" value="$(arg flight_mode_enabled)" />
     <param name="wall_bench_wait_for_ranges" value="$(arg wall_bench_wait_for_ranges)" />
+    <param name="motor_output_telemetry_enabled" value="$(arg wall_bench_wait_for_ranges)" />
     <param name="wall_manual_approach" value="$(arg wall_manual_approach)" />
     <param name="estimator_timeout_s"
            value="$(arg flight_estimator_timeout_s)" />
@@ -136,6 +137,8 @@
     <param name="require_min_altitude"
            value="$(arg wall_require_min_altitude)" />
     <param name="bench_wait_for_ranges" value="$(arg wall_bench_wait_for_ranges)" />
+    <param if="$(arg wall_bench_wait_for_ranges)" name="flip_max_pitch_rate_rps" value="9.0" />
+    <param if="$(arg wall_bench_wait_for_ranges)" name="capture_max_pitch_rate_rps" value="9.0" />
     <param if="$(arg wall_bench_wait_for_ranges)" name="sensor_timeout_s"
            value="$(arg wall_bench_range_timeout_s)" />
     <param name="hover_thrust" value="$(arg hover_thrust)" />
