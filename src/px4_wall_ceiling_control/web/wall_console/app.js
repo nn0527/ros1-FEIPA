@@ -158,7 +158,7 @@ async function poll(){
     if(!response.ok)throw new Error("本机服务响应异常");paint(await response.json());
   }catch(error){
     if(latest){latest=structuredClone(latest);latest.ssh.connected=false;latest.session.feedback_live=false;latest.can_wall=latest.can_detach=latest.success=false;for(const item of Object.values(latest.status))item.fresh=false;}
-    $("control").disabled=true;$("push").disabled=true;text("connectionText","本机服务无响应");$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;
+    $("resetObservation").disabled=requestBusy || !latest;$("control").disabled=true;$("push").disabled=true;text("connectionText","本机服务无响应");$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;
     if(!$("successNote").hidden)text("successNote","本轮曾成功进入贴墙保持；当前反馈中断，不能确认现在的状态。");
     text("stageTitle","反馈中断");text("stageReason","无法确认当前阶段，请核对飞控状态");
     text("killState","急停反馈中断，动作禁用");text("detachCondition","实时反馈中断，离墙禁用");
