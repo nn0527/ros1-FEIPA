@@ -30,6 +30,30 @@ ROS 基础程序、发布动作请求、订阅真实反馈。树莓派不开放 
 
 ## 打开页面
 
+### 固定三路 USB 设备
+
+本台树莓派使用固定插口别名，避免重启或重新插拔改变 `ttyUSB` 顺序：
+
+| 角色 | 页面串口路径 | 当前绑定插口 ID_PATH |
+|---|---|---|
+| 飞控（原 USB0） | `/dev/serial/by-path/wall-fcu` | `platform-xhci-hcd.1-usb-0:1:1.0` |
+| 顶部雷达（原 USB1） | `/dev/serial/by-path/wall-top` | `platform-xhci-hcd.1-usb-0:2:1.0` |
+| 前向雷达（原 USB2） | `/dev/serial/by-path/wall-front` | `platform-xhci-hcd.0-usb-0:2:1.0` |
+
+三只转换器没有唯一序列号，因此必须保持设备插在上述各自的 USB 插口；交换插口时需重新确认角色并更新规则。
+规则源文件为 `config/udev/99-wall-robot-serial.rules`。只在树莓派主机安装一次：
+
+```bash
+sudo install -m 644 /home/pi/ros_ws/src/px4_wall_ceiling_control/config/udev/99-wall-robot-serial.rules /etc/udev/rules.d/99-wall-robot-serial.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=tty --action=change
+sudo udevadm settle
+ls -l /dev/serial/by-path/wall-*
+```
+
+当前 Docker 绑定整个 `/dev`，可直接看到别名。旧页面配置若仍是完整的 USB0/1/2 默认组合，会自动迁移，波特率、悬停推力及试验模式保持原值；显式配置的其他组合不自动修改。
+程序不会把 Linux 的 `ttyUSB0` 强制改名，实际编号可以改变，但上述角色路径保持固定。
+
 在 Windows 工作区执行：
 
 ```powershell

@@ -6,9 +6,23 @@ import threading
 import time
 
 
+STABLE_PORTS = {
+    "fcu_port": "/dev/serial/by-path/wall-fcu",
+    "ceiling_port": "/dev/serial/by-path/wall-top",
+    "front_port": "/dev/serial/by-path/wall-front",
+}
+LEGACY_PORTS = {"fcu_port": "/dev/ttyUSB0", "ceiling_port": "/dev/ttyUSB1", "front_port": "/dev/ttyUSB2"}
+
+
+def migrate_legacy_ports(values):
+    """Upgrade this bench's old defaults; preserve explicit alternate layouts."""
+    if isinstance(values, dict) and all(values.get(k) == v for k, v in LEGACY_PORTS.items()):
+        return dict(values, **STABLE_PORTS)
+    return values
+
+
 DEFAULT_CONFIG = {
-    "fcu_port": "/dev/ttyUSB0", "baud": 230400,
-    "ceiling_port": "/dev/ttyUSB1", "front_port": "/dev/ttyUSB2",
+    **STABLE_PORTS, "baud": 230400,
     "hover_thrust": 0.45,
     "test_profile": "flight",
 }

@@ -17,7 +17,7 @@ PACKAGE = Path(__file__).resolve().parents[2]
 # Keep Catkin's relay package first: it exposes both generated msg/ and source
 # modules. The source fallback is only needed on the Windows HTTP host.
 sys.path.append(str(PACKAGE / "src"))
-from px4_wall_ceiling_control.wall_console import ConsoleState, DEFAULT_CONFIG, finite_json, launch_arguments, validate_config
+from px4_wall_ceiling_control.wall_console import ConsoleState, DEFAULT_CONFIG, finite_json, launch_arguments, validate_config, migrate_legacy_ports
 
 
 class RemoteRuntime:
@@ -248,7 +248,7 @@ class RemoteRuntime:
                         ceiling_port=self.ros.get_param("/ceiling_lidar_node/serial_port", running["ceiling_port"]),
                         front_port=self.ros.get_param("/front_lidar_node/serial_port", running["front_port"]),
                         hover_thrust=self.ros.get_param("/wall_perch_decision_node/hover_thrust", running["hover_thrust"]))
-                    self.state.config = validate_config(running)
+                    self.state.config = validate_config(migrate_legacy_ports(running))
                 except (ValueError, TypeError):
                     enabled = False
         return {"enabled": bool(enabled), "test_profile": profile, "nodes": sorted(nodes),
@@ -267,7 +267,7 @@ class RemoteRuntime:
             time.sleep(1)
 
     def start(self, config):
-        config = validate_config(config)
+        config = validate_config(migrate_legacy_ports(config))
         # After SSH reconnection, inspect the already-running nodes before
         # the first monitor tick; never attempt a duplicate launch.
         if self.ros is None and self.nodes():
@@ -281,7 +281,7 @@ class RemoteRuntime:
                 if self.state.config != config:
                     raise ValueError("基础程序正在运行，当前页面不支持在运行中变更配置")
                 url = config["fcu_port"] + ":" + str(config["baud"])
-                if self.ros.get_param("/mavros/fcu_url", "") != url:
+                if not self.fcu_url_matches(url):
                     raise ValueError("已运行 MAVROS 的串口配置与页面不一致")
                 flight = self.state.snapshot()["status"]["state"]
                 if flight["fresh"] and flight["value"].get("connected") and not flight["value"].get("armed"):
@@ -326,7 +326,7 @@ class RemoteRuntime:
                 self.state.event("检测到已退出的 MAVROS 残留注册；重新启动 MAVROS")
             if "/mavros" not in nodes:
                 self.spawn("mavros", ["roslaunch", "mavros", "px4.launch", "fcu_url:=" + url])
-            elif self.ros.get_param("/mavros/fcu_url", "") != url:
+            elif not self.fcu_url_matches(url):
                 raise ValueError("已运行 MAVROS 的串口配置与页面不一致")
             else:
                 self.state.event("复用已运行的唯一 MAVROS 实例")
@@ -372,6 +372,18 @@ class RemoteRuntime:
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
             return result.returncode == 0
         except subprocess.TimeoutExpired:
+            return False
+
+    def fcu_url_matches(self, expected):
+        actual = self.ros.get_param("/mavros/fcu_url", "")
+        if actual == expected:
+            return True
+        try:
+            actual_port, actual_baud = actual.rsplit(":", 1)
+            expected_port, expected_baud = expected.rsplit(":", 1)
+            return (actual_baud == expected_baud and
+                    Path(actual_port).resolve() == Path(expected_port).resolve())
+        except (ValueError, TypeError):
             return False
 
     def wall(self):
@@ -569,7 +581,7 @@ def http_main(args):
     settings = Path(args.settings).expanduser()
     config = dict(DEFAULT_CONFIG)
     if settings.exists():
-        config = validate_config(json.loads(settings.read_text(encoding="utf-8")))
+        config = validate_config(migrate_legacy_ports(json.loads(settings.read_text(encoding="utf-8"))))
     transport = SSHTransport(args)
     token = secrets.token_urlsafe(32)
     class Handler(BaseHTTPRequestHandler):
@@ -611,7 +623,7 @@ def http_main(args):
                     raise ValueError("请求长度无效")
                 data = json.loads(self.rfile.read(size))
                 if self.path == "/api/start":
-                    proposed = validate_config(data)
+                    proposed = validate_config(migrate_legacy_ports(data))
                     result = transport.request("start", proposed)
                     settings.parent.mkdir(parents=True, exist_ok=True)
                     temporary = settings.with_suffix(".tmp")

@@ -26,11 +26,11 @@
 <div id="events" role="log" aria-live="off"><p class="empty">等待树莓派实时反馈</p></div></section>
 </div><aside>
 <section class="panel configuration"><h2>启动配置</h2><form id="config">
-<label for="fcu_port">FCU 串口</label><input id="fcu_port" name="fcu_port" value="/dev/ttyUSB0" required>
+<label for="fcu_port">FCU 串口</label><input id="fcu_port" name="fcu_port" value="/dev/serial/by-path/wall-fcu" required>
 <label for="baud">波特率</label><select id="baud" name="baud"><option>57600</option><option>115200</option><option selected>230400</option><option>460800</option><option>921600</option></select>
 <label for="test_profile">测试配置</label><select id="test_profile" name="test_profile"><option value="flight">普通实飞</option><option value="restrained_bench">有约束台架</option></select>
-<label for="ceiling_port">顶部雷达</label><input id="ceiling_port" name="ceiling_port" value="/dev/ttyUSB1" required>
-<label for="front_port">前向雷达</label><input id="front_port" name="front_port" value="/dev/ttyUSB2" required>
+<label for="ceiling_port">顶部雷达</label><input id="ceiling_port" name="ceiling_port" value="/dev/serial/by-path/wall-top" required>
+<label for="front_port">前向雷达</label><input id="front_port" name="front_port" value="/dev/serial/by-path/wall-front" required>
 <label for="hover_thrust">悬停推力</label><input id="hover_thrust" name="hover_thrust" type="number" min="0.01" max="0.85" step="0.01" value="0.45" required>
 </form><p class="configHelp">沿用当前串口配置。启动时保存，下次自动载入。悬停推力请使用实测值。</p></section>
 <section class="panel readiness"><h2>飞行就绪检查</h2><div class="flightState"><span>飞控</span><strong id="flightConnection">—</strong><span>解锁</span><strong id="armed">—</strong></div>

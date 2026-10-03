@@ -13,7 +13,7 @@ import tempfile
 from types import SimpleNamespace
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
-from px4_wall_ceiling_control.wall_console import ConsoleState, DEFAULT_CONFIG, launch_arguments, validate_config
+from px4_wall_ceiling_control.wall_console import ConsoleState, DEFAULT_CONFIG, LEGACY_PORTS, launch_arguments, validate_config
 
 server_path = pathlib.Path(__file__).resolve().parents[1] / "scripts/operator/wall_console_server.py"
 spec = importlib.util.spec_from_file_location("wall_console_server", str(server_path))
@@ -22,6 +22,23 @@ spec.loader.exec_module(server)
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_legacy_default_ports_migrate_without_losing_parameters(self):
+        original = dict(DEFAULT_CONFIG, **LEGACY_PORTS, hover_thrust=0.52)
+        result = server.migrate_legacy_ports(original)
+        self.assertEqual(result["fcu_port"], DEFAULT_CONFIG["fcu_port"])
+        self.assertEqual(result["hover_thrust"], 0.52)
+        self.assertEqual(original["fcu_port"], "/dev/ttyUSB0")
+        alternate = dict(original, fcu_port="/dev/ttyUSB3")
+        self.assertEqual(server.migrate_legacy_ports(alternate), alternate)
+
+    def test_fcu_url_compares_resolved_device_and_baud(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.ros = mock.Mock()
+        with tempfile.TemporaryDirectory() as folder:
+            port = pathlib.Path(folder) / "port"
+            runtime.ros.get_param.return_value = str(port) + ":230400"
+            self.assertTrue(runtime.fcu_url_matches(str(pathlib.Path(folder) / "child/../port") + ":230400"))
+            self.assertFalse(runtime.fcu_url_matches(str(port) + ":921600"))
     def test_mavros_liveness_rejects_dead_registration(self):
         with mock.patch.object(server.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
             self.assertFalse(server.RemoteRuntime.mavros_alive())
@@ -211,7 +228,7 @@ class ConsoleTests(unittest.TestCase):
 
     def test_no_rc_mapping_needed_and_shell_input_rejected(self):
         self.assertEqual(validate_config(DEFAULT_CONFIG), DEFAULT_CONFIG)
-        for change in ({"fcu_port": "/dev/ttyUSB0; reboot"}, {"front_port": "/dev/ttyUSB1"},
+        for change in ({"fcu_port": "/dev/ttyUSB0; reboot"}, {"front_port": DEFAULT_CONFIG["ceiling_port"]},
                        {"hover_thrust": float("nan")}, {"baud": True}, {"flight_enabled": False}):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 validate_config(dict(DEFAULT_CONFIG, **change))
@@ -418,7 +435,7 @@ class ConsoleTests(unittest.TestCase):
             runtime.prepare_lidars()
             self.assertEqual(factory.call_count, 2)
             self.assertEqual([call.args[0] for call in factory.call_args_list],
-                             ["/dev/ttyUSB1", "/dev/ttyUSB2"])
+                             [DEFAULT_CONFIG["ceiling_port"], DEFAULT_CONFIG["front_port"]])
             device = factory.return_value.__enter__.return_value
             self.assertEqual(device.write.call_args_list, [mock.call(b"iHALT"), mock.call(b"iHALT")])
             self.state.update("state", {"connected": True, "armed": True, "mode": "ALTCTL"})
