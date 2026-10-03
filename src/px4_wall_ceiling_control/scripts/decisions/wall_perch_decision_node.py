@@ -148,6 +148,9 @@ class WallPerchDecisionNode:
         )
         if self.max_thrust <= self.hover_thrust:
             raise ValueError("wall detach max_thrust must exceed hover_thrust")
+        self.bench_detach_hover_thrust = float(rospy.get_param("~bench_detach_hover_thrust", self.hover_thrust))
+        if not math.isfinite(self.bench_detach_hover_thrust) or not 0.1 <= self.bench_detach_hover_thrust < self.max_thrust:
+            raise ValueError("bench_detach_hover_thrust must be finite and below max_thrust")
         pressure_floor = min(
             self.max_thrust,
             max(
@@ -785,7 +788,8 @@ class WallPerchDecisionNode:
         altitude, speed = feedback
         vertical_fraction = max(0.0, rotate_vector(attitude, (0.0, 0.0, 1.0))[2])
         if getattr(self, "bench_wait_for_ranges", False):
-            return clamp(self.hover_thrust / max(vertical_fraction, 1.0e-3), 0.1, self.max_thrust)
+            base = getattr(self, "bench_detach_hover_thrust", self.hover_thrust)
+            return clamp(base / max(vertical_fraction, 1.0e-3), 0.1, self.max_thrust)
         vertical_demand = (
             self.hover_thrust
             + self.detach_altitude_kp * (self.detach_altitude_m - altitude)
@@ -1294,7 +1298,9 @@ class WallPerchDecisionNode:
             thrust = self._height_hold_thrust()
         elif self.state == WallPerchStatus.STATE_EXIT:
             quaternion = self.q_hover
-            thrust = self.hover_thrust
+            thrust = (self._height_hold_thrust()
+                      if getattr(self, "bench_wait_for_ranges", False) and getattr(self, "detach_altitude_m", None) is not None
+                      else self.hover_thrust)
         elif self.state == WallPerchStatus.STATE_ABORT:
             quaternion = self.q_hover
             thrust = (

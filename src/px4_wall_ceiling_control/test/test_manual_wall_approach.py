@@ -311,4 +311,40 @@ class BenchRangeGraceTests(unittest.TestCase):
         self.assertTrue(n._top_contact_ready(now))
 
 
+class BenchDetachSupportTests(unittest.TestCase):
+    def node(self):
+        n = WallDecision.__new__(WallDecision)
+        n.bench_wait_for_ranges = True
+        n.bench_detach_hover_thrust = .48
+        n.hover_thrust, n.max_thrust = .45, .85
+        n.detach_altitude_m = 3
+        n._height_feedback = lambda: (3, 0)
+        n._current_quaternion = lambda: (0, 0, 0, 1)
+        n.q_hover = (0, 0, 0, 1)
+        return n
+
+    def test_level_recovery_and_exit_keep_same_support_until_handover(self):
+        n = self.node()
+        for state in [WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT]:
+            n.state = state
+            self.assertAlmostEqual(n._candidate(rospy.Time.from_sec(10))[2], .48)
+
+    def test_bench_support_ignores_height_drift_and_respects_tilt_and_cap(self):
+        n = self.node()
+        n._height_feedback = lambda: (-100, 20)
+        self.assertAlmostEqual(n._height_hold_thrust(), .48)
+        a = math.radians(60)
+        n._current_quaternion = lambda: (0, math.sin(a/2), 0, math.cos(a/2))
+        self.assertAlmostEqual(n._height_hold_thrust(), .85)
+
+    def test_normal_flight_and_pre_detach_exit_retain_hover_setting(self):
+        n = self.node()
+        n.state = WallPerchStatus.STATE_EXIT
+        n.bench_wait_for_ranges = False
+        self.assertAlmostEqual(n._candidate(rospy.Time.from_sec(10))[2], .45)
+        n.bench_wait_for_ranges = True
+        n.detach_altitude_m = None
+        self.assertAlmostEqual(n._candidate(rospy.Time.from_sec(10))[2], .45)
+
+
 if __name__ == "__main__": unittest.main()

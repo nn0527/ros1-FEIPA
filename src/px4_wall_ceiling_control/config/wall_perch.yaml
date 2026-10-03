@@ -52,6 +52,8 @@ wall_perch_decision_node:
   # 90 deg over 3 s (quintic setpoint); validate actual motion on the rig.
   detach_time_s: 3.00
   recover_time_s: 1.00
+  # Bench departure/recovery support only; retain through EXIT until ALTCTL.
+  bench_detach_hover_thrust: 0.48
   # Capture odometry Z when detach starts. As the body levels, use Z/vertical
   # speed feedback and measured tilt to request the vertical hover component.
   # Keep the wall-pressure thrust while the wheels roll on the wall. Near 90 deg,
