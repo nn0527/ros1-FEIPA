@@ -48,8 +48,9 @@ wall_perch_decision_node:
   detach_max_rate_rps: 0.15
   detach_max_abs_vertical_speed_mps: 0.15
   detach_stable_hold_s: 0.50
-  # 90 deg over 4 s (quintic setpoint); verify wheel contact and sink rate on rig.
-  detach_time_s: 4.00
+  # Temporary constrained-rig tune: shorten weak vertical support during detach.
+  # 90 deg over 3 s (quintic setpoint); validate actual motion on the rig.
+  detach_time_s: 3.00
   recover_time_s: 1.00
   # Capture odometry Z when detach starts. As the body levels, use Z/vertical
   # speed feedback and measured tilt to request the vertical hover component.
@@ -57,7 +58,7 @@ wall_perch_decision_node:
   # wheel friction must support weight; thrust is capped at max_thrust.
   detach_altitude_kp: 0.50
   detach_vertical_speed_kd: 0.30
-  detach_compensation_start_deg: 75.0
+  detach_compensation_start_deg: 80.0
   # Remain in RECOVER until both height and vertical speed settle.
   detach_altitude_tolerance_m: 0.10
   detach_vertical_speed_tolerance_mps: 0.20
