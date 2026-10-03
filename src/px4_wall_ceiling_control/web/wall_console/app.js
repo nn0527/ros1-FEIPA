@@ -40,7 +40,7 @@ function pair(label, value, className=""){
 }
 function paint(s){
   latest=s; token=s.token;
-  if(!loaded){for(const input of form.elements) if(input.name in s.config) input.value=s.config[input.name];loaded=true;}
+  if(!loaded || fresh(s,"runtime")?.enabled){for(const input of form.elements) if(input.name in s.config) input.value=s.config[input.name];loaded=true;}
   const ssh=s.ssh.connected, state=fresh(s,"state"), runtime=fresh(s,"runtime"), phase=fresh(s,"phase"), wall=fresh(s,"wall"), health=fresh(s,"health"), odom=fresh(s,"odom");
   text("connectionText",ssh?"SSH 已连接":"SSH 未连接");text("host",s.ssh.host);
   $("connectionDot").classList.toggle("ok",ssh);

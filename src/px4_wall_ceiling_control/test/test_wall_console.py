@@ -328,6 +328,38 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(self.state.launch_error, "")
         thread.assert_not_called()
 
+    def test_new_computer_adopts_running_configuration(self):
+        self.ready()
+        running = dict(DEFAULT_CONFIG, test_profile="restrained_bench", hover_thrust=0.52,
+                       fcu_port="/dev/ttyUSB3", front_port="/dev/ttyUSB4")
+        self.state.config = running
+        bridge = object.__new__(server.SSHTransport)
+        bridge.lock = threading.RLock()
+        bridge.snapshot = self.state.snapshot()
+        bridge.arrived, bridge.connected, bridge.error = 100.0, True, ""
+        bridge.args = SimpleNamespace(ssh_host="test-host", ssh_user="pi")
+        with mock.patch.object(server.time, "monotonic", return_value=100.1):
+            result = bridge.status(DEFAULT_CONFIG)
+        self.assertEqual(result["config"], running)
+
+    def test_runtime_reads_pi_settings_for_another_computer(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = self.state
+        names = {"/mavros", "/terminal_operator_node", "/flight_mode_manager_node",
+                 "/attachment_output_mux_node", "/wall_perch_decision_node", "/sensor_range_manager_node",
+                 "/ceiling_lidar_node", "/front_lidar_node"}
+        values = {"/mavros/fcu_url": "/dev/ttyUSB3:230400",
+                  "/ceiling_lidar_node/serial_port": "/dev/ttyUSB1",
+                  "/front_lidar_node/serial_port": "/dev/ttyUSB4",
+                  "/wall_perch_decision_node/hover_thrust": 0.52}
+        runtime.ros = SimpleNamespace(get_param=lambda name, default=False:
+            values.get(name, False if name.endswith(("require_rc_center", "rc_assist_enabled")) else True))
+        with mock.patch.object(runtime, "nodes", return_value=names):
+            self.assertTrue(runtime.inspect_runtime()["enabled"])
+        self.assertEqual(runtime.state.config["test_profile"], "restrained_bench")
+        self.assertEqual(runtime.state.config["fcu_port"], "/dev/ttyUSB3")
+        self.assertEqual(runtime.state.config["hover_thrust"], 0.52)
+
     def test_armed_vehicle_blocks_new_pipeline_start(self):
         self.ready()
         self.state.update("runtime", {"enabled": False})

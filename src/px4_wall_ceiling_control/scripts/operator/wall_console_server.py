@@ -240,7 +240,17 @@ class RemoteRuntime:
         profile = "restrained_bench" if wall_bench and manager_bench else "flight"
         with self.state.lock:
             if required <= nodes:
-                self.state.config["test_profile"] = profile
+                running = dict(self.state.config, test_profile=profile)
+                url = self.ros.get_param("/mavros/fcu_url", "")
+                try:
+                    port, baud = url.rsplit(":", 1)
+                    running.update(fcu_port=port, baud=int(baud),
+                        ceiling_port=self.ros.get_param("/ceiling_lidar_node/serial_port", running["ceiling_port"]),
+                        front_port=self.ros.get_param("/front_lidar_node/serial_port", running["front_port"]),
+                        hover_thrust=self.ros.get_param("/wall_perch_decision_node/hover_thrust", running["hover_thrust"]))
+                    self.state.config = validate_config(running)
+                except (ValueError, TypeError):
+                    enabled = False
         return {"enabled": bool(enabled), "test_profile": profile, "nodes": sorted(nodes),
                 "missing": sorted(required - nodes), "logger": "/attachment_flight_logger" in nodes}
 
@@ -423,7 +433,7 @@ class SSHTransport:
         while True:
             client = paramiko.SSHClient()
             try:
-                client.load_host_keys(str(Path.home() / ".ssh" / "known_hosts"))
+                client.load_host_keys(str(Path(getattr(self.args, "known_hosts", Path.home() / ".ssh" / "known_hosts")).expanduser()))
                 client.set_missing_host_key_policy(paramiko.RejectPolicy())
                 client.connect(self.args.ssh_host, port=self.args.ssh_port, username=self.args.ssh_user,
                                key_filename=self.args.ssh_key, look_for_keys=False, allow_agent=False,
@@ -466,6 +476,9 @@ class SSHTransport:
             result = json.loads(json.dumps(self.snapshot))
             age = time.monotonic() - self.arrived if self.arrived else None
             connected = self.connected and age is not None and age < 2
+            runtime = result["status"]["runtime"]
+            if connected and runtime["fresh"] and runtime["value"] and runtime["value"].get("enabled"):
+                config = validate_config(result["config"])
             # Account for transport delay in every ROS freshness decision.
             for item in result["status"].values():
                 if item["age_s"] is not None:
@@ -504,6 +517,8 @@ class SSHTransport:
             result["config"] = config
             result["ssh"] = {"connected": connected, "error": self.error, "age_s": age,
                              "host": self.args.ssh_user + "@" + self.args.ssh_host}
+            result["connection"] = {name: getattr(self.args, name, None) for name in
+                                    ("ssh_port", "container", "remote_workspace")}
             return result
 
     def request(self, action, config=None):
@@ -608,6 +623,7 @@ if __name__ == "__main__":
     parser.add_argument("--ssh-port", type=int, default=22)
     parser.add_argument("--ssh-user", default="pi")
     parser.add_argument("--ssh-key", default=str(Path.home() / ".ssh/id_ed25519_wallrobot"))
+    parser.add_argument("--known-hosts", default=str(Path.home() / ".ssh/known_hosts"))
     parser.add_argument("--container", default="ros1_noetic")
     parser.add_argument("--remote-workspace", default="/root/ros_ws")
     parser.add_argument("--settings", default=str(Path.home() / ".codex/wall-console/settings.json"))

@@ -1,0 +1,3 @@
+# Local HTTP/SSH host only. The Pi ROS bridge does not use this dependency.
+# Verified with Python 3.12 and Paramiko 5.0.0.
+paramiko==5.0.0

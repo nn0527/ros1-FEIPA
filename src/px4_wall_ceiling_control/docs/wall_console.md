@@ -13,11 +13,73 @@ ROS 基础程序、发布动作请求、订阅真实反馈。树莓派不开放 
 ```
 
 然后在 Codex 浏览器打开 `http://127.0.0.1:8787`。不传 `-NoBrowser` 时打开系统浏览器。
-启动脚本优先使用 Codex 自带 Python（包含 Paramiko），避免使用旧版系统 Python。
+启动脚本优先使用本仓库 `.venv-wall-console`，其次 Codex 自带 Python，再查找系统 Python；
+也支持普通 Python 3.10+ 与 `-PythonPath`。捆绑运行时可能更新，因此建议独立虚拟环境。
 
 前提：已验证的 SSH 公钥与 known_hosts、树莓派上的 `ros1_noetic` 容器、
 `/root/ros_ws/devel/setup.bash`，以及同步到容器工作区的本包源码。
 SSH 主机、用户、密钥和本机端口可通过脚本参数修改。
+
+## 换电脑复用
+
+电脑只运行 HTTP 页面和 SSH 客户端，不需要 ROS、MAVROS、雷达驱动或 QGC。
+Codex 是打开本机页面和协助调试的入口；同一页面也能用普通浏览器打开。
+Windows 使用根目录 `Start-WallConsole.ps1`；macOS/Linux 可用下面的 Python 命令。
+验证过的环境为 Windows、Python 3.12、Paramiko 5.0.0。其他操作系统的实机测试尚未执行。
+
+1. 获取同一版本代码。只复制网页 HTML 不够，必须包含启动脚本及整个本包
+   `src/px4_wall_ceiling_control`（其中包括 Python 服务、状态模块和 web 目录）。
+   本机不用复制 ROS build/devel 或试飞记录。树莓派仍使用已编译的 `/root/ros_ws`；
+   更新消息定义后需先在树莓派 `catkin_make`，再在未解锁时重启基础链路。
+2. 有 Codex 捆绑 Python 时可直接使用；否则安装 Python 3.10+，并安装本机依赖：
+
+   ```powershell
+   python -m venv .venv-wall-console
+   .\.venv-wall-console\Scripts\python.exe -m pip install -r src/px4_wall_ceiling_control/requirements-console.txt
+   ```
+
+3. 新电脑接入能访问树莓派的网络，配置该电脑自己的 SSH 密钥，让树莓派管理员授权公钥。
+   私钥留在各自电脑。先核对树莓派主机指纹，再通过一次普通 SSH 登录写入 known_hosts；
+   本服务拒绝未知／变化的主机指纹，不自动接受。确认能无交互密钥登录，并执行 `docker ps`
+   （用户需要已有 Docker 权限）。新电脑更换不需要改飞控参数。
+4. 在代码根目录启动，按实际路径修改参数：
+
+   ```powershell
+   .\Start-WallConsole.ps1 -NoBrowser -SshHost 192.168.50.66 -SshUser pi `
+     -SshKey "$env:USERPROFILE/.ssh/id_ed25519_wallrobot" `
+     -KnownHosts "$env:USERPROFILE/.ssh/known_hosts" -SshPort 22 `
+     -Container ros1_noetic -RemoteWorkspace /root/ros_ws
+   ```
+
+   普通 Python 可以额外指定 `-PythonPath 'C:/Python312/python.exe'`。
+   HTTP 端口占用时用 `-Port 8791`，对应打开 `http://127.0.0.1:8791/`。
+   脚本不会把另一台 SSH 目标的既有页面误认成当前连接。
+
+   macOS/Linux 或直接运行 Python：
+
+   ```bash
+   python3 src/px4_wall_ceiling_control/scripts/operator/wall_console_server.py \
+     --ssh-host 192.168.50.66 --ssh-user pi --ssh-port 22 \
+     --ssh-key "$HOME/.ssh/id_ed25519_wallrobot" --known-hosts "$HOME/.ssh/known_hosts" \
+     --container ros1_noetic --remote-workspace /root/ros_ws --port 8787
+   ```
+
+5. 打开本机地址，先确认 SSH 连接和反馈。若飞机已有基础链路运行，新电脑读取树莓派上
+   的实际串口、波特率、推力和台架配置，不用本机默认值覆盖它们，不重复启动控制节点。
+   尚未启动时，由操作者选择“有约束台架”并核对三路串口／推力；新电脑配置文件初始默认
+   为“普通实飞”，不能仅因电脑换了就假定台架限制已关闭。
+6. 静态、未解锁时验收基础程序和传感器。之后由飞手按既有流程起飞、贴墙、离墙、
+   确认 ALTCTL、降油门落地／承托、上锁。急停收尾后，解除急停并保持有效 RC 反馈，
+   等待 IDLE、owner=0、ALTCTL，再由飞手重新解锁。页面不自动解锁或重放上次命令。
+
+不要同时用两台电脑发动作；更换操作电脑时先停止旧本机 HTTP 后台，树莓派飞行程序保持运行。
+关闭页面／SSH 不会终止飞行程序。配置路径可用 `-Settings` 或 `--settings` 指定。
+断电或 USB 掉线需要先恢复硬件；ROS 节点名残留不代表 MAVROS 进程和串口仍有效。
+上次测试已验证接管和急停后的重新待命，但 USB 设备随后消失，所以尚未完成第二轮实飞。
+
+验收顺序：全新配置启动 → SSH 反馈 → 读取现场配置 → 重复启动不产生新节点 →
+SSH 断开时按钮禁用／重连不重放 → 现场完成一轮 → 解除急停后第二轮。
+软件回放不能替代最后两步的实机验收。
 
 ## 本次测试的操作
 
