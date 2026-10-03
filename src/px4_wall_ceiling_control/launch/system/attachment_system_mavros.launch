@@ -29,6 +29,7 @@
   <arg name="output_max_thrust" default="0.85" />
   <arg name="match_fcu_thrust_on_handover" default="false" />
   <arg name="thrust_handover_ramp_s" default="1.0" />
+  <arg name="fcu_target_timeout_s" default="0.20" />
   <arg name="rc_assist_enabled" default="false" />
   <arg name="require_rc_center" default="false" />
   <arg name="rc_roll_channel_index" default="-1" />
@@ -154,6 +155,7 @@
     <param name="max_thrust" value="$(arg output_max_thrust)" />
     <param name="match_fcu_thrust_on_handover"
            value="$(arg match_fcu_thrust_on_handover)" />
+    <param name="fcu_target_timeout_s" value="$(arg fcu_target_timeout_s)" />
     <param name="thrust_handover_ramp_s"
            value="$(arg thrust_handover_ramp_s)" />
   </node>

@@ -15,6 +15,8 @@
     <arg name="wall_flip_thrust_follow_tilt" value="true" />
     <arg name="match_fcu_thrust_on_handover" value="true" />
     <arg name="thrust_handover_ramp_s" value="1.0" />
+    <!-- Measured FCU target stream is 4 Hz despite the requested 10 Hz. -->
+    <arg name="fcu_target_timeout_s" value="0.35" />
     <arg name="ceiling_enabled" value="false" />
     <arg name="output_enabled" value="true" />
     <arg name="mechanism_output_enabled" value="false" />
