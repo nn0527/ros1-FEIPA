@@ -22,6 +22,14 @@ spec.loader.exec_module(server)
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_mavros_liveness_rejects_dead_registration(self):
+        with mock.patch.object(server.subprocess, "run", return_value=SimpleNamespace(returncode=1)):
+            self.assertFalse(server.RemoteRuntime.mavros_alive())
+        with mock.patch.object(server.subprocess, "run", side_effect=subprocess.TimeoutExpired("rosnode", 4)):
+            self.assertFalse(server.RemoteRuntime.mavros_alive())
+        with mock.patch.object(server.subprocess, "run", return_value=SimpleNamespace(returncode=0)):
+            self.assertTrue(server.RemoteRuntime.mavros_alive())
+
     def test_password_auth_consumes_environment_without_persisting(self):
         args = SimpleNamespace(ssh_auth="password")
         with mock.patch.dict(os.environ, {"WALL_CONSOLE_SSH_PASSWORD": "fixture-secret"}), mock.patch.object(server.threading, "Thread"):

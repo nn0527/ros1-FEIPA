@@ -151,7 +151,7 @@ class RemoteRuntime:
             from std_msgs.msg import String, UInt8
             from rosgraph_msgs.msg import Log
             from px4_wall_ceiling_control.msg import SensorHealth, WallPerchStatus, OperatorCommand
-            rospy.init_node("wall_console_bridge", anonymous=False, disable_signals=True)
+            rospy.init_node("wall_console_bridge", anonymous=True, disable_signals=True)
             self.publisher = rospy.Publisher("/attachment/terminal_command", String, queue_size=1)
             topics = {"state": ("/mavros/state", State), "rc": ("/mavros/rc/in", RCIn),
                       "estimator": ("/mavros/estimator_status", EstimatorStatus),
@@ -318,6 +318,12 @@ class RemoteRuntime:
             self.init_ros()
             nodes = self.nodes()
             url = self.state.config["fcu_port"] + ":" + str(self.state.config["baud"])
+            if "/mavros" in nodes and not self.mavros_alive():
+                owners = self.port_owners(self.state.config["fcu_port"])
+                if owners:
+                    raise ValueError("MAVROS 无响应，但飞控串口仍被进程占用，不能重复启动: " + str(owners))
+                nodes.discard("/mavros")
+                self.state.event("检测到已退出的 MAVROS 残留注册；重新启动 MAVROS")
             if "/mavros" not in nodes:
                 self.spawn("mavros", ["roslaunch", "mavros", "px4.launch", "fcu_url:=" + url])
             elif self.ros.get_param("/mavros/fcu_url", "") != url:
@@ -357,6 +363,16 @@ class RemoteRuntime:
             self.state.event(str(error), "error")
         finally:
             self.state.starting = False
+
+    @staticmethod
+    def mavros_alive():
+        """A ROS master registration can outlive the actual serial reader."""
+        try:
+            result = subprocess.run(["rosnode", "ping", "-c", "1", "/mavros"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
+            return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
 
     def wall(self):
         def publish(command):
