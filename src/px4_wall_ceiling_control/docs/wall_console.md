@@ -245,3 +245,11 @@ python3 -m unittest discover -s src/px4_wall_ceiling_control/test -p test_wall_c
 
 前端测试使用模拟 HTTP 反馈验证未就绪、就绪、请求回执、贴墙确认、故障和 SSH 中断。
 真实 SSH/ROS 连接验证不发送贴墙请求或启动飞行控制；实际离地和贴墙必须现场测试。
+
+## 多电脑共享反馈
+
+Windows EXE 经 SSH 启动轻量 relay，容器内 `--shared-service` 用文件锁确保单实例，唯一 RemoteRuntime 订阅 ROS 并统一生成 10 Hz 快照。Unix socket 位于 `~/.ros/wall_console/shared.sock`，权限 0600，不暴露公网端口。无客户端时服务仍观察并记录事件；不停止飞行节点。日志 `~/.ros/wall_console/shared-service.log`。容器重启后首次连接自动启动。
+
+默认各电脑为观察端，显式申请控制权；树莓派在同一锁内验证控制权和分发动作。没有自动抢占。暂停推送保留 SSH 和控制权，禁用本机动作；其他电脑不受影响。断线保留 30 秒，同一客户端进程重连恢复，超时后新申请仅在有效未解锁状态或确认已交回 ALTCTL 时接受。冷启动无 MAVROS 时可申请控制权以启动基础程序。关闭浏览器不会退出本地服务。旧客户端不支持新握手，升级需要所有电脑替换 EXE 并重启本地服务。
+
+部署遵循本机提交 → Gitee 推送 → 树莓派 git pull --ff-only。不要直接覆盖树莓派脚本。服务代码升级仅在确认飞控未解锁时重启桥接，不重启飞行节点。

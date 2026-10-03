@@ -41,16 +41,21 @@ function pair(label, value, className=""){
 function paint(s){
   latest=s; token=s.token;
   if(!loaded || fresh(s,"runtime")?.enabled){for(const input of form.elements) if(input.name in s.config) input.value=s.config[input.name];loaded=true;}
-  const ssh=s.ssh.connected, state=fresh(s,"state"), runtime=fresh(s,"runtime"), phase=fresh(s,"phase"), wall=fresh(s,"wall"), health=fresh(s,"health"), odom=fresh(s,"odom");
+  const ssh=s.ssh.connected, session=s.session || {}, live=!!session.feedback_live, control=!!session.control, state=fresh(s,"state"), runtime=fresh(s,"runtime"), phase=fresh(s,"phase"), wall=fresh(s,"wall"), health=fresh(s,"health"), odom=fresh(s,"odom");
   text("connectionText",ssh?"SSH 已连接":"SSH 未连接");text("host",s.ssh.host);
   $("connectionDot").classList.toggle("ok",ssh);
+  text("sessionText",(control?"本机为控制端":session.owner?"本机为观察端 · 控制端："+session.owner:"本机为观察端 · 暂无控制端")+" · 在线 "+(session.clients || 0)+" 台 · "+(!session.push?"实时反馈已暂停":live?"实时反馈已开启":"等待新反馈"));
+  text("control",control?"释放控制权":"申请控制权");
+  $("control").disabled=requestBusy || !ssh || (!control && !!session.owner);
+  text("push",session.push?"暂停实时反馈":"开启实时反馈");
+  $("push").disabled=requestBusy || !ssh;
   text("flightConnection",state ? (state.connected?"已连接":"未连接") : "无有效反馈");
   text("armed",state ? (state.armed?"已解锁":"未解锁") : "—");text("mode",state?.mode || "—");
   const enabled=!!runtime?.enabled;
-  $("start").disabled=requestBusy || !ssh || s.starting || (state?.armed && !enabled);
+  $("start").disabled=requestBusy || !live || !control || s.starting || (state?.armed && !enabled);
   text("startLabel",s.starting?"正在启动…":enabled?"基础程序已启动":"启动基础程序");
-  $("wall").disabled=requestBusy || !ssh || !s.can_wall;
-  $("detach").disabled=requestBusy || !ssh || !s.can_detach;
+  $("wall").disabled=requestBusy || !live || !control || !s.can_wall;
+  $("detach").disabled=requestBusy || !live || !control || !s.can_detach;
   text("detachBlockReason",s.can_detach?"可提交离墙请求；控制节点确认连续稳定后才旋转": "离墙："+(s.detach_blockers?.[0] || "等待贴墙保持"));
   $("detachBlockReason").classList.toggle("ready",!!s.can_detach);
   const kill=fresh(s,"kill");
@@ -58,7 +63,7 @@ function paint(s){
   $("killState").classList.toggle("errorText",!kill?.valid || !!kill.active);
   text("detachCondition",wall?.state_name!=="WALL_HOLD"?"离墙仅在当前贴墙保持阶段接受请求":wall.detach_pending?"离墙请求等待中："+(wall.detach_block_reason || "等待连续稳定"):wall.detach_ready?"旋转条件已满足，可提交离墙请求":"可提交离墙请求，旋转前还需："+(wall.detach_block_reason || "等待姿态和角速度稳定"));
   text("wallBlockReason",s.can_wall?"":s.blockers.join("；"));
-  for(const field of form.elements) field.disabled=s.starting || enabled || requestBusy;
+  for(const field of form.elements) field.disabled=s.starting || enabled || requestBusy || !control || !live;
   let title="等待启动", reason=s.blockers[0] || "飞行稳定后，可发送贴墙指令", step=0;
   if(!ssh){title="SSH 反馈中断";reason=s.ssh.error || "正在重新连接树莓派";}
   else if(s.starting){title="基础程序启动中";reason="正在启动 MAVROS、雷达与贴墙控制节点";}
@@ -82,11 +87,12 @@ function paint(s){
   if(phase==="RETURNING"){title="等待遥控接管";reason="保持水平控制输出，等待飞控确认 ALTCTL；未确认前不结束交接";}
   if(returned){title=history?.fault_detected?"异常恢复完成，已交还遥控":"离墙完成，已交还遥控";reason="已确认 ALTCTL，输出已释放；飞手降低油门落地，再按正常流程上锁";}
   if(kill?.active){title="急停已生效";reason=state?.armed?"电机已停，飞控等待自动上锁；动作请求已禁用":"飞控已上锁，急停开关仍生效";}
+  if(!live){title=!session.push?"实时反馈已暂停":"等待实时反馈";reason=!session.push?"本机停止接收数据；飞行程序与记录继续运行，动作已禁用":"需要收到新反馈后才能操作";}
   text("stageTitle",title);text("stageReason",translate[reason] || reason);
   document.querySelector(".stage").classList.toggle("error",!!kill?.active || !!s.launch_error || phase==="LOCKED" || wall?.fault_detected || wall?.state_name==="ABORT");
-  $("successNote").hidden=!history?.hold_achieved;
+  $("successNote").hidden=!history?.hold_achieved || !live;
   text("successNote",s.success?"本轮已确认贴墙保持；当前仍在保持。":history?.hold_achieved?"本轮曾成功进入贴墙保持，记录已保留。当前状态见上方；历史结果不代表现在仍贴墙。":"");
-  document.querySelectorAll(".steps li").forEach((el,i)=>{el.classList.toggle("done",i<step || (history?.hold_achieved && i===5) || (returned && i===step));el.classList.toggle("current",ssh && !returned && wall?.state_name!=="ABORT" && i===step);});
+  document.querySelectorAll(".steps li").forEach((el,i)=>{el.classList.toggle("done",i<step || (history?.hold_achieved && i===5) || (returned && i===step));el.classList.toggle("current",live && !returned && wall?.state_name!=="ABORT" && i===step);});
   text("front",health?.front_valid?n(fresh(s,"front")?.range_m):"—");
   text("ceiling",health?.ceiling_valid?n(fresh(s,"ceiling")?.range_m):"—");
   text("angles",odom?.angles ? n(odom.angles[0],1)+" / "+n(odom.angles[1],1) : "—");
@@ -103,14 +109,16 @@ function paint(s){
     const el=pair(label,value,"check"+(ok?" ok":""));el.title=check.reason;return el;
   });
   const ages=[["飞控心跳","state"],["里程计","odom"],["估计器","estimator"],["遥控输入","rc"],["急停反馈","kill"],["两路雷达","health"],["贴墙状态","wall"]];
-  rows($("ages"),ages,([label,key])=>{const item=s.status[key],el=pair(label,item.age_s===null?"未收到":n(item.age_s,2)+" s","ageRow");el.lastChild.classList.toggle("stale",!item.fresh);return el;});
+  rows($("ages"),ages,([label,key])=>{const item=s.status[key],el=pair(label,!session.push?"推送已暂停":item.age_s===null?"未收到":n(item.age_s,2)+" s","ageRow");el.lastChild.classList.toggle("stale",!item.fresh);return el;});
   text("sshError",ssh?"":s.ssh.error);
-  text("recording",runtime?.logger?"试飞日志：录制中":enabled?"试飞日志：未检测到录制节点":"试飞日志：等待启动");
+  text("recording",!live?"试飞日志：当前无法确认":runtime?.logger?"试飞日志：录制中":enabled?"试飞日志：未检测到录制节点":"试飞日志：等待启动");
   if(s.events.length){rows($("events"),s.events.slice(-25).reverse(),event=>pair(new Date(event.time*1000).toLocaleTimeString("zh-CN",{hour12:false}),event.text,"eventRow "+event.kind));}
 }
+$("control").addEventListener("click",()=>action(latest?.session?.control?"/api/release":"/api/acquire",{}));
+$("push").addEventListener("click",()=>action("/api/push",{enabled:!latest?.session?.push}));
 async function action(path, data){
   if(requestBusy)return;requestBusy=true;$("start").disabled=true;$("wall").disabled=true;$("detach").disabled=true;
-  message(path==="/api/wall"?"正在发送 wall…":path==="/api/detach"?"正在发送 detach…":"正在请求启动…");
+  message(path==="/api/wall"?"正在发送 wall…":path==="/api/detach"?"正在发送 detach…":path==="/api/start"?"正在请求启动…":"正在更新连接设置…");
   try{
     const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Console-Token":token},body:JSON.stringify(data),signal:AbortSignal.timeout(9000)});
     const result=await response.json();if(!response.ok)throw new Error(result.error || "操作失败");message(result.message);
@@ -132,7 +140,7 @@ async function poll(){
     const response=await fetch("/api/status",{cache:"no-store",signal:AbortSignal.timeout(2500)});
     if(!response.ok)throw new Error("本机服务响应异常");paint(await response.json());
   }catch(error){
-    text("connectionText","本机服务无响应");$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;
+    $("control").disabled=true;$("push").disabled=true;text("connectionText","本机服务无响应");$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;
     if(!$("successNote").hidden)text("successNote","本轮曾成功进入贴墙保持；当前反馈中断，不能确认现在的状态。");
     text("stageTitle","反馈中断");text("stageReason","无法确认当前阶段，请核对飞控状态");
     text("killState","急停反馈中断，动作禁用");text("detachCondition","实时反馈中断，离墙禁用");

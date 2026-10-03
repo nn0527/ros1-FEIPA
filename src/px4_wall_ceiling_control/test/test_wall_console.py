@@ -277,6 +277,8 @@ class ConsoleTests(unittest.TestCase):
         bridge.lock = threading.RLock()
         bridge.snapshot = self.state.snapshot()
         bridge.arrived, bridge.connected, bridge.error = 100.0, True, ""
+        bridge.heartbeat, bridge.push_enabled = 100.0, True
+        bridge.session = {"control": True, "push": True}
         bridge.args = SimpleNamespace(ssh_host="test-host", ssh_user="pi")
         with mock.patch.object(server.time, "monotonic", return_value=103.0):
             result = bridge.status(DEFAULT_CONFIG)
@@ -331,6 +333,8 @@ class ConsoleTests(unittest.TestCase):
         bridge.snapshot = self.state.snapshot()
         bridge.snapshot["success"] = True
         bridge.arrived, bridge.connected, bridge.error = 100.0, True, ""
+        bridge.heartbeat, bridge.push_enabled = 100.0, True
+        bridge.session = {"control": True, "push": True}
         bridge.args = SimpleNamespace(ssh_host="test-host", ssh_user="pi")
         with mock.patch.object(server.time, "monotonic", return_value=103.0):
             status = bridge.status(DEFAULT_CONFIG)
@@ -345,6 +349,8 @@ class ConsoleTests(unittest.TestCase):
         bridge.lock = threading.RLock()
         bridge.snapshot = self.state.snapshot()
         bridge.arrived, bridge.connected, bridge.error = 100.0, True, ""
+        bridge.heartbeat, bridge.push_enabled = 100.0, True
+        bridge.session = {"control": True, "push": True}
         bridge.args = SimpleNamespace(ssh_host="test-host", ssh_user="pi")
         with mock.patch.object(server.time, "monotonic", return_value=100.2):
             status = bridge.status(DEFAULT_CONFIG)
@@ -375,6 +381,8 @@ class ConsoleTests(unittest.TestCase):
         bridge.lock = threading.RLock()
         bridge.snapshot = self.state.snapshot()
         bridge.arrived, bridge.connected, bridge.error = 100.0, True, ""
+        bridge.heartbeat, bridge.push_enabled = 100.0, True
+        bridge.session = {"control": True, "push": True}
         bridge.args = SimpleNamespace(ssh_host="test-host", ssh_user="pi")
         with mock.patch.object(server.time, "monotonic", return_value=100.1):
             result = bridge.status(DEFAULT_CONFIG)

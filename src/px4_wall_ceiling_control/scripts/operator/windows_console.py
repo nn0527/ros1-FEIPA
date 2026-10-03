@@ -96,6 +96,8 @@ def launch(config, no_browser=False):
         try:
             with urllib.request.urlopen(url + "/api/status", timeout=1) as response:
                 status = json.load(response)
+            if status.get("token") and status.get("console_protocol") != 2:
+                raise RuntimeError("旧版页面服务仍在运行，请双击“重启本地页面.cmd”后重新打开。关闭浏览器不会退出旧服务。")
             if not status.get("token"):
                 raise RuntimeError("页面端口已被其他程序占用")
             expected = dict(ssh_port=int(config["ssh_port"]), container=config["container"],

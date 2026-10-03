@@ -407,42 +407,8 @@ class RemoteRuntime:
 
 
 def bridge_main():
-    output = sys.stdout
-    sys.stdout = sys.stderr  # ROS logging cannot corrupt the JSON-line transport.
-    write_lock = threading.Lock()
-    def send(value):
-        with write_lock:
-            output.write(json.dumps(finite_json(value), ensure_ascii=False, allow_nan=False) + "\n")
-            output.flush()
-    runtime = RemoteRuntime()
-    running = threading.Event()
-    running.set()
-    def stream():
-        while running.is_set():
-            try:
-                send({"type": "snapshot", "data": runtime.state.snapshot()})
-            except (BrokenPipeError, OSError):
-                return
-            time.sleep(0.1)
-    threading.Thread(target=stream, daemon=True).start()
-    for line in sys.stdin:
-        request = {}
-        try:
-            request = json.loads(line)
-            action = request.get("action")
-            if action == "start":
-                result = runtime.start(request["config"])
-            elif action == "wall":
-                result = runtime.wall()
-            elif action == "detach":
-                result = runtime.detach()
-            else:
-                raise ValueError("未知操作")
-            send({"type": "reply", "id": request["id"], "ok": True, "data": result})
-        except Exception as error:
-            send({"type": "reply", "id": request.get("id"), "ok": False, "error": str(error)})
-    running.clear()
-    # Do not stop flight processes because the local UI or SSH connection closes.
+    from px4_wall_ceiling_control.shared_bridge import relay
+    relay(str(Path(__file__).resolve()))
 
 
 class SSHTransport:
@@ -454,6 +420,11 @@ class SSHTransport:
         self.connected = False
         self.error = "正在连接树莓派"
         self.arrived = 0.0
+        self.heartbeat = 0.0
+        self.push_enabled = True
+        self.session_id = secrets.token_hex(24)
+        self.session = {"control": False, "owner": "", "clients": 0, "push": True}
+        threading.Thread(target=self.keepalive_loop, daemon=True).start()
         self.pending = {}
         self.writer = None
         self.client = None
@@ -479,6 +450,10 @@ class SSHTransport:
                 stdin, stdout, stderr = client.exec_command(command)
                 with self.lock:
                     self.client, self.writer = client, stdin
+                    self.session = {"control": False, "owner": "", "clients": 0, "push": self.push_enabled}
+                    self.arrived = 0.0
+                    stdin.write(json.dumps({"client": self.session_id, "label": os.environ.get("COMPUTERNAME", "Windows"), "push": self.push_enabled}) + "\n")
+                    stdin.flush()
                 def drain(stream):
                     for line in stream:
                         self.stderr_tail = (self.stderr_tail + line)[-2000:]
@@ -486,9 +461,13 @@ class SSHTransport:
                 for line in stdout:
                     message = json.loads(line)
                     with self.lock:
-                        if message.get("type") == "snapshot":
+                        if message.get("type") == "session":
+                            self.session = message["data"]
+                            self.connected, self.error, self.heartbeat = True, "", time.monotonic()
+                        elif message.get("type") == "snapshot" and self.push_enabled:
                             self.snapshot = message["data"]
                             self.connected, self.error, self.arrived = True, "", time.monotonic()
+                            self.heartbeat = self.arrived
                         elif message.get("type") == "reply" and message.get("id") in self.pending:
                             slot = self.pending[message["id"]]
                             slot["reply"] = message
@@ -504,11 +483,23 @@ class SSHTransport:
                 client.close()
             time.sleep(3)
 
+    def keepalive_loop(self):
+        while True:
+            time.sleep(2)
+            with self.lock:
+                if self.writer:
+                    try:
+                        self.writer.write('{"action":"ping"}\n')
+                        self.writer.flush()
+                    except OSError:
+                        pass
+
     def status(self, config):
         with self.lock:
             result = json.loads(json.dumps(self.snapshot))
             age = time.monotonic() - self.arrived if self.arrived else None
-            connected = self.connected and age is not None and age < 2
+            link_connected = self.connected and time.monotonic() - self.heartbeat < 3
+            connected = link_connected and self.push_enabled and age is not None and age < 2
             runtime = result["status"]["runtime"]
             if connected and runtime["fresh"] and runtime["value"] and runtime["value"].get("enabled"):
                 config = validate_config(result["config"])
@@ -539,7 +530,7 @@ class SSHTransport:
                 result["can_wall"] = False
                 result["success"] = False
                 if not connected:
-                    result["blockers"] = ["SSH 反馈中断；历史数据不能用于判断贴墙成功"]
+                    result["blockers"] = ["实时反馈已暂停，动作禁用" if not self.push_enabled else "SSH 反馈中断；历史数据不能用于判断贴墙成功"]
                     for check in result["checks"]:
                         check["ok"] = False
             detach_sources = required_feedback + ("health", "setpoint")
@@ -548,7 +539,10 @@ class SSHTransport:
                     result["detach_blockers"] = ["离墙所需实时反馈中断或过期"]
                 result["can_detach"] = False
             result["config"] = config
-            result["ssh"] = {"connected": connected, "error": self.error, "age_s": age,
+            result["session"] = dict(self.session, push=self.push_enabled, feedback_live=connected)
+            if not self.session.get("control"):
+                result["can_wall"] = result["can_detach"] = False
+            result["ssh"] = {"connected": link_connected, "error": self.error, "age_s": age,
                              "host": self.args.ssh_user + "@" + self.args.ssh_host}
             result["connection"] = {name: getattr(self.args, name, None) for name in
                                     ("ssh_port", "container", "remote_workspace")}
@@ -558,8 +552,13 @@ class SSHTransport:
         identifier = secrets.token_hex(12)
         event = threading.Event()
         with self.lock:
-            if not self.connected or not self.writer or time.monotonic() - self.arrived >= 2:
-                raise ValueError("SSH 未连接或反馈过期，操作未发送")
+            if not self.connected or not self.writer or time.monotonic() - self.heartbeat >= 3:
+                raise ValueError("SSH 未连接，操作未发送")
+            if action in ("start", "wall", "detach") and (not self.push_enabled or not self.session.get("control") or time.monotonic() - self.arrived >= 2):
+                raise ValueError("需要控制权和有效的实时反馈，操作未发送")
+            if action == "push":
+                self.push_enabled = bool(config["enabled"])
+                self.arrived = 0.0
             slot = {"event": event}
             self.pending[identifier] = slot
             try:
@@ -607,6 +606,7 @@ def http_main(args):
             if self.path == "/api/status":
                 value = transport.status(config)
                 value["token"] = token
+                value["console_protocol"] = 2
                 return self.respond(200, value)
             assets = {"/": ("index.html", "text/html; charset=utf-8"),
                       "/app.js": ("app.js", "text/javascript; charset=utf-8"),
@@ -633,6 +633,12 @@ def http_main(args):
                     temporary.write_text(json.dumps(proposed, ensure_ascii=False, indent=2), encoding="utf-8")
                     temporary.replace(settings)
                     config = proposed
+                elif self.path in ("/api/acquire", "/api/release"):
+                    result = transport.request(self.path.rsplit("/", 1)[1])
+                elif self.path == "/api/push":
+                    if type(data.get("enabled")) is not bool:
+                        raise ValueError("enabled 必须为布尔值")
+                    result = transport.request("push", data)
                 elif self.path == "/api/wall":
                     result = transport.request("wall")
                 elif self.path == "/api/detach":
@@ -651,6 +657,7 @@ def http_main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--bridge", action="store_true")
+    parser.add_argument("--shared-service", action="store_true")
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--ssh-host", default="192.168.50.66")
     parser.add_argument("--ssh-port", type=int, default=22)
@@ -662,7 +669,10 @@ if __name__ == "__main__":
     parser.add_argument("--remote-workspace", default="/root/ros_ws")
     parser.add_argument("--settings", default=str(Path.home() / ".codex/wall-console/settings.json"))
     options = parser.parse_args()
-    if options.bridge:
+    if options.shared_service:
+        from px4_wall_ceiling_control.shared_bridge import serve
+        serve(RemoteRuntime, str(Path.home() / ".ros/wall_console/shared.sock"))
+    elif options.bridge:
         bridge_main()
     else:
         http_main(options)
