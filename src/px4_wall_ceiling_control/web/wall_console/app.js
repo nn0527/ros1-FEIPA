@@ -4,7 +4,7 @@ let token = "", loaded = false, requestBusy = false, latest = null;
 const form = $("config");
 let observationKey = "", observation = {reset:false,eventAfter:null}, previousPhase = null;
 function saveObservation(){try{localStorage.setItem(observationKey,JSON.stringify(observation));}catch(_){}}
-function observationActive(s){return ["PRESTREAM","ENTERING","ACTIVE","RETURNING"].includes(fresh(s,"phase")) || (fresh(s,"state")?.armed && fresh(s,"state")?.mode==="OFFBOARD");}
+function observationActive(s){return ["WAITING_WALL","PRESTREAM","ENTERING","ACTIVE","RETURNING"].includes(fresh(s,"phase")) || (fresh(s,"state")?.armed && fresh(s,"state")?.mode==="OFFBOARD");}
 const translate = {
   initialized:"等待贴墙指令", "PX4 entered OFFBOARD":"飞控已进入 OFFBOARD",
   "flight state timeout":"飞控心跳已过期", "MAVROS disconnected":"MAVROS 连接中断",
@@ -46,7 +46,7 @@ function paint(s){
   const key="wall-observation:"+s.ssh.host+":"+(s.connection?.remote_workspace || "");
   if(key!==observationKey){observationKey=key;try{observation=JSON.parse(localStorage.getItem(key)) || {reset:false,eventAfter:null};}catch(_){observation={reset:false,eventAfter:null};}previousPhase=null;}
   const currentPhase=fresh(s,"phase");
-  if(observation.reset && ((currentPhase==="PRESTREAM" && previousPhase!=="PRESTREAM") || (currentPhase==="ACTIVE" && fresh(s,"wall")?.state_name==="FRONT_WALL_DETECT"))){observation.reset=false;saveObservation();}
+  if(observation.reset && ((["WAITING_WALL","PRESTREAM"].includes(currentPhase) && !["WAITING_WALL","PRESTREAM"].includes(previousPhase)) || (currentPhase==="ACTIVE" && fresh(s,"wall")?.state_name==="FRONT_WALL_DETECT"))){observation.reset=false;saveObservation();}
   previousPhase=currentPhase;
   $("resetObservation").disabled=requestBusy || observationActive(s);
   text("observationNote",observation.reset?"本机观测已重置；实时反馈、动作条件与树莓派日志保持更新。":"重置本机进度与显示记录，飞行状态和树莓派日志继续保留。");
@@ -80,7 +80,7 @@ function paint(s){
   else if(s.starting){title="基础程序启动中";reason="正在启动 MAVROS、雷达与贴墙控制节点";}
   else if(s.launch_error){title="启动未完成";reason=s.launch_error;}
   else if(phase==="WAITING_WALL"){title="飞手手动接近 · ALTCTL";reason=fresh(s,"reason") || "等待有效距离连续满足翻转条件，尚未接管";step=0;}
-  else if(phase==="PRESTREAM"){title="预发送姿态目标";reason="距离条件已满足，建立设定值流；仍为 ALTCTL，尚未接管";step=1;}
+  else if(phase==="PRESTREAM"){title="预发送姿态目标";reason="建立设定值流；仍为 ALTCTL，尚未接管";step=1;}
   else if(phase==="ENTERING"){title="进入 OFFBOARD";reason="等待飞控确认模式切换";step=2;}
   else if(phase==="ACTIVE"){
     title=wallNames[wall?.state_name] || "贴墙控制中";reason=wall?.reason || "等待贴墙状态反馈";

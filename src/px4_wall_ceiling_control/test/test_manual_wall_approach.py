@@ -44,20 +44,20 @@ class ManualApproachTests(unittest.TestCase):
         with mock.patch.object(rospy.Time, "now", return_value=self.now), mock.patch("time.monotonic", return_value=self.clock):
             self.node._on_timer(None)
 
-    def test_request_waits_in_altctl_without_output_or_mode_command(self):
+    def test_request_warms_stream_in_altctl_without_mode_command(self):
         self.tick()
         self.clock += 30
         self.tick()
         self.assertEqual(self.node.phase, Manager.WAITING_WALL)
         self.node._request_mode.assert_not_called()
-        self.assertFalse(self.node.prestream_pub.publish.call_args[0][0].data)
+        self.assertTrue(self.node.prestream_pub.publish.call_args[0][0].data)
         self.assertEqual(self.node.flight.mode, "ALTCTL")
 
     def test_ready_has_no_extra_three_second_delay(self):
         self.tick()
         self.node.wall.flip_ready = True
         self.tick()  # Same monotonic time: no added reaction delay.
-        self.assertEqual(self.node.phase, Manager.PRESTREAM)
+        self.assertEqual(self.node.phase, Manager.WAITING_WALL)
         self.tick()
         self.clock += 1.6
         self.tick()
@@ -76,7 +76,7 @@ class ManualApproachTests(unittest.TestCase):
         self.assertEqual(self.node.phase, Manager.WAITING_WALL)
         self.node._request_mode.assert_not_called()
 
-    def test_distance_lost_in_prestream_resumes_wait_without_extending_deadline(self):
+    def test_distance_changes_do_not_restart_parallel_stream_or_extend_deadline(self):
         self.tick()
         self.node.wall.flip_ready = True
         self.tick()
@@ -86,8 +86,42 @@ class ManualApproachTests(unittest.TestCase):
         self.tick()
         self.assertEqual(self.node.phase, Manager.WAITING_WALL)
         self.assertEqual(self.node.manual_wall_wait_started, 100)
-        self.assertIsNone(self.node.stream_since)
+        self.assertEqual(self.node.stream_since, 100)
         self.node._request_mode.assert_not_called()
+        self.clock += 1
+        self.node.wall.flip_ready = True
+        self.tick()
+        self.assertEqual(self.node.phase, Manager.ENTERING)
+        self.node._request_mode.assert_called_once_with("OFFBOARD")
+
+    def test_warm_stream_takes_over_on_distance_gate_without_additional_wait(self):
+        self.tick()
+        self.tick()
+        self.clock += 10
+        self.tick()
+        self.node._request_mode.assert_not_called()
+        self.node.wall.flip_ready = True
+        self.tick()
+        self.assertEqual(self.node.phase, Manager.ENTERING)
+        self.node._request_mode.assert_called_once_with("OFFBOARD")
+
+    def test_output_stream_loss_restarts_only_stream_confirmation(self):
+        self.tick()
+        self.tick()
+        self.clock += 5
+        self.node.output_mode = 0
+        self.tick()
+        self.assertIsNone(self.node.stream_since)
+        self.node.output_mode = 2
+        self.node.wall.flip_ready = True
+        self.tick()
+        self.assertEqual(self.node.phase, Manager.WAITING_WALL)
+        self.clock += 1.4
+        self.tick()
+        self.node._request_mode.assert_not_called()
+        self.clock += .2
+        self.tick()
+        self.node._request_mode.assert_called_once_with("OFFBOARD")
 
     def test_timeout_cancels_intent_without_changing_flight_mode(self):
         self.tick()

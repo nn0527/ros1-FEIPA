@@ -256,12 +256,12 @@ Windows EXE 经 SSH 启动轻量 relay，容器内 `--shared-service` 用文件�
 
 ## 重置本轮观测
 
-“重置本轮观测”只清空当前浏览器的历史进度高亮、历史成功提示和旧显示记录，并保存在本机浏览器。刷新不会带回旧进度；下一轮 PRESTREAM／FRONT_WALL_DETECT 到来后正常跟踪新一轮。飞行动作执行时禁用；断线后也可重置显示，但不会把旧反馈当作实时反馈重新启用动作。该操作没有 ROS／SSH 动作请求，不清理控制器状态、不删除树莓派日志，不影响其他电脑的观察。
+“重置本轮观测”只清空当前浏览器的历史进度高亮、历史成功提示和旧显示记录，并保存在本机浏览器。刷新不会带回旧进度；下一轮 WAITING_WALL／PRESTREAM／FRONT_WALL_DETECT 到来后正常跟踪新一轮。飞行动作执行时禁用；断线后也可重置显示，但不会把旧反馈当作实时反馈重新启用动作。该操作没有 ROS／SSH 动作请求，不清理控制器状态、不删除树莓派日志，不影响其他电脑的观察。
 
 ## 飞手手动接近入口
 
-`wall_console_flight.launch` 为模式管理器启用 `wall_manual_approach=true`，并为决策节点启用 `manual_approach=true`。发送 wall 后进入 WAITING_WALL，保持 ALTCTL，不开启 OFFBOARD 预发送、不申请控制输出。使用决策节点同一前向滤波距离和连续采样计时判定翻转条件：当前 ≤0.20 m、连续0.30 s；同时要求新鲜两路有效距离和原有交接前置条件。无额外3秒准备延时。
+`wall_console_flight.launch` 为模式管理器启用 `wall_manual_approach=true`，并为决策节点启用 `manual_approach=true`。发送 wall 后进入 WAITING_WALL，保持 ALTCTL，同时开启 OFFBOARD 预发送，不申请贴墙输出归属。使用决策节点同一前向滤波距离和连续采样计时判定翻转条件：当前 ≤0.20 m、连续0.30 s；同时要求新鲜两路有效距离和原有交接前置条件。无额外3秒准备延时。
 
-`flight_mode_manager_node/manual_wall_wait_timeout_s=60.0` 是请求后的最大手动等待时间；包括距离条件反复失效后的等待，不重复延长。条件满足才建立默认1.5秒连续预发送，在 ALTCTL 下仍由飞手操控；条件失效重新等待。飞控确认 OFFBOARD 后跳过3°自动接近，直接进入 FLIP_TO_WALL 并申请输出归属。确认接管时距离条件丢失则进入交回 ALTCTL 的路径。
+`flight_mode_manager_node/manual_wall_wait_timeout_s=60.0` 是请求后的最大手动等待时间；包括距离条件反复失效后的等待，不重复延长。手动接近期间并行建立默认1.5秒连续预发送，在 ALTCTL 下仍由飞手操控。距离条件满足且预发送已就绪，即请求 OFFBOARD，不再额外等待1.5秒。距离条件反复变化不重置预发送计时；控制目标流中断则重新计时。飞控确认 OFFBOARD 后跳过3°自动接近，直接进入 FLIP_TO_WALL 并申请输出归属。确认接管时距离条件丢失则进入交回 ALTCTL 的路径。
 
 “取消等待”使用专用 `/wall_perch/cancel_wait`，模式管理器只在 WAITING_WALL 接受；晚到的消息不打断接管／翻转。超时释放终端意图，不请求 OFFBOARD。原 `approach_timeout_s=20` 只用于保留的自动接近入口；`flip_time_s=2` 翻转耗时、`capture_timeout_s=8` 接触确认超时不变。其他旧入口默认维持自动接近。

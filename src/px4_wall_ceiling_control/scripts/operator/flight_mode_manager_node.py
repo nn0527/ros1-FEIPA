@@ -530,10 +530,22 @@ class FlightModeManagerNode:
             elif self._manual_wait_elapsed(monotonic_now) >= self.manual_wall_wait_timeout_s:
                 self._reset(lock=True, reason="手动接近等待超时，贴墙请求已取消；仍由飞手控制 ALTCTL")
                 self.cancel_pub.publish(String(data="cancel"))
-            elif self._manual_wall_ready(now):
-                self._set_phase(self.PRESTREAM, reason="距离条件已满足，预发送目标；ALTCTL 尚未交接")
             else:
-                self.phase_reason = self._manual_wait_reason(now, monotonic_now)
+                # Warm the OFFBOARD stream while the pilot approaches in ALTCTL.
+                # Distance changes do not restart this independent stream timer.
+                if not self._stream_ready(now):
+                    self.stream_since = None
+                elif self.stream_since is None:
+                    self.stream_since = monotonic_now
+                stream_warm = (self.stream_since is not None
+                               and monotonic_now - self.stream_since >= self.prestream_s)
+                if stream_warm and self._manual_wall_ready(now):
+                    self._set_phase(self.ENTERING)
+                    self._request_mode("OFFBOARD")
+                elif self._manual_wall_ready(now):
+                    self.phase_reason = "距离条件已满足；等待并行预发送完成，仍由飞手控制 ALTCTL"
+                else:
+                    self.phase_reason = self._manual_wait_reason(now, monotonic_now)
         elif self.phase == self.PRESTREAM:
             failure_reason = None
             if requested != self.selected_mode:
@@ -552,12 +564,6 @@ class FlightModeManagerNode:
                     lock=requested is not None,
                     reason=failure_reason,
                 )
-            elif self._manual_wall_selected() and self._manual_wait_elapsed(monotonic_now) >= self.manual_wall_wait_timeout_s:
-                self._reset(lock=True, reason="手动接近等待超时，贴墙请求已取消；仍由飞手控制 ALTCTL")
-                self.cancel_pub.publish(String(data="cancel"))
-            elif self._manual_wall_selected() and not self._manual_wall_ready(now):
-                self.stream_since = None
-                self._set_phase(self.WAITING_WALL, reason="距离条件失效；保持 ALTCTL，继续等待手动接近")
             elif self._stream_ready(now):
                 if self.stream_since is None:
                     self.stream_since = monotonic_now
@@ -641,7 +647,7 @@ class FlightModeManagerNode:
                 self._reset(lock=True, reason=failure_reason)
 
         self.prestream_pub.publish(
-            Bool(data=self.phase in (self.PRESTREAM, self.ENTERING, self.ACTIVE, self.RETURNING))
+            Bool(data=self.phase in (self.WAITING_WALL, self.PRESTREAM, self.ENTERING, self.ACTIVE, self.RETURNING))
         )
         self.phase_pub.publish(String(data=self.phase))
         phase_reason_pub = getattr(self, "phase_reason_pub", None)
