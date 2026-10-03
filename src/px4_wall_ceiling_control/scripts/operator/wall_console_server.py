@@ -17,7 +17,7 @@ PACKAGE = Path(__file__).resolve().parents[2]
 # Keep Catkin's relay package first: it exposes both generated msg/ and source
 # modules. The source fallback is only needed on the Windows HTTP host.
 sys.path.append(str(PACKAGE / "src"))
-from px4_wall_ceiling_control.wall_console import ConsoleState, DEFAULT_CONFIG, finite_json, launch_arguments, validate_config, migrate_legacy_ports
+from px4_wall_ceiling_control.wall_console import ConsoleState, DEFAULT_CONFIG, STABLE_PORTS, finite_json, launch_arguments, validate_config, migrate_legacy_ports
 
 
 class RemoteRuntime:
@@ -248,6 +248,9 @@ class RemoteRuntime:
                         ceiling_port=self.ros.get_param("/ceiling_lidar_node/serial_port", running["ceiling_port"]),
                         front_port=self.ros.get_param("/front_lidar_node/serial_port", running["front_port"]),
                         hover_thrust=self.ros.get_param("/wall_perch_decision_node/hover_thrust", running["hover_thrust"]))
+                    for name, alias in STABLE_PORTS.items():
+                        if Path(running[name]).resolve() == Path(alias).resolve():
+                            running[name] = alias
                     self.state.config = validate_config(migrate_legacy_ports(running))
                 except (ValueError, TypeError):
                     enabled = False
