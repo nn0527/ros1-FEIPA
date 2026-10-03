@@ -448,6 +448,11 @@ class WallPerchDecisionNode:
 
     def _on_top_range(self, message):
         if not is_valid_range(message):
+            # A bad sample must not count toward continuous contact confirmation.
+            # Keep the last valid range and its original timestamp for the
+            # bounded bench safety grace; never refresh them with invalid data.
+            self.top_contact_since = None
+            self.top_contact_last_sample_at = None
             return
         now = rospy.Time.now()
         previous = (
@@ -660,6 +665,13 @@ class WallPerchDecisionNode:
         )
 
     def _top_preflight_ready(self, now):
+        if getattr(self, "bench_wait_for_ranges", False) and self.state in (
+            WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE,
+            WallPerchStatus.STATE_WALL_HOLD, WallPerchStatus.STATE_WALL_PIN,
+        ):
+            # Ignore the instantaneous invalid-frame bit only while a recent
+            # valid sample and the sensor manager heartbeat remain available.
+            return self._sensor_health_fresh(now) and self._top_fresh(now)
         if getattr(self, "bench_wait_for_ranges", False) and self.state in (
             WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER,
             WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT,

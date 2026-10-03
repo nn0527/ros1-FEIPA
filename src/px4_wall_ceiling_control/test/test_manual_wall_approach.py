@@ -5,6 +5,7 @@ from unittest import mock
 import rospy
 from mavros_msgs.msg import State
 from std_msgs.msg import Bool
+from sensor_msgs.msg import Range
 from px4_wall_ceiling_control.msg import OperatorCommand, SensorHealth, WallPerchStatus
 from test_flight_handover import Manager, OutputMux
 from test_attachment_safety import WallDecision
@@ -240,6 +241,74 @@ class FlipThrustTests(unittest.TestCase):
         self.assertAlmostEqual(first, .46)
         self.assertLess(abs(midpoint-first), .01)
         self.assertLess(final, .47)
+
+
+class BenchRangeGraceTests(unittest.TestCase):
+    def node(self):
+        n = WallDecision.__new__(WallDecision)
+        n.state = WallPerchStatus.STATE_FLIP_TO_WALL
+        n.bench_wait_for_ranges = True
+        n.require_top_sensor_on_acquire = True
+        n.top_range = Range(range=.04, min_range=.03, max_range=40)
+        n.top_filtered_m = .04
+        n.top_received_at = rospy.Time.from_sec(10)
+        n.sensor_timeout_s, n.sensor_health_timeout_s = .6, .3
+        n.sensor_health = SensorHealth(ceiling_valid=False, front_valid=True)
+        n.sensor_health_received_at = rospy.Time.from_sec(10)
+        n.top_contact_since = n.top_contact_last_sample_at = rospy.Time.from_sec(10)
+        n.top_contact_hold_s, n.top_contact_distance_m = 1, .056
+        n.top_clear_distance_m = .1
+        n.top_clear_since = n.top_clear_last_sample_at = None
+        n._filter_range = lambda message, previous: message.range
+        n._flight_ready = n._odom_fresh = n._vertical_speed_safe = n._rates_safe = lambda *args: True
+        n.flip_max_rate_rps, n.capture_max_rate_rps = 6, 3
+        return n
+
+    def test_brief_error_keeps_bench_flip_capture_and_hold_safe(self):
+        n = self.node()
+        for state in [WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE,
+                      WallPerchStatus.STATE_WALL_HOLD, WallPerchStatus.STATE_WALL_PIN]:
+            n.state = state
+            self.assertTrue(n._safety_ok(rospy.Time.from_sec(10.1)))
+
+    def test_persistent_range_loss_still_stops_after_original_timeout(self):
+        n = self.node()
+        now = rospy.Time.from_sec(10.61)
+        n.sensor_health_received_at = now
+        self.assertFalse(n._safety_ok(now))
+
+    def test_sensor_manager_loss_still_stops_even_with_valid_range(self):
+        n = self.node()
+        n.top_received_at = rospy.Time.from_sec(10.4)
+        self.assertFalse(n._safety_ok(rospy.Time.from_sec(10.4)))
+
+    def test_normal_flight_keeps_instantaneous_health_requirement(self):
+        n = self.node()
+        n.bench_wait_for_ranges = False
+        self.assertFalse(n._safety_ok(rospy.Time.from_sec(10.1)))
+
+    def test_brief_sensor_error_does_not_bypass_flight_or_rate_protection(self):
+        n = self.node()
+        n._rates_safe = lambda *args: False
+        self.assertFalse(n._safety_ok(rospy.Time.from_sec(10.1)))
+        n._rates_safe = lambda *args: True
+        n._flight_ready = lambda *args: False
+        self.assertFalse(n._safety_ok(rospy.Time.from_sec(10.1)))
+
+    def test_invalid_sample_never_refreshes_distance_and_restarts_confirmation(self):
+        n = self.node()
+        with mock.patch.object(rospy.Time, 'now', return_value=rospy.Time.from_sec(10.2)):
+            n._on_top_range(Range(range=float('nan'), min_range=.03, max_range=40))
+        self.assertEqual(n.top_received_at, rospy.Time.from_sec(10))
+        self.assertEqual(n.top_filtered_m, .04)
+        self.assertFalse(n._top_contact_ready(rospy.Time.from_sec(10.2)))
+        for t in [10.3, 10.5, 10.7, 10.9, 11.1, 11.3, 11.5]:
+            now = rospy.Time.from_sec(t)
+            with mock.patch.object(rospy.Time, 'now', return_value=now):
+                n._on_top_range(Range(range=.04, min_range=.03, max_range=40))
+            if t < 11.3:
+                self.assertFalse(n._top_contact_ready(now))
+        self.assertTrue(n._top_contact_ready(now))
 
 
 if __name__ == "__main__": unittest.main()
