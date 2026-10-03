@@ -277,6 +277,20 @@ class BenchRangeGraceTests(unittest.TestCase):
         n.sensor_health_received_at = now
         self.assertFalse(n._safety_ok(now))
 
+    def test_extended_bench_timeout_tolerates_1_1_seconds_but_not_1_21(self):
+        n = self.node()
+        n.sensor_timeout_s = 1.2
+        for age, safe in [(1.1, True), (1.21, False)]:
+            now = rospy.Time.from_sec(10 + age)
+            n.sensor_health_received_at = now
+            self.assertEqual(n._safety_ok(now), safe)
+
+    def test_extended_timeout_does_not_complete_contact_on_cached_sample(self):
+        n = self.node()
+        n.sensor_timeout_s = 1.2
+        self.assertFalse(n._top_contact_ready(rospy.Time.from_sec(11.1)))
+        self.assertEqual(n.top_contact_last_sample_at, rospy.Time.from_sec(10))
+
     def test_sensor_manager_loss_still_stops_even_with_valid_range(self):
         n = self.node()
         n.top_received_at = rospy.Time.from_sec(10.4)

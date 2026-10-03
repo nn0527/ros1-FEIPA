@@ -24,6 +24,7 @@
   <arg name="wall_min_altitude_m" default="0.30" />
   <arg name="wall_require_min_altitude" default="true" />
   <arg name="wall_bench_wait_for_ranges" default="false" />
+  <arg name="wall_bench_range_timeout_s" default="1.2" />
   <arg name="wall_manual_approach" default="false" />
   <arg name="wall_flip_thrust_follow_tilt" default="false" />
   <arg name="output_max_thrust" default="0.85" />
@@ -108,7 +109,10 @@
   </node>
 
   <node pkg="px4_wall_ceiling_control" type="sensor_range_manager_node.py"
-        name="sensor_range_manager_node" output="$(arg node_output)" />
+        name="sensor_range_manager_node" output="$(arg node_output)">
+    <param if="$(arg wall_bench_wait_for_ranges)" name="input_timeout_s"
+           value="$(arg wall_bench_range_timeout_s)" />
+  </node>
 
   <node if="$(arg ceiling_enabled)"
         pkg="px4_wall_ceiling_control"
@@ -132,6 +136,8 @@
     <param name="require_min_altitude"
            value="$(arg wall_require_min_altitude)" />
     <param name="bench_wait_for_ranges" value="$(arg wall_bench_wait_for_ranges)" />
+    <param if="$(arg wall_bench_wait_for_ranges)" name="sensor_timeout_s"
+           value="$(arg wall_bench_range_timeout_s)" />
     <param name="hover_thrust" value="$(arg hover_thrust)" />
     <param name="state_timeout_s" value="$(arg flight_state_timeout_s)" />
   </node>
