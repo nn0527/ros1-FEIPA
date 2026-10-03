@@ -32,6 +32,7 @@ from px4_wall_ceiling_control.msg import (
 
 class FlightModeManagerNode:
     IDLE = "IDLE"
+    WAITING_WALL = "WAITING_WALL"
     PRESTREAM = "PRESTREAM"
     ENTERING = "ENTERING"
     ACTIVE = "ACTIVE"
@@ -50,6 +51,12 @@ class FlightModeManagerNode:
         self.estimator_timeout_s = float(rospy.get_param("~estimator_timeout_s", 1.5))
         self.operator_timeout_s = float(rospy.get_param("~operator_timeout_s", 0.5))
         self.sensor_timeout_s = float(rospy.get_param("~sensor_timeout_s", 0.5))
+        self.wall_manual_approach = bool(rospy.get_param("~wall_manual_approach", False))
+        self.manual_wall_wait_timeout_s = max(2.0, float(rospy.get_param("~manual_wall_wait_timeout_s", 60.0)))
+        self.manual_wall_wait_started = None
+        self.manual_wait_canceled = False
+        rospy.Subscriber("/wall_perch/cancel_wait", Bool, self._on_wait_cancel, queue_size=1)
+        self.cancel_pub = rospy.Publisher("/attachment/terminal_command", String, queue_size=1)
         self.wall_bench_wait_for_ranges = bool(rospy.get_param("~wall_bench_wait_for_ranges", False))
         self.output_timeout_s = float(rospy.get_param("~output_timeout_s", 0.3))
         self.status_timeout_s = float(rospy.get_param("~status_timeout_s", 0.5))
@@ -273,6 +280,29 @@ class FlightModeManagerNode:
     def _preflight_ready(self, now, selected):
         return self._preflight_failure_reason(now, selected) is None
 
+    def _on_wait_cancel(self, message):
+        if message.data and self.phase == self.WAITING_WALL:
+            self.manual_wait_canceled = True
+
+    def _manual_wall_selected(self):
+        return getattr(self, "wall_manual_approach", False) and self.selected_mode == OperatorCommand.MODE_WALL
+
+    def _manual_wall_ready(self, now):
+        wall = self.wall
+        return bool(wall is not None and is_fresh(self.wall_at, self.status_timeout_s, now)
+                    and wall.state == WallPerchStatus.STATE_IDLE
+                    and wall.flip_ready and wall.front_range_fresh and wall.top_range_fresh
+                    and wall.top_preflight_ready and wall.entry_height_ready
+                    and self.sensor is not None and is_fresh(self.sensor_at, self.sensor_timeout_s, now)
+                    and self.sensor.front_valid and self.sensor.ceiling_valid)
+
+    def _manual_wait_elapsed(self, monotonic_now):
+        return monotonic_now - self.manual_wall_wait_started
+
+    def _manual_wait_reason(self, now, monotonic_now):
+        remaining = max(0.0, self.manual_wall_wait_timeout_s - self._manual_wait_elapsed(monotonic_now))
+        return "等待飞手手动接近：保持 ALTCTL；需有效距离连续满足翻转阈值，等待窗口剩余 {:.0f} 秒".format(remaining)
+
     def _stream_ready(self, now):
         return bool(
             self.output_mode == 2
@@ -427,6 +457,7 @@ class FlightModeManagerNode:
                     or self._requested_mode(rospy.Time.now()) != self.selected_mode
                     or not self._preflight_ready(rospy.Time.now(), self.selected_mode)
                     or not self._stream_ready(rospy.Time.now())
+                    or (self._manual_wall_selected() and not self._manual_wall_ready(rospy.Time.now()))
                 ):
                     return
             elif mode == "ALTCTL":
@@ -446,6 +477,8 @@ class FlightModeManagerNode:
 
     def _reset(self, lock=False, reason=None):
         self.selected_mode = None
+        self.manual_wall_wait_started = None
+        self.manual_wait_canceled = False
         self.stream_since = None
         self.owner_seen = False
         self.detach_seen = False
@@ -480,7 +513,27 @@ class FlightModeManagerNode:
                 and self._preflight_ready(now, requested)
             ):
                 self.selected_mode = requested
-                self._set_phase(self.PRESTREAM)
+                if self._manual_wall_selected():
+                    self.manual_wall_wait_started = monotonic_now
+                    self._set_phase(self.WAITING_WALL, reason=self._manual_wait_reason(now, monotonic_now))
+                else:
+                    self._set_phase(self.PRESTREAM)
+        elif self.phase == self.WAITING_WALL:
+            if getattr(self, "manual_wait_canceled", False):
+                self._reset(lock=True, reason="手动接近等待已取消；仍由飞手控制 ALTCTL")
+                self.cancel_pub.publish(String(data="cancel"))
+            elif requested != self.selected_mode:
+                self._reset(lock=requested is not None, reason="manual wall request canceled")
+            elif flight_mode != "ALTCTL" or not self._preflight_ready(now, self.selected_mode):
+                self._reset(lock=True, reason=self._preflight_failure_reason(now, self.selected_mode) or "manual approach requires ALTCTL")
+                self.cancel_pub.publish(String(data="cancel"))
+            elif self._manual_wait_elapsed(monotonic_now) >= self.manual_wall_wait_timeout_s:
+                self._reset(lock=True, reason="手动接近等待超时，贴墙请求已取消；仍由飞手控制 ALTCTL")
+                self.cancel_pub.publish(String(data="cancel"))
+            elif self._manual_wall_ready(now):
+                self._set_phase(self.PRESTREAM, reason="距离条件已满足，预发送目标；ALTCTL 尚未交接")
+            else:
+                self.phase_reason = self._manual_wait_reason(now, monotonic_now)
         elif self.phase == self.PRESTREAM:
             failure_reason = None
             if requested != self.selected_mode:
@@ -499,6 +552,12 @@ class FlightModeManagerNode:
                     lock=requested is not None,
                     reason=failure_reason,
                 )
+            elif self._manual_wall_selected() and self._manual_wait_elapsed(monotonic_now) >= self.manual_wall_wait_timeout_s:
+                self._reset(lock=True, reason="手动接近等待超时，贴墙请求已取消；仍由飞手控制 ALTCTL")
+                self.cancel_pub.publish(String(data="cancel"))
+            elif self._manual_wall_selected() and not self._manual_wall_ready(now):
+                self.stream_since = None
+                self._set_phase(self.WAITING_WALL, reason="距离条件失效；保持 ALTCTL，继续等待手动接近")
             elif self._stream_ready(now):
                 if self.stream_since is None:
                     self.stream_since = monotonic_now
@@ -509,7 +568,13 @@ class FlightModeManagerNode:
                 self.stream_since = None
         elif self.phase == self.ENTERING:
             if flight_fresh and flight_mode == "OFFBOARD":
-                self._set_phase(self.ACTIVE, reason="PX4 entered OFFBOARD")
+                if (self._manual_wall_selected() and not self._manual_wall_ready(now)
+                    and not (self.wall is not None and is_fresh(self.wall_at, self.status_timeout_s, now)
+                             and self.wall.state == WallPerchStatus.STATE_FLIP_TO_WALL and self.wall.candidate_valid
+                             and not self.wall.fault_detected)):
+                    self._set_phase(self.RETURNING, reason="OFFBOARD 确认时距离条件失效，恢复水平并交回 ALTCTL")
+                else:
+                    self._set_phase(self.ACTIVE, reason="PX4 entered OFFBOARD")
             else:
                 failure_reason = None
                 if requested != self.selected_mode:

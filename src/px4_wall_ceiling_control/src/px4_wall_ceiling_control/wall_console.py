@@ -171,6 +171,9 @@ class ConsoleState:
                     "success": bool(success), "starting": self.starting, "pending": pending,
                     "can_detach": not detach_blockers, "detach_blockers": detach_blockers,
                     "detach_pending": detach_pending,
+                    "can_cancel_wait": bool(val("phase") == "WAITING_WALL" and val("owner") == 0
+                        and flight.get("connected") and flight.get("mode") == "ALTCTL"
+                        and val("operator", {}).get("enabled") and val("operator", {}).get("mode") == 3),
                     "sensor_warnings": sensor_reasons,
                     "launch_error": self.launch_error, "config": dict(self.config), "events": list(self.events)}
 

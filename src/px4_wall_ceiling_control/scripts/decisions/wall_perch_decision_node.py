@@ -52,6 +52,7 @@ class WallPerchDecisionNode:
 
     def __init__(self):
         install_kill_guard(self, rospy, String)
+        self.manual_approach = bool(rospy.get_param("~manual_approach", False))
         self.decision_enabled = bool(rospy.get_param("~decision_enabled", False))
         self.front_ready_distance_m = float(
             rospy.get_param("~front_ready_distance_m", 0.50)
@@ -1036,11 +1037,13 @@ class WallPerchDecisionNode:
             altitude_ok = self._entry_height_ready()
             safety_ok = self._safety_ok(now)
             if mode_requested and not self.rearm_required and altitude_ok and safety_ok:
-                self._enter_state(
-                    WallPerchStatus.STATE_FRONT_WALL_DETECT,
-                    now,
-                    "wall mode armed",
-                )
+                self._enter_state(WallPerchStatus.STATE_FRONT_WALL_DETECT, now, "wall mode armed")
+                if getattr(self, "manual_approach", False):
+                    ready = (self._flip_ready(now) and self._top_fresh(now)
+                             and self._sensor_health_fresh(now)
+                             and self.sensor_health.front_valid and self.sensor_health.ceiling_valid)
+                    self._enter_state(WallPerchStatus.STATE_FLIP_TO_WALL if ready else WallPerchStatus.STATE_ABORT,
+                                      now, "manual approach complete; begin flip" if ready else "manual flip gate lost during takeover")
             elif mode_requested:
                 if self.rearm_required:
                     self.last_reason = "waiting for operator release before rearm"
@@ -1278,17 +1281,18 @@ class WallPerchDecisionNode:
             thrust = clamp(thrust, 0.1, self.max_thrust)
         return neutral, quaternion, thrust, progress
 
+    def _acquire_requested(self, now):
+        return bool((self.state == WallPerchStatus.STATE_FRONT_WALL_DETECT
+                     or (getattr(self, "manual_approach", False) and self.state == WallPerchStatus.STATE_FLIP_TO_WALL))
+                    and self._mode_requested(now) and self._safety_ok(now))
+
     def _build_status(self, now):
         status = WallPerchStatus()
         status.header.stamp = now
         status.state = self.state
         status.state_name = self.STATE_NAMES[self.state]
         status.enabled = self.state != WallPerchStatus.STATE_IDLE
-        status.acquire_request = bool(
-            self.state == WallPerchStatus.STATE_FRONT_WALL_DETECT
-            and self._mode_requested(now)
-            and self._safety_ok(now)
-        )
+        status.acquire_request = self._acquire_requested(now)
         status.keep_ownership = status.enabled
         status.front_range_fresh = self._front_fresh(now)
         status.top_range_fresh = self._top_fresh(now)

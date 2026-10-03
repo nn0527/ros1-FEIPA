@@ -11,6 +11,7 @@
     <arg name="kill_guard_enabled" value="true" />
     <arg name="flight_mode_enabled" value="true" />
     <arg name="wall_enabled" value="true" />
+    <arg name="wall_manual_approach" value="true" />
     <arg name="ceiling_enabled" value="false" />
     <arg name="output_enabled" value="true" />
     <arg name="mechanism_output_enabled" value="false" />

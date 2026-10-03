@@ -74,7 +74,7 @@ class SharedBridge:
                     raise ValueError("动作执行中或反馈过期，不能释放控制权")
                 self.owner, self.owner_label = None, ""
                 return {"message": "已释放控制权"}
-            if action not in ("start", "wall", "detach"):
+            if action not in ("start", "wall", "detach", "cancel_wait"):
                 raise ValueError("未知操作")
             if not meta["control"]:
                 raise ValueError("当前为观察端；请先申请控制权")

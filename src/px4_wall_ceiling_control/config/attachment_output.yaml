@@ -90,3 +90,7 @@ ceiling_attachment_output_node:
   min_thrust: 0.10
   max_thrust: 0.90
   local_frame_id: map
+
+# Separate from the legacy automatic approach timeout and 2 s flip trajectory.
+flight_mode_manager_node:
+  manual_wall_wait_timeout_s: 60.0

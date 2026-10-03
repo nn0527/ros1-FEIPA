@@ -21,7 +21,7 @@ wall_perch_decision_node:
   front_ready_hold_s: 0.40
   # WP_FLP_TRD_DIST / WP_FLP_TRD_HLD
   flip_trigger_distance_m: 0.20
-  flip_trigger_hold_s: 0.15
+  flip_trigger_hold_s: 0.30
   # WP_TOP_CT_DIST / WP_TOP_CT_HLD
   top_contact_distance_m: 0.056
   # 顶距连续确认1 s后从WALL_CAPTURE进入WALL_HOLD。

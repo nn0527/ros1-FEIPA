@@ -22,6 +22,17 @@ spec.loader.exec_module(server)
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_wait_cancellation_requires_live_altctl_pending_wall_request(self):
+        self.ready()
+        self.state.update("phase", "WAITING_WALL")
+        self.state.update("operator", {"mode": 3, "enabled": True})
+        self.assertTrue(self.state.snapshot()["can_cancel_wait"])
+        self.state.update("phase", "ENTERING")
+        self.assertFalse(self.state.snapshot()["can_cancel_wait"])
+        self.state.update("phase", "WAITING_WALL")
+        self.state.update("state", {"connected": True, "armed": True, "mode": "OFFBOARD"})
+        self.assertFalse(self.state.snapshot()["can_cancel_wait"])
+
     def test_legacy_default_ports_migrate_without_losing_parameters(self):
         original = dict(DEFAULT_CONFIG, **LEGACY_PORTS, hover_thrust=0.52)
         result = server.migrate_legacy_ports(original)

@@ -148,11 +148,12 @@ class RemoteRuntime:
             from mavros_msgs.msg import State, RCIn, EstimatorStatus, AttitudeTarget
             from nav_msgs.msg import Odometry
             from sensor_msgs.msg import Range, BatteryState
-            from std_msgs.msg import String, UInt8
+            from std_msgs.msg import String, UInt8, Bool
             from rosgraph_msgs.msg import Log
             from px4_wall_ceiling_control.msg import SensorHealth, WallPerchStatus, OperatorCommand
             rospy.init_node("wall_console_bridge", anonymous=True, disable_signals=True)
             self.publisher = rospy.Publisher("/attachment/terminal_command", String, queue_size=1)
+            self.wait_cancel_publisher = rospy.Publisher("/wall_perch/cancel_wait", Bool, queue_size=1)
             topics = {"state": ("/mavros/state", State), "rc": ("/mavros/rc/in", RCIn),
                       "estimator": ("/mavros/estimator_status", EstimatorStatus),
                       "odom": ("/mavros/local_position/odom", Odometry),
@@ -185,7 +186,7 @@ class RemoteRuntime:
                       "front_distance_filtered_m", "top_distance_filtered_m", "thrust_normalized", "top_contact_ready",
                       "altitude_reference_valid", "height_above_takeoff_m", "min_entry_height_m", "entry_height_ready",
                       "hold_achieved", "reached_state_name", "detach_ready", "detach_completed", "recovery_completed",
-                      "detach_pending", "detach_block_reason")}
+                      "detach_pending", "detach_block_reason", "flip_ready", "front_range_fresh", "top_range_fresh")}
         elif name in ("front_diagnostic", "ceiling_diagnostic", "kill"):
             value = json.loads(msg.data)
         elif name in ("phase", "reason", "owner"):
@@ -395,7 +396,7 @@ class RemoteRuntime:
                 raise ValueError("终端指令节点未订阅，消息未发送")
             self.publisher.publish(command)
         self.state.send_wall(publish)
-        return {"message": "wall 已发送，等待贴墙阶段反馈"}
+        return {"message": "贴墙请求已提交；保持 ALTCTL 手动接近，距离条件满足后才接管翻转"}
 
     def detach(self):
         def publish(command):
@@ -404,6 +405,16 @@ class RemoteRuntime:
             self.publisher.publish(command)
         self.state.send_detach(publish)
         return {"message": "离墙请求已发送；控制节点等待连续稳定后旋转，8 秒未满足会取消"}
+
+    def cancel_wait(self):
+        with self.state.lock:
+            if not self.state.snapshot()["can_cancel_wait"]:
+                raise ValueError("当前不是 ALTCTL 手动接近等待阶段，取消未发送")
+            if not self.wait_cancel_publisher.get_num_connections():
+                raise ValueError("模式管理节点未订阅取消等待消息")
+            self.wait_cancel_publisher.publish(True)
+            self.state.event("已请求取消手动接近等待；以模式阶段反馈为准")
+        return {"message": "取消等待已提交；仅等待阶段接受，开始接管后不会中断动作"}
 
 
 def bridge_main():
@@ -539,9 +550,11 @@ class SSHTransport:
                     result["detach_blockers"] = ["离墙所需实时反馈中断或过期"]
                 result["can_detach"] = False
             result["config"] = config
+            if not connected or stale:
+                result["can_cancel_wait"] = False
             result["session"] = dict(self.session, push=self.push_enabled, feedback_live=connected)
             if not self.session.get("control"):
-                result["can_wall"] = result["can_detach"] = False
+                result["can_wall"] = result["can_detach"] = result["can_cancel_wait"] = False
             result["ssh"] = {"connected": link_connected, "error": self.error, "age_s": age,
                              "host": self.args.ssh_user + "@" + self.args.ssh_host}
             result["connection"] = {name: getattr(self.args, name, None) for name in
@@ -554,7 +567,7 @@ class SSHTransport:
         with self.lock:
             if not self.connected or not self.writer or time.monotonic() - self.heartbeat >= 3:
                 raise ValueError("SSH 未连接，操作未发送")
-            if action in ("start", "wall", "detach") and (not self.push_enabled or not self.session.get("control") or time.monotonic() - self.arrived >= 2):
+            if action in ("start", "wall", "detach", "cancel_wait") and (not self.push_enabled or not self.session.get("control") or time.monotonic() - self.arrived >= 2):
                 raise ValueError("需要控制权和有效的实时反馈，操作未发送")
             if action == "push":
                 self.push_enabled = bool(config["enabled"])
@@ -641,6 +654,8 @@ def http_main(args):
                     result = transport.request("push", data)
                 elif self.path == "/api/wall":
                     result = transport.request("wall")
+                elif self.path == "/api/cancel-wait":
+                    result = transport.request("cancel_wait")
                 elif self.path == "/api/detach":
                     result = transport.request("detach")
                 else:

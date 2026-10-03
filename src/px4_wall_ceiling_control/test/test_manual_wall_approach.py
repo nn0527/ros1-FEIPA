@@ -1,0 +1,162 @@
+"""Mode ownership and timing regression tests using ROS messages, no flight."""
+import unittest
+from unittest import mock
+import rospy
+from mavros_msgs.msg import State
+from std_msgs.msg import Bool
+from px4_wall_ceiling_control.msg import OperatorCommand, SensorHealth, WallPerchStatus
+from test_flight_handover import Manager
+from test_attachment_safety import WallDecision
+
+
+class ManualApproachTests(unittest.TestCase):
+    def setUp(self):
+        self.now = rospy.Time.from_sec(10)
+        self.clock = 100.0
+        n = self.node = Manager.__new__(Manager)
+        n.phase, n.selected_mode, n.phase_since = Manager.IDLE, None, self.clock
+        n.wall_manual_approach = True
+        n.manual_wall_wait_timeout_s = 60
+        n.manual_wall_wait_started = None
+        n.manual_wait_canceled = False
+        n.stream_since = None
+        n.prestream_s = 1.5
+        n.state_timeout_s = n.sensor_timeout_s = n.status_timeout_s = n.output_timeout_s = .5
+        n.flight, n.flight_at = State(connected=True, armed=True, mode="ALTCTL"), self.now
+        n.sensor, n.sensor_at = SensorHealth(front_valid=True, ceiling_valid=True), self.now
+        n.wall = WallPerchStatus(state=WallPerchStatus.STATE_IDLE, flip_ready=False,
+                                front_range_fresh=True, top_range_fresh=True,
+                                top_preflight_ready=True, entry_height_ready=True)
+        n.wall_at = self.now
+        n.owner, n.owner_at, n.output_mode, n.output_at = 0, self.now, 2, self.now
+        n._requested_mode = mock.Mock(return_value=OperatorCommand.MODE_WALL)
+        n._preflight_ready = mock.Mock(return_value=True)
+        n._preflight_failure_reason = mock.Mock(return_value=None)
+        n._request_mode = mock.Mock()
+        n._handover_ready = mock.Mock(return_value=True)
+        n.cancel_pub = mock.Mock()
+        n.prestream_pub = mock.Mock()
+        n.phase_pub = mock.Mock()
+        n.phase_reason_pub = mock.Mock()
+        n.kill_guard_enabled = False
+
+    def tick(self):
+        with mock.patch.object(rospy.Time, "now", return_value=self.now), mock.patch("time.monotonic", return_value=self.clock):
+            self.node._on_timer(None)
+
+    def test_request_waits_in_altctl_without_output_or_mode_command(self):
+        self.tick()
+        self.clock += 30
+        self.tick()
+        self.assertEqual(self.node.phase, Manager.WAITING_WALL)
+        self.node._request_mode.assert_not_called()
+        self.assertFalse(self.node.prestream_pub.publish.call_args[0][0].data)
+        self.assertEqual(self.node.flight.mode, "ALTCTL")
+
+    def test_ready_has_no_extra_three_second_delay(self):
+        self.tick()
+        self.node.wall.flip_ready = True
+        self.tick()  # Same monotonic time: no added reaction delay.
+        self.assertEqual(self.node.phase, Manager.PRESTREAM)
+        self.tick()
+        self.clock += 1.6
+        self.tick()
+        self.assertEqual(self.node.phase, Manager.ENTERING)
+        self.node._request_mode.assert_called_once_with("OFFBOARD")
+
+    def test_stale_or_invalid_range_cannot_start_takeover(self):
+        self.tick()
+        self.node.wall.flip_ready = True
+        self.node.wall_at = rospy.Time.from_sec(8)
+        self.tick()
+        self.assertEqual(self.node.phase, Manager.WAITING_WALL)
+        self.node.wall_at = self.now
+        self.node.sensor.front_valid = False
+        self.tick()
+        self.assertEqual(self.node.phase, Manager.WAITING_WALL)
+        self.node._request_mode.assert_not_called()
+
+    def test_distance_lost_in_prestream_resumes_wait_without_extending_deadline(self):
+        self.tick()
+        self.node.wall.flip_ready = True
+        self.tick()
+        self.tick()
+        self.node.wall.flip_ready = False
+        self.clock += 1
+        self.tick()
+        self.assertEqual(self.node.phase, Manager.WAITING_WALL)
+        self.assertEqual(self.node.manual_wall_wait_started, 100)
+        self.assertIsNone(self.node.stream_since)
+        self.node._request_mode.assert_not_called()
+
+    def test_timeout_cancels_intent_without_changing_flight_mode(self):
+        self.tick()
+        self.clock += 60
+        self.tick()
+        self.assertEqual(self.node.phase, Manager.LOCKED)
+        self.node._request_mode.assert_not_called()
+        self.assertEqual(self.node.cancel_pub.publish.call_args[0][0].data, "cancel")
+
+    def test_wait_cancel_only_applies_before_takeover(self):
+        self.tick()
+        self.node._on_wait_cancel(Bool(data=True))
+        self.tick()
+        self.assertEqual(self.node.phase, Manager.LOCKED)
+        self.node._request_mode.assert_not_called()
+        self.node.phase = Manager.ENTERING
+        self.node.manual_wait_canceled = False
+        self.node._on_wait_cancel(Bool(data=True))
+        self.assertFalse(self.node.manual_wait_canceled)
+
+    def test_offboard_confirmed_after_gate_loss_returns_without_flip(self):
+        self.tick()
+        self.node.phase = Manager.ENTERING
+        self.node.flight.mode = "OFFBOARD"
+        self.tick()
+        self.assertEqual(self.node.phase, Manager.RETURNING)
+        self.tick()
+        self.node._request_mode.assert_called_once_with("ALTCTL")
+
+    def test_rpc_rechecks_distance_after_async_dispatch(self):
+        self.tick()
+        self.node.phase = Manager.ENTERING
+        self.node.set_mode = mock.Mock()
+        self.node.request_in_flight = True
+        with mock.patch.object(rospy.Time, "now", return_value=self.now), mock.patch.object(rospy, "wait_for_service"):
+            self.node._send_mode_request("OFFBOARD")
+        self.node.set_mode.assert_not_called()
+        self.assertFalse(self.node.request_in_flight)
+
+    def test_decision_does_not_take_output_while_pilot_is_in_altctl(self):
+        n = WallDecision.__new__(WallDecision)
+        n.state = WallPerchStatus.STATE_IDLE
+        n.manual_approach = True
+        n.cancel_requested = n.rearm_required = False
+        n._mode_requested = n._entry_height_ready = lambda *args: True
+        n._safety_ok = lambda *_: False  # OFFBOARD requirement fails in ALTCTL.
+        n._enter_state = mock.Mock()
+        n._update_state_machine(self.now)
+        n._enter_state.assert_not_called()
+        self.assertFalse(n._acquire_requested(self.now))
+
+    def test_decision_skips_automatic_approach_and_requests_output_owner(self):
+        n = WallDecision.__new__(WallDecision)
+        n.state = WallPerchStatus.STATE_IDLE
+        n.manual_approach = True
+        n.cancel_requested = n.rearm_required = False
+        n._mode_requested = n._entry_height_ready = n._safety_ok = lambda *args: True
+        n._flip_ready = n._top_fresh = n._sensor_health_fresh = lambda *_: True
+        n.sensor_health = SensorHealth(front_valid=True, ceiling_valid=True)
+        transitions = []
+        def enter(state, *_):
+            transitions.append(state)
+            n.state = state
+        n._enter_state = enter
+        n._update_state_machine(self.now)
+        self.assertEqual(transitions, [WallPerchStatus.STATE_FRONT_WALL_DETECT, WallPerchStatus.STATE_FLIP_TO_WALL])
+        self.assertTrue(n._acquire_requested(self.now))
+        n._safety_ok = lambda *_: False
+        self.assertFalse(n._acquire_requested(self.now))
+
+
+if __name__ == "__main__": unittest.main()

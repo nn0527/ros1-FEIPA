@@ -35,7 +35,7 @@ class SharedTests(unittest.TestCase):
 
     def test_observer_cannot_bypass_http_and_send_actions(self):
         self.bridge.request("a", "acquire")
-        for action in ("start", "wall", "detach"):
+        for action in ("start", "wall", "detach", "cancel_wait"):
             with self.assertRaises(ValueError): self.bridge.request("b", action)
         self.runtime.start.assert_not_called()
         self.runtime.wall.assert_not_called()

@@ -66,6 +66,7 @@ function paint(s){
   text("startLabel",s.starting?"正在启动…":enabled?"基础程序已启动":"启动基础程序");
   $("wall").disabled=requestBusy || !live || !control || !s.can_wall;
   $("detach").disabled=requestBusy || !live || !control || !s.can_detach;
+  $("cancelWait").disabled=requestBusy || !live || !control || !s.can_cancel_wait;
   text("detachBlockReason",s.can_detach?"可提交离墙请求；控制节点确认连续稳定后才旋转": "离墙："+(s.detach_blockers?.[0] || "等待贴墙保持"));
   $("detachBlockReason").classList.toggle("ready",!!s.can_detach);
   const kill=fresh(s,"kill");
@@ -78,7 +79,8 @@ function paint(s){
   if(!ssh){title="SSH 反馈中断";reason=s.ssh.error || "正在重新连接树莓派";}
   else if(s.starting){title="基础程序启动中";reason="正在启动 MAVROS、雷达与贴墙控制节点";}
   else if(s.launch_error){title="启动未完成";reason=s.launch_error;}
-  else if(phase==="PRESTREAM"){title="预发送姿态目标";reason="建立连续设定值流，等待模式交接";step=1;}
+  else if(phase==="WAITING_WALL"){title="飞手手动接近 · ALTCTL";reason=fresh(s,"reason") || "等待有效距离连续满足翻转条件，尚未接管";step=0;}
+  else if(phase==="PRESTREAM"){title="预发送姿态目标";reason="距离条件已满足，建立设定值流；仍为 ALTCTL，尚未接管";step=1;}
   else if(phase==="ENTERING"){title="进入 OFFBOARD";reason="等待飞控确认模式切换";step=2;}
   else if(phase==="ACTIVE"){
     title=wallNames[wall?.state_name] || "贴墙控制中";reason=wall?.reason || "等待贴墙状态反馈";
@@ -88,7 +90,7 @@ function paint(s){
   else if(enabled){title=s.pending?"贴墙请求已发送":s.can_wall?"可以发送贴墙指令":"等待稳定飞行";}
   if(wall?.state_name==="ABORT" && (!observation.reset || observationActive(s))){title=wallNames.ABORT;reason=wall.reason;}
   if(s.success){title="贴墙保持";reason="控制节点已确认接触，当前保持贴墙";step=5;}
-  const history=observation.reset?null:s.status.wall?.value;
+  const history=observation.reset || ["WAITING_WALL","PRESTREAM","ENTERING"].includes(phase)?null:s.status.wall?.value;
   const reached={SLOW_APPROACH:3,FLIP_TO_WALL:4,WALL_CAPTURE:4,WALL_HOLD:5,WALL_PIN:4,DETACH_ROTATE:6,RECOVER:7,EXIT:7};
   step=Math.max(step,observationActive(s)?reached[wall?.state_name] || 0:0,reached[history?.reached_state_name] || 0,history?.hold_achieved?5:0);
   const recovered=history?.recovery_completed || history?.detach_completed;
@@ -99,7 +101,7 @@ function paint(s){
   if(kill?.active){title="急停已生效";reason=state?.armed?"电机已停，飞控等待自动上锁；动作请求已禁用":"飞控已上锁，急停开关仍生效";}
   if(!live){title=!session.push?"实时反馈已暂停":"等待实时反馈";reason=!session.push?"本机停止接收数据；飞行程序与记录继续运行，动作已禁用":"需要收到新反馈后才能操作";}
   text("stageTitle",title);text("stageReason",translate[reason] || reason);
-  document.querySelector(".stage").classList.toggle("error",!!kill?.active || !!s.launch_error || phase==="LOCKED" || (!observation.reset || observationActive(s)) && (wall?.fault_detected || wall?.state_name==="ABORT"));
+  document.querySelector(".stage").classList.toggle("error",!!kill?.active || !!s.launch_error || phase==="LOCKED" || (!observation.reset || observationActive(s)) && ((wall?.fault_detected && wall?.state_name!=="IDLE") || wall?.state_name==="ABORT"));
   $("successNote").hidden=!(history?.hold_achieved || s.success) || !live;
   text("successNote",s.success?"本轮已确认贴墙保持；当前仍在保持。":history?.hold_achieved?"本轮曾成功进入贴墙保持，记录已保留。当前状态见上方；历史结果不代表现在仍贴墙。":"");
   document.querySelectorAll(".steps li").forEach((el,i)=>{el.classList.toggle("done",i<step || (history?.hold_achieved && i===5) || (returned && i===step));el.classList.toggle("current",live && !returned && wall?.state_name!=="ABORT" && i===step);});
@@ -134,7 +136,7 @@ $("resetObservation").addEventListener("click",()=>{
 $("control").addEventListener("click",()=>action(latest?.session?.control?"/api/release":"/api/acquire",{}));
 $("push").addEventListener("click",()=>action("/api/push",{enabled:!latest?.session?.push}));
 async function action(path, data){
-  if(requestBusy)return;requestBusy=true;$("start").disabled=true;$("wall").disabled=true;$("detach").disabled=true;
+  if(requestBusy)return;requestBusy=true;$("cancelWait").disabled=true;$("start").disabled=true;$("wall").disabled=true;$("detach").disabled=true;
   message(path==="/api/wall"?"正在发送 wall…":path==="/api/detach"?"正在发送 detach…":path==="/api/start"?"正在请求启动…":"正在更新连接设置…");
   try{
     const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Console-Token":token},body:JSON.stringify(data),signal:AbortSignal.timeout(9000)});
@@ -149,6 +151,7 @@ $("start").addEventListener("click",()=>{
   data.baud=Number(data.baud);data.hover_thrust=Number(data.hover_thrust);action("/api/start",data);
 });
 $("wall").addEventListener("click",()=>action("/api/wall",{}));
+$("cancelWait").addEventListener("click",()=>action("/api/cancel-wait",{}));
 $("detach").addEventListener("click",()=>action("/api/detach",{}));
 let polling=false;
 async function poll(){
@@ -157,8 +160,8 @@ async function poll(){
     const response=await fetch("/api/status",{cache:"no-store",signal:AbortSignal.timeout(2500)});
     if(!response.ok)throw new Error("本机服务响应异常");paint(await response.json());
   }catch(error){
-    if(latest){latest=structuredClone(latest);latest.ssh.connected=false;latest.session.feedback_live=false;latest.can_wall=latest.can_detach=latest.success=false;for(const item of Object.values(latest.status))item.fresh=false;}
-    $("resetObservation").disabled=requestBusy || !latest;$("control").disabled=true;$("push").disabled=true;text("connectionText","本机服务无响应");$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;
+    if(latest){latest=structuredClone(latest);latest.ssh.connected=false;latest.session.feedback_live=false;latest.can_wall=latest.can_detach=latest.can_cancel_wait=latest.success=false;for(const item of Object.values(latest.status))item.fresh=false;}
+    $("resetObservation").disabled=requestBusy || !latest;$("control").disabled=true;$("push").disabled=true;text("connectionText","本机服务无响应");$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;$("cancelWait").disabled=true;
     if(!$("successNote").hidden)text("successNote","本轮曾成功进入贴墙保持；当前反馈中断，不能确认现在的状态。");
     text("stageTitle","反馈中断");text("stageReason","无法确认当前阶段，请核对飞控状态");
     text("killState","急停反馈中断，动作禁用");text("detachCondition","实时反馈中断，离墙禁用");
