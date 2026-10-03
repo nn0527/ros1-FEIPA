@@ -22,6 +22,19 @@ spec.loader.exec_module(server)
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_password_auth_consumes_environment_without_persisting(self):
+        args = SimpleNamespace(ssh_auth="password")
+        with mock.patch.dict(os.environ, {"WALL_CONSOLE_SSH_PASSWORD": "fixture-secret"}), mock.patch.object(server.threading, "Thread"):
+            transport = server.SSHTransport(args)
+            self.assertEqual(transport.password, "fixture-secret")
+            self.assertNotIn("WALL_CONSOLE_SSH_PASSWORD", os.environ)
+            self.assertNotIn("password", transport.snapshot)
+
+    def test_key_auth_does_not_use_password(self):
+        with mock.patch.object(server.threading, "Thread"):
+            transport = server.SSHTransport(SimpleNamespace(ssh_auth="key"))
+            self.assertIsNone(transport.password)
+
     def telemetry_runtime(self):
         runtime = object.__new__(server.RemoteRuntime)
         runtime.state = self.state

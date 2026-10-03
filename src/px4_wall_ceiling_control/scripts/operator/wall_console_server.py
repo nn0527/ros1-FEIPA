@@ -417,6 +417,7 @@ def bridge_main():
 class SSHTransport:
     def __init__(self, args):
         self.args = args
+        self.password = os.environ.pop("WALL_CONSOLE_SSH_PASSWORD", None) if getattr(args, "ssh_auth", "key") == "password" else None
         self.lock = threading.RLock()
         self.snapshot = ConsoleState().snapshot()
         self.connected = False
@@ -436,7 +437,8 @@ class SSHTransport:
                 client.load_host_keys(str(Path(getattr(self.args, "known_hosts", Path.home() / ".ssh" / "known_hosts")).expanduser()))
                 client.set_missing_host_key_policy(paramiko.RejectPolicy())
                 client.connect(self.args.ssh_host, port=self.args.ssh_port, username=self.args.ssh_user,
-                               key_filename=self.args.ssh_key, look_for_keys=False, allow_agent=False,
+                               key_filename=self.args.ssh_key if getattr(self.args, "ssh_auth", "key") == "key" else None,
+                               password=self.password, look_for_keys=False, allow_agent=False,
                                timeout=8, auth_timeout=8)
                 client.get_transport().set_keepalive(5)
                 source = self.args.remote_workspace + "/devel/setup.bash"
@@ -622,6 +624,7 @@ if __name__ == "__main__":
     parser.add_argument("--ssh-host", default="192.168.50.66")
     parser.add_argument("--ssh-port", type=int, default=22)
     parser.add_argument("--ssh-user", default="pi")
+    parser.add_argument("--ssh-auth", choices=("key", "password"), default="key")
     parser.add_argument("--ssh-key", default=str(Path.home() / ".ssh/id_ed25519_wallrobot"))
     parser.add_argument("--known-hosts", default=str(Path.home() / ".ssh/known_hosts"))
     parser.add_argument("--container", default="ros1_noetic")
