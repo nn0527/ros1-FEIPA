@@ -2,6 +2,7 @@
 """ROS/MAVROS decision port of the reference PX4 wall_perch state machine."""
 
 import math
+from statistics import median
 
 import rospy
 from geometry_msgs.msg import Quaternion
@@ -115,7 +116,7 @@ class WallPerchDecisionNode:
             rospy.get_param("~detach_max_rate_rps", 0.15)
         )
         self.detach_max_abs_vertical_speed_mps = float(
-            rospy.get_param("~detach_max_abs_vertical_speed_mps", 0.15)
+            rospy.get_param("~detach_max_abs_vertical_speed_mps", 1.00)
         )
         self.detach_stable_hold_s = float(
             rospy.get_param("~detach_stable_hold_s", 0.50)
@@ -238,6 +239,19 @@ class WallPerchDecisionNode:
         self.filter_alpha = clamp(
             float(rospy.get_param("~range_filter_alpha", 0.30)), 0.0, 1.0
         )
+        # Top lidar changes viewing direction during the flip: do not carry
+        # metre-scale history into centimetre-scale contact confirmation.
+        self.top_flip_filter_alpha = clamp(
+            float(rospy.get_param("~top_flip_filter_alpha", 0.70)), 0.0, 1.0
+        )
+        self.top_hold_filter_alpha = clamp(
+            float(rospy.get_param("~top_hold_filter_alpha", self.filter_alpha)), 0.0, 1.0
+        )
+        self.top_capture_window_samples = max(
+            3, int(rospy.get_param("~top_capture_window_samples", 3))
+        )
+        self.top_capture_samples = []
+        self.top_capture_near_samples = 0
         # PX4's raw actuator/mixer bypass has no equivalent in this ROS path.
         # If enabled, WALL_PIN remains an attitude target with bounded thrust.
         self.pin_enabled = bool(rospy.get_param("~pin_enabled", False))
@@ -466,6 +480,8 @@ class WallPerchDecisionNode:
             # bounded bench safety grace; never refresh them with invalid data.
             self.top_contact_since = None
             self.top_contact_last_sample_at = None
+            self.top_capture_samples = []
+            self.top_capture_near_samples = 0
             return
         now = rospy.Time.now()
         previous = (
@@ -475,12 +491,36 @@ class WallPerchDecisionNode:
         )
         self.top_range = message
         self.top_received_at = now
-        self.top_filtered_m = self._filter_range(message, previous)
+        if previous is None:
+            self.top_capture_samples = []
+            self.top_capture_near_samples = 0
+            self.top_contact_since = None
+            self.top_contact_last_sample_at = None
+        if self.state == WallPerchStatus.STATE_WALL_CAPTURE:
+            self.top_capture_samples.append(message.range)
+            self.top_capture_samples = self.top_capture_samples[-self.top_capture_window_samples:]
+            self.top_filtered_m = median(self.top_capture_samples)
+            self.top_capture_near_samples = (
+                self.top_capture_near_samples + 1
+                if message.range <= self.top_contact_distance_m else 0
+            )
+            contact = (message.range <= self.top_contact_distance_m
+                       and self.top_filtered_m <= self.top_contact_distance_m)
+        else:
+            alpha = (self.top_flip_filter_alpha
+                     if self.state == WallPerchStatus.STATE_FLIP_TO_WALL
+                     else self.top_hold_filter_alpha
+                     if self.state in (WallPerchStatus.STATE_WALL_HOLD,
+                                       WallPerchStatus.STATE_WALL_PIN)
+                     else self.filter_alpha)
+            self.top_filtered_m = (message.range if previous is None
+                                   else previous + alpha * (message.range - previous))
+            contact = self.top_filtered_m <= self.top_contact_distance_m
         (
             self.top_contact_since,
             self.top_contact_last_sample_at,
         ) = self._record_hold_sample(
-            self.top_filtered_m <= self.top_contact_distance_m,
+            contact,
             now,
             self.top_contact_since,
         )
@@ -899,6 +939,9 @@ class WallPerchDecisionNode:
         if not fresh:
             self.top_contact_since = None
             self.top_contact_last_sample_at = None
+        if (self.state == WallPerchStatus.STATE_WALL_CAPTURE
+                and self.top_capture_near_samples < self.top_capture_window_samples):
+            return False
         return self._held_samples(
             fresh,
             self.top_contact_since,
@@ -978,6 +1021,18 @@ class WallPerchDecisionNode:
         self.state = new_state
         self.state_entered_at = now
         self.last_reason = reason
+        if new_state in (WallPerchStatus.STATE_FLIP_TO_WALL,
+                         WallPerchStatus.STATE_WALL_CAPTURE):
+            self.top_capture_samples = []
+            self.top_capture_near_samples = 0
+            self.top_contact_since = None
+            self.top_contact_last_sample_at = None
+            self.top_clear_since = None
+            self.top_clear_last_sample_at = None
+            # Seed from existing valid data without refreshing its timestamp.
+            # Capture confirmation below still requires new samples.
+            if self._top_fresh(now) and self.top_range is not None:
+                self.top_filtered_m = self.top_range.range
         if new_state == WallPerchStatus.STATE_FRONT_WALL_DETECT:
             self.recovery_completed = False
             self.detach_altitude_m = None

@@ -46,7 +46,7 @@ wall_perch_decision_node:
   detach_reference_angle_deg: 10.0
   detach_axis_error_deg: 5.0
   detach_max_rate_rps: 0.15
-  detach_max_abs_vertical_speed_mps: 0.15
+  detach_max_abs_vertical_speed_mps: 1.00
   detach_stable_hold_s: 0.50
   # Temporary constrained-rig tune: shorten weak vertical support during detach.
   # 90 deg over 3 s (quintic setpoint); validate actual motion on the rig.
