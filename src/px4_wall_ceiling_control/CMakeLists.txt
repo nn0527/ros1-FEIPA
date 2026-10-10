@@ -86,6 +86,10 @@ install(FILES README.md
 )
 
 if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_detach_current_attitude.py)
+  catkin_add_nosetests(test/test_hold_down_velocity.py)
+  catkin_add_nosetests(test/test_hold_range_loss.py)
+  catkin_add_nosetests(test/test_sensor_error_reporting.py)
   catkin_add_nosetests(test/test_attachment_safety.py)
   catkin_add_nosetests(test/test_ceiling_motor_bench.py)
   catkin_add_nosetests(test/test_ceiling_state_monitor.py)

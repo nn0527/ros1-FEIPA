@@ -106,9 +106,6 @@ class WallPerchDecisionNode:
         self.hold_entry_blend_s = max(
             0.01, float(rospy.get_param("~hold_entry_blend_s", 0.50))
         )
-        self.detach_reference_angle_rad = math.radians(
-            float(rospy.get_param("~detach_reference_angle_deg", 10.0))
-        )
         self.detach_axis_error_rad = math.radians(
             float(rospy.get_param("~detach_axis_error_deg", 5.0))
         )
@@ -212,6 +209,14 @@ class WallPerchDecisionNode:
         self.min_altitude_m = float(rospy.get_param("~min_altitude_m", 0.30))
         self.altitude_reference = rospy.get_param("~altitude_reference", "arming_ground")
         self.bench_wait_for_ranges = bool(rospy.get_param("~bench_wait_for_ranges", False))
+        self.ignore_range_loss_during_hold = bool(
+            rospy.get_param("~ignore_range_loss_during_hold", False)
+        )
+        self.ignore_down_velocity_during_hold = bool(
+            rospy.get_param("~ignore_down_velocity_during_hold", False)
+        )
+        if self.ignore_range_loss_during_hold:
+            rospy.logwarn("WALL_HOLD/WALL_PIN range-loss abort checks disabled; actual range and health remain unchanged")
         if self.altitude_reference not in ("arming_ground", "local_origin"):
             raise ValueError("altitude_reference must be arming_ground or local_origin")
         self.takeoff_height = TakeoffHeightReference()
@@ -635,10 +640,7 @@ class WallPerchDecisionNode:
         measured = self._current_quaternion()
         if measured is None or self._height_feedback() is None:
             return False
-        reference = getattr(self, "q_hold_reference", self.q_contact)
         followed = self._hold_follow_quaternion()
-        if quaternion_angle(measured, reference) > self.detach_reference_angle_rad:
-            return False
         if quaternion_angle(measured, followed) > self.detach_axis_error_rad:
             return False
         if not self._rates_safe(self.detach_max_rate_rps):
@@ -671,9 +673,6 @@ class WallPerchDecisionNode:
         q = self._current_quaternion()
         if q is None:
             return "离墙姿态反馈无效"
-        error = math.degrees(quaternion_angle(q, getattr(self, "q_hold_reference", self.q_contact)))
-        if error > math.degrees(self.detach_reference_angle_rad):
-            return "贴墙参考姿态偏差 {:.1f}°，需 ≤ {:.1f}°".format(error, math.degrees(self.detach_reference_angle_rad))
         axis = math.degrees(quaternion_angle(q, self._hold_follow_quaternion()))
         if axis > math.degrees(self.detach_axis_error_rad):
             return "离墙旋转轴偏差 {:.1f}°，需 ≤ {:.1f}°".format(axis, math.degrees(self.detach_axis_error_rad))
@@ -717,7 +716,16 @@ class WallPerchDecisionNode:
             )
         )
 
+    def _ignore_hold_range_loss(self):
+        return bool(
+            getattr(self, "ignore_range_loss_during_hold", False)
+            and self.state in (WallPerchStatus.STATE_WALL_HOLD,
+                               WallPerchStatus.STATE_WALL_PIN)
+        )
+
     def _top_preflight_ready(self, now):
+        if self._ignore_hold_range_loss():
+            return True
         if getattr(self, "bench_wait_for_ranges", False) and self.state in (
             WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE,
             WallPerchStatus.STATE_WALL_HOLD, WallPerchStatus.STATE_WALL_PIN,
@@ -759,6 +767,8 @@ class WallPerchDecisionNode:
         return True
 
     def _top_required(self):
+        if self._ignore_hold_range_loss():
+            return False
         if getattr(self, "bench_wait_for_ranges", False) and self.state in (
             WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER,
         ):
@@ -819,6 +829,10 @@ class WallPerchDecisionNode:
         if getattr(self, "bench_wait_for_ranges", False) and self.state in (
             WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER,
             WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT,
+        ):
+            return math.isfinite(velocity_z)
+        if getattr(self, "ignore_down_velocity_during_hold", False) and self.state in (
+            WallPerchStatus.STATE_WALL_HOLD, WallPerchStatus.STATE_WALL_PIN,
         ):
             return math.isfinite(velocity_z)
         return math.isfinite(velocity_z) and velocity_z >= -self.max_down_velocity_mps

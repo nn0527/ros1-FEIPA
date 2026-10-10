@@ -22,6 +22,72 @@ spec.loader.exec_module(server)
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_stop_rejects_armed_or_expired_state(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = ConsoleState()
+        runtime.state.update('state', {'connected': True, 'armed': True, 'mode': 'ALTCTL'})
+        runtime.children = {}
+        with self.assertRaisesRegex(ValueError, '解锁状态'):
+            runtime.stop()
+
+    def test_stop_stale_feedback_requires_grounded_confirmation(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = ConsoleState()
+        runtime.children = {}
+        runtime.ros = None
+        with self.assertRaisesRegex(ValueError, '明确确认'):
+            runtime.stop()
+        with mock.patch.object(server.Path, 'glob', return_value=[]):
+            self.assertIn('已终止', runtime.stop({'grounded_confirmed': True})['message'])
+
+    def test_stop_without_remaining_processes_updates_runtime(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = ConsoleState()
+        runtime.state.update('state', {'connected': True, 'armed': False, 'mode': 'ALTCTL'})
+        runtime.children = {'mavros': mock.Mock(), 'wall_flight': mock.Mock()}
+        runtime.ros = None
+        runtime.state.launch_error = 'mavros 已退出，请查看启动日志'
+        with mock.patch.object(server.Path, 'glob', return_value=[]):
+            self.assertIn('已终止', runtime.stop()['message'])
+        self.assertEqual(runtime.children, {})
+        self.assertEqual(runtime.state.launch_error, '')
+        self.assertFalse(runtime.state.snapshot()['status']['runtime']['value']['enabled'])
+        self.assertTrue(runtime.stop_requested)
+
+    def test_mavros_replacement_clears_old_exit_and_reports_new_failure(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = ConsoleState()
+        runtime.children = {"mavros": SimpleNamespace(poll=lambda: -6)}
+        runtime.mavros_alive = mock.Mock(return_value=True)
+        runtime.fcu_url_matches = mock.Mock(return_value=True)
+        runtime.state.launch_error = "mavros 已退出，请查看启动日志"
+        live = {"nodes": ["/mavros"], "enabled": True}
+        runtime.update_process_errors(live)
+        self.assertEqual(runtime.state.launch_error, "")
+        self.assertNotIn("mavros", runtime.children)
+        runtime.mavros_alive.return_value = False
+        runtime.update_process_errors(live)
+        self.assertEqual(runtime.state.launch_error, "mavros 无响应，请查看启动日志")
+        runtime.mavros_alive.return_value = True
+        runtime.update_process_errors(live)
+        self.assertEqual(runtime.state.launch_error, "")
+
+    def test_mavros_recovery_preserves_other_errors_and_rejects_wrong_port(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = ConsoleState()
+        runtime.children = {"mavros": SimpleNamespace(poll=lambda: -6)}
+        runtime.mavros_alive = mock.Mock(return_value=True)
+        runtime.fcu_url_matches = mock.Mock(return_value=False)
+        live = {"nodes": ["/mavros"], "enabled": True}
+        runtime.update_process_errors(live)
+        self.assertIn("mavros", runtime.children)
+        self.assertEqual(runtime.state.launch_error, "mavros 已退出，请查看启动日志")
+        runtime.children = {}
+        runtime.fcu_url_matches.return_value = True
+        runtime.state.launch_error = "雷达串口错误"
+        runtime.update_process_errors(live)
+        self.assertEqual(runtime.state.launch_error, "雷达串口错误")
+
     def test_wait_cancellation_requires_live_altctl_pending_wall_request(self):
         self.ready()
         self.state.update("phase", "WAITING_WALL")

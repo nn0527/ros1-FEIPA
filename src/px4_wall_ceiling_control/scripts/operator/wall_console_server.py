@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import secrets
+import signal
 import shlex
 import subprocess
 import sys
@@ -25,6 +26,8 @@ class RemoteRuntime:
     def __init__(self):
         self.state = ConsoleState()
         self.children = {}
+        self.stop_requested = False
+        self.stopping = False
         self.ros = None
         self.init_lock = threading.Lock()
         self.telemetry_lock = threading.Lock()
@@ -44,6 +47,8 @@ class RemoteRuntime:
         return set(result.stdout.split()) if result.returncode == 0 else set()
 
     def spawn(self, name, args):
+        if getattr(self, "stop_requested", False):
+            raise ValueError("启动已取消：已请求终止现有进程")
         log = self.log_dir / (name + ".log")
         with log.open("ab") as out:
             self.children[name] = subprocess.Popen(args, stdout=out, stderr=out, start_new_session=True)
@@ -262,28 +267,49 @@ class RemoteRuntime:
         return {"enabled": bool(enabled), "test_profile": profile, "nodes": sorted(nodes),
                 "missing": sorted(required - nodes), "logger": "/attachment_flight_logger" in nodes}
 
+    def update_process_errors(self, runtime):
+        """Report the live ROS instance rather than an obsolete launcher PID."""
+        mavros_error = "mavros 无响应，请查看启动日志"
+        mavros_present = "/mavros" in runtime.get("nodes", [])
+        expected = self.state.config["fcu_port"] + ":" + str(self.state.config["baud"])
+        mavros_live = mavros_present and self.mavros_alive() and self.fcu_url_matches(expected)
+        with self.state.lock:
+            for name, child in list(self.children.items()):
+                if child.poll() is None or self.state.starting:
+                    continue
+                error = name + " 已退出，请查看启动日志"
+                replaced = ((name == "wall_flight" and runtime.get("enabled")) or
+                            (name == "mavros" and mavros_live))
+                if replaced:
+                    self.children.pop(name, None)
+                    if self.state.launch_error == error:
+                        self.state.launch_error = ""
+                else:
+                    self.state.launch_error = error
+            # Continue checking a replacement even after its old PID is discarded.
+            if mavros_present and not mavros_live and not self.state.starting:
+                if not self.state.launch_error or self.state.launch_error == mavros_error:
+                    self.state.launch_error = mavros_error
+            elif mavros_live and self.state.launch_error in (
+                    mavros_error, "mavros 已退出，请查看启动日志"):
+                self.state.launch_error = ""
+
     def monitor(self):
         while not self.ros.is_shutdown():
             try:
                 runtime = self.inspect_runtime()
                 self.state.update("runtime", runtime)
                 self.maintain_telemetry()
-                for name, child in list(self.children.items()):
-                    if child.poll() is not None and not self.state.starting:
-                        error = name + " 已退出，请查看启动日志"
-                        if name == "wall_flight" and runtime.get("enabled"):
-                            # A disarmed deployment may replace our launcher.
-                            # The complete live ROS chain supersedes the old PID.
-                            self.children.pop(name, None)
-                            if self.state.launch_error == error:
-                                self.state.launch_error = ""
-                        else:
-                            self.state.launch_error = error
+                if not getattr(self, "stopping", False):
+                    self.update_process_errors(runtime)
             except Exception as error:
                 self.state.update("runtime", {"enabled": False, "error": str(error)[:200]})
             time.sleep(1)
 
     def start(self, config):
+        if getattr(self, "stopping", False):
+            raise ValueError("正在终止现有进程，请等待结束")
+        self.stop_requested = False
         config = validate_config(migrate_legacy_ports(config))
         # After SSH reconnection, inspect the already-running nodes before
         # the first monitor tick; never attempt a duplicate launch.
@@ -350,6 +376,8 @@ class RemoteRuntime:
             # A connected flight state must establish disarmed status before output-capable nodes launch.
             deadline = time.monotonic() + 25
             while True:
+                if self.stop_requested:
+                    raise ValueError("启动已取消：已请求终止现有进程")
                 item = self.state.snapshot()["status"]["state"]
                 if item["fresh"] and item["value"]["connected"]:
                     if item["value"]["armed"]:
@@ -428,6 +456,69 @@ class RemoteRuntime:
             self.wait_cancel_publisher.publish(True)
             self.state.event("已请求取消手动接近等待；以模式阶段反馈为准")
         return {"message": "取消等待已提交；仅等待阶段接受，开始接管后不会中断动作"}
+
+    def stop(self, config=None):
+        """Stop this console's test pipeline, preserving ROS master and SSH."""
+        with self.state.lock:
+            if getattr(self, "stopping", False):
+                raise ValueError("正在终止现有进程，请等待结束")
+            snapshot = self.state.snapshot()
+            flight = snapshot["status"]["state"]
+            value = flight.get("value") or {}
+            runtime = snapshot["status"]["runtime"].get("value") or {}
+            confirmed = (config or {}).get("grounded_confirmed") is True
+            if flight["fresh"] and value.get("armed"):
+                raise ValueError("飞控仍处于解锁状态；请先落地并上锁，再终止程序")
+            if not flight["fresh"] and not confirmed:
+                raise ValueError("飞控反馈过期；需明确确认飞机已落地且电机停止，才可清理异常进程")
+            self.stopping = True
+            self.stop_requested = True
+        try:
+            targets = {}
+            for item in Path("/proc").glob("[0-9]*/cmdline"):
+                try:
+                    args = item.read_bytes().split(b"\0")
+                    text_args = [a.decode(errors="replace") for a in args if a]
+                    is_launch = any("roslaunch" in a for a in text_args) and (
+                        "wall_console_flight.launch" in text_args or
+                        ("mavros" in text_args and "px4.launch" in text_args))
+                    is_node = any(a.startswith(str(PACKAGE / "scripts") + "/") or
+                                  a.startswith(str(PACKAGE.parents[1] / "devel/lib/px4_wall_ceiling_control") + "/")
+                                  for a in text_args) and not any("wall_console_server.py" in a for a in text_args)
+                    is_mavros = "/opt/ros/noetic/lib/mavros/mavros_node" in text_args
+                    is_record = any("rosbag" in a for a in text_args) and any(
+                        a.startswith("/root/wall_test_records/") for a in text_args)
+                    if is_launch or is_node or is_mavros or is_record:
+                        targets[int(item.parent.name)] = item.read_bytes()
+                except (OSError, ValueError):
+                    continue
+            def alive(pid, original):
+                try:
+                    return Path('/proc', str(pid), 'cmdline').read_bytes() == original
+                except OSError:
+                    return False
+            for sig, delay in ((signal.SIGINT, 3.0), (signal.SIGTERM, 2.0), (signal.SIGKILL, .3)):
+                for pid, original in list(targets.items()):
+                    if alive(pid, original):
+                        try: os.kill(pid, sig)
+                        except ProcessLookupError: pass
+                deadline = time.monotonic() + delay
+                while time.monotonic() < deadline and any(alive(pid, original) for pid, original in targets.items()):
+                    time.sleep(.1)
+            remaining = [pid for pid, original in targets.items() if alive(pid, original)]
+            for name in ("wall_flight", "mavros"):
+                self.children.pop(name, None)
+            with self.state.lock:
+                self.state.pending_since = self.state.detach_pending_since = None
+                self.state.starting = False
+                self.state.launch_error = "终止失败，残留 PID: " + str(remaining) if remaining else ""
+            if remaining:
+                raise ValueError(self.state.launch_error)
+            self.state.update("runtime", self.inspect_runtime() if self.ros else {"enabled": False, "nodes": [], "missing": []})
+            self.state.event("已终止试验控制、MAVROS、雷达及记录进程；可以重新启动")
+            return {"message": "现有试验进程已终止，可以重新启动基础程序"}
+        finally:
+            self.stopping = False
 
 
 def bridge_main():
@@ -580,6 +671,8 @@ class SSHTransport:
         with self.lock:
             if not self.connected or not self.writer or time.monotonic() - self.heartbeat >= 3:
                 raise ValueError("SSH 未连接，操作未发送")
+            if action == "stop" and not self.session.get("control"):
+                raise ValueError("需要控制权，终止未发送")
             if action in ("start", "wall", "detach", "cancel_wait") and (not self.push_enabled or not self.session.get("control") or time.monotonic() - self.arrived >= 2):
                 raise ValueError("需要控制权和有效的实时反馈，操作未发送")
             if action == "push":
@@ -594,7 +687,7 @@ class SSHTransport:
                 self.pending.pop(identifier, None)
                 raise
         try:
-            if not event.wait(6):
+            if not event.wait(15 if action == "stop" else 6):
                 raise ValueError("SSH 操作确认超时；不会自动重发，请先核对状态")
             reply = slot["reply"]
             if not reply["ok"]:
@@ -669,6 +762,8 @@ def http_main(args):
                     result = transport.request("wall")
                 elif self.path == "/api/cancel-wait":
                     result = transport.request("cancel_wait")
+                elif self.path == "/api/stop":
+                    result = transport.request("stop", data)
                 elif self.path == "/api/detach":
                     result = transport.request("detach")
                 else:

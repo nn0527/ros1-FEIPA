@@ -2,9 +2,6 @@
 const $ = id => document.getElementById(id);
 let token = "", loaded = false, requestBusy = false, latest = null;
 const form = $("config");
-let observationKey = "", observation = {reset:false,eventAfter:null}, previousPhase = null;
-function saveObservation(){try{localStorage.setItem(observationKey,JSON.stringify(observation));}catch(_){}}
-function observationActive(s){return ["WAITING_WALL","PRESTREAM","ENTERING","ACTIVE","RETURNING"].includes(fresh(s,"phase")) || (fresh(s,"state")?.armed && fresh(s,"state")?.mode==="OFFBOARD");}
 const translate = {
   initialized:"等待贴墙指令", "PX4 entered OFFBOARD":"飞控已进入 OFFBOARD",
   "flight state timeout":"飞控心跳已过期", "MAVROS disconnected":"MAVROS 连接中断",
@@ -43,13 +40,6 @@ function pair(label, value, className=""){
 }
 function paint(s){
   latest=s; token=s.token;
-  const key="wall-observation:"+s.ssh.host+":"+(s.connection?.remote_workspace || "");
-  if(key!==observationKey){observationKey=key;try{observation=JSON.parse(localStorage.getItem(key)) || {reset:false,eventAfter:null};}catch(_){observation={reset:false,eventAfter:null};}previousPhase=null;}
-  const currentPhase=fresh(s,"phase");
-  if(observation.reset && ((["WAITING_WALL","PRESTREAM"].includes(currentPhase) && !["WAITING_WALL","PRESTREAM"].includes(previousPhase)) || (currentPhase==="ACTIVE" && fresh(s,"wall")?.state_name==="FRONT_WALL_DETECT"))){observation.reset=false;saveObservation();}
-  previousPhase=currentPhase;
-  $("resetObservation").disabled=requestBusy || observationActive(s);
-  text("observationNote",observation.reset?"本机观测已重置；实时反馈、动作条件与树莓派日志保持更新。":"重置本机进度与显示记录，飞行状态和树莓派日志继续保留。");
   if(!loaded || fresh(s,"runtime")?.enabled){for(const input of form.elements) if(input.name in s.config) input.value=s.config[input.name];loaded=true;}
   const ssh=s.ssh.connected, session=s.session || {}, live=!!session.feedback_live, control=!!session.control, state=fresh(s,"state"), runtime=fresh(s,"runtime"), phase=fresh(s,"phase"), wall=fresh(s,"wall"), health=fresh(s,"health"), odom=fresh(s,"odom");
   text("connectionText",ssh?"SSH 已连接":"SSH 未连接");text("host",s.ssh.host);
@@ -66,7 +56,7 @@ function paint(s){
   text("startLabel",s.starting?"正在启动…":enabled?"基础程序已启动":"启动基础程序");
   $("wall").disabled=requestBusy || !live || !control || !s.can_wall;
   $("detach").disabled=requestBusy || !live || !control || !s.can_detach;
-  $("cancelWait").disabled=requestBusy || !live || !control || !s.can_cancel_wait;
+  $("stop").disabled=requestBusy || !ssh || !control;
   text("detachBlockReason",s.can_detach?"可提交离墙请求；控制节点确认连续稳定后才旋转": "离墙："+(s.detach_blockers?.[0] || "等待贴墙保持"));
   $("detachBlockReason").classList.toggle("ready",!!s.can_detach);
   const kill=fresh(s,"kill");
@@ -79,8 +69,7 @@ function paint(s){
   if(!ssh){title="SSH 反馈中断";reason=s.ssh.error || "正在重新连接树莓派";}
   else if(s.starting){title="基础程序启动中";reason="正在启动 MAVROS、雷达与贴墙控制节点";}
   else if(s.launch_error){title="启动未完成";reason=s.launch_error;}
-  else if(phase==="WAITING_WALL"){title="飞手手动接近 · ALTCTL";reason=fresh(s,"reason") || "等待有效距离连续满足翻转条件，尚未接管";step=0;}
-  else if(phase==="PRESTREAM"){title="预发送姿态目标";reason="建立设定值流；仍为 ALTCTL，尚未接管";step=1;}
+  else if(phase==="PRESTREAM"){title="预发送姿态目标";reason="建立连续设定值流，等待模式交接";step=1;}
   else if(phase==="ENTERING"){title="进入 OFFBOARD";reason="等待飞控确认模式切换";step=2;}
   else if(phase==="ACTIVE"){
     title=wallNames[wall?.state_name] || "贴墙控制中";reason=wall?.reason || "等待贴墙状态反馈";
@@ -88,11 +77,11 @@ function paint(s){
   } else if(phase==="LOCKED"){title="动作受阻";reason=fresh(s,"reason") || reason;}
   else if(phase && phase!=="IDLE"){title=phase;reason=fresh(s,"reason") || reason;}
   else if(enabled){title=s.pending?"贴墙请求已发送":s.can_wall?"可以发送贴墙指令":"等待稳定飞行";}
-  if(wall?.state_name==="ABORT" && (!observation.reset || observationActive(s))){title=wallNames.ABORT;reason=wall.reason;}
+  if(wall?.state_name==="ABORT"){title=wallNames.ABORT;reason=wall.reason;}
   if(s.success){title="贴墙保持";reason="控制节点已确认接触，当前保持贴墙";step=5;}
-  const history=observation.reset || ["WAITING_WALL","PRESTREAM","ENTERING"].includes(phase)?null:s.status.wall?.value;
+  const history=s.status.wall?.value;
   const reached={SLOW_APPROACH:3,FLIP_TO_WALL:4,WALL_CAPTURE:4,WALL_HOLD:5,WALL_PIN:4,DETACH_ROTATE:6,RECOVER:7,EXIT:7};
-  step=Math.max(step,observationActive(s)?reached[wall?.state_name] || 0:0,reached[history?.reached_state_name] || 0,history?.hold_achieved?5:0);
+  step=Math.max(step,reached[history?.reached_state_name] || 0,history?.hold_achieved?5:0);
   const recovered=history?.recovery_completed || history?.detach_completed;
   const returned=!!(recovered && state?.mode==="ALTCTL" && fresh(s,"owner")===0 && ["IDLE","LOCKED"].includes(phase));
   if(recovered)step=8;
@@ -101,8 +90,8 @@ function paint(s){
   if(kill?.active){title="急停已生效";reason=state?.armed?"电机已停，飞控等待自动上锁；动作请求已禁用":"飞控已上锁，急停开关仍生效";}
   if(!live){title=!session.push?"实时反馈已暂停":"等待实时反馈";reason=!session.push?"本机停止接收数据；飞行程序与记录继续运行，动作已禁用":"需要收到新反馈后才能操作";}
   text("stageTitle",title);text("stageReason",translate[reason] || reason);
-  document.querySelector(".stage").classList.toggle("error",!!kill?.active || !!s.launch_error || phase==="LOCKED" || (!observation.reset || observationActive(s)) && ((wall?.fault_detected && wall?.state_name!=="IDLE") || wall?.state_name==="ABORT"));
-  $("successNote").hidden=!(history?.hold_achieved || s.success) || !live;
+  document.querySelector(".stage").classList.toggle("error",!!kill?.active || !!s.launch_error || phase==="LOCKED" || wall?.fault_detected || wall?.state_name==="ABORT");
+  $("successNote").hidden=!history?.hold_achieved || !live;
   text("successNote",s.success?"本轮已确认贴墙保持；当前仍在保持。":history?.hold_achieved?"本轮曾成功进入贴墙保持，记录已保留。当前状态见上方；历史结果不代表现在仍贴墙。":"");
   document.querySelectorAll(".steps li").forEach((el,i)=>{el.classList.toggle("done",i<step || (history?.hold_achieved && i===5) || (returned && i===step));el.classList.toggle("current",live && !returned && wall?.state_name!=="ABORT" && i===step);});
   text("front",health?.front_valid?n(fresh(s,"front")?.range_m):"—");
@@ -124,20 +113,13 @@ function paint(s){
   rows($("ages"),ages,([label,key])=>{const item=s.status[key],el=pair(label,!session.push?"推送已暂停":item.age_s===null?"未收到":n(item.age_s,2)+" s","ageRow");el.lastChild.classList.toggle("stale",!item.fresh);return el;});
   text("sshError",ssh?"":s.ssh.error);
   text("recording",!live?"试飞日志：当前无法确认":runtime?.logger?"试飞日志：录制中":enabled?"试飞日志：未检测到录制节点":"试飞日志：等待启动");
-  const events=s.events.filter(event=>observation.eventAfter===null || event.time>observation.eventAfter);
-  if(events.length){rows($("events"),events.slice(-25).reverse(),event=>pair(new Date(event.time*1000).toLocaleTimeString("zh-CN",{hour12:false}),event.text,"eventRow "+event.kind));}
-  else{const empty=document.createElement("p");empty.className="empty";empty.textContent="等待本轮新记录；历史日志保留在树莓派";$("events").replaceChildren(empty);}
+  if(s.events.length){rows($("events"),s.events.slice(-25).reverse(),event=>pair(new Date(event.time*1000).toLocaleTimeString("zh-CN",{hour12:false}),event.text,"eventRow "+event.kind));}
 }
-$("resetObservation").addEventListener("click",()=>{
-  if(requestBusy || !latest || observationActive(latest))return;
-  observation={reset:true,eventAfter:Math.max(observation.eventAfter ?? 0,...latest.events.map(event=>event.time))};
-  saveObservation();paint(latest);message("本机观测已重置，等待下一轮；未发送飞行指令");
-});
 $("control").addEventListener("click",()=>action(latest?.session?.control?"/api/release":"/api/acquire",{}));
 $("push").addEventListener("click",()=>action("/api/push",{enabled:!latest?.session?.push}));
 async function action(path, data){
-  if(requestBusy)return;requestBusy=true;$("cancelWait").disabled=true;$("start").disabled=true;$("wall").disabled=true;$("detach").disabled=true;
-  message(path==="/api/wall"?"正在发送 wall…":path==="/api/detach"?"正在发送 detach…":path==="/api/start"?"正在请求启动…":"正在更新连接设置…");
+  if(requestBusy)return;requestBusy=true;$("stop").disabled=true;$("start").disabled=true;$("wall").disabled=true;$("detach").disabled=true;
+  message(path==="/api/stop"?"正在终止现有进程…":path==="/api/wall"?"正在发送 wall…":path==="/api/detach"?"正在发送 detach…":path==="/api/start"?"正在请求启动…":"正在更新连接设置…");
   try{
     const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Console-Token":token},body:JSON.stringify(data),signal:AbortSignal.timeout(9000)});
     const result=await response.json();if(!response.ok)throw new Error(result.error || "操作失败");message(result.message);
@@ -151,8 +133,11 @@ $("start").addEventListener("click",()=>{
   data.baud=Number(data.baud);data.hover_thrust=Number(data.hover_thrust);action("/api/start",data);
 });
 $("wall").addEventListener("click",()=>action("/api/wall",{}));
-$("cancelWait").addEventListener("click",()=>action("/api/cancel-wait",{}));
 $("detach").addEventListener("click",()=>action("/api/detach",{}));
+$("stop").addEventListener("click",()=>{
+  if(window.confirm("确认飞机已落地且电机已停止？此操作将终止试验控制、MAVROS、雷达和日志记录进程。"))
+    action("/api/stop",{grounded_confirmed:true});
+});
 let polling=false;
 async function poll(){
   if(polling)return;polling=true;
@@ -160,8 +145,7 @@ async function poll(){
     const response=await fetch("/api/status",{cache:"no-store",signal:AbortSignal.timeout(2500)});
     if(!response.ok)throw new Error("本机服务响应异常");paint(await response.json());
   }catch(error){
-    if(latest){latest=structuredClone(latest);latest.ssh.connected=false;latest.session.feedback_live=false;latest.can_wall=latest.can_detach=latest.can_cancel_wait=latest.success=false;for(const item of Object.values(latest.status))item.fresh=false;}
-    $("resetObservation").disabled=requestBusy || !latest;$("control").disabled=true;$("push").disabled=true;text("connectionText","本机服务无响应");$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;$("cancelWait").disabled=true;
+    $("stop").disabled=true;$("control").disabled=true;$("push").disabled=true;text("connectionText","本机服务无响应");$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;
     if(!$("successNote").hidden)text("successNote","本轮曾成功进入贴墙保持；当前反馈中断，不能确认现在的状态。");
     text("stageTitle","反馈中断");text("stageReason","无法确认当前阶段，请核对飞控状态");
     text("killState","急停反馈中断，动作禁用");text("detachCondition","实时反馈中断，离墙禁用");

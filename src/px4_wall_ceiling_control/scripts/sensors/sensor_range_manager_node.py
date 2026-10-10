@@ -2,9 +2,11 @@
 """Validate and independently distribute the ceiling and front ranges."""
 
 import math
+import json
 
 import rospy
 from sensor_msgs.msg import Range
+from std_msgs.msg import String
 
 from px4_wall_ceiling_control.freshness import is_fresh, is_valid_range
 from px4_wall_ceiling_control.msg import SensorHealth
@@ -30,6 +32,9 @@ class SensorRangeManagerNode:
         self.front_sequence = 0
         self.ceiling_invalid_count = 0
         self.front_invalid_count = 0
+        self.input_errors = {}
+        self.input_received_at = {}
+        self.driver_errors = {}
 
         self.ceiling_publisher = rospy.Publisher(
             rospy.get_param("~ceiling_output_topic", "/sensor/ceiling/range"),
@@ -63,10 +68,61 @@ class SensorRangeManagerNode:
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / max(health_rate_hz, 1.0)), self._on_timer
         )
+        for channel in ("front", "ceiling"):
+            rospy.Subscriber(
+                rospy.get_param("~{}_diagnostic_topic".format(channel),
+                                "/sensor/{}/diagnostic".format(channel)),
+                String, lambda msg, key=channel: self._on_diagnostic(key, msg),
+                queue_size=10,
+            )
+
+    def _record_input_error(self, channel, message, valid, now):
+        # getattr preserves compatibility with minimal test fixtures.
+        if not hasattr(self, "input_errors"):
+            self.input_errors, self.input_received_at, self.driver_errors = {}, {}, {}
+        self.input_received_at[channel] = now
+        if valid:
+            self.input_errors.pop(channel, None)
+            self.driver_errors.pop(channel, None)
+        elif not math.isfinite(message.range):
+            self.input_errors[channel] = (-3, "nonfinite", "distance is not finite")
+        else:
+            self.input_errors[channel] = (-4, "out_of_range", "distance {} m outside [{}, {}] m".format(message.range, message.min_range, message.max_range))
+
+    def _on_diagnostic(self, channel, message):
+        try:
+            data = json.loads(message.data)
+            if not isinstance(data, dict) or not isinstance(data.get("valid"), bool):
+                raise ValueError("diagnostic requires boolean valid")
+            if data["valid"]:
+                self.driver_errors.pop(channel, None)
+                return
+            code = int(data.get("error_code", -5))
+            kind = str(data.get("error_type", "parse"))
+            reason = str(data.get("error", "invalid lidar frame"))
+        except (ValueError, TypeError, OverflowError) as exc:
+            code, kind, reason = -9, "diagnostic", "invalid diagnostic: {}".format(exc)
+        self.driver_errors[channel] = (code, kind, reason, rospy.Time.now())
+        setattr(self, channel + "_latest_valid", False)
+
+    def _channel_error(self, channel, valid, now):
+        if valid:
+            return 0, "", ""
+        driver = getattr(self, "driver_errors", {}).get(channel)
+        if driver and (driver[1] in ("serial", "configuration", "driver")
+                       or is_fresh(driver[3], self.input_timeout_s, now)):
+            return driver[:3]
+        received = getattr(self, "input_received_at", {}).get(channel)
+        if received is None:
+            return -2, "no_data", "no range received since startup"
+        if not is_fresh(received, self.input_timeout_s, now):
+            return -1, "timeout", "no range received for {:.2f} s".format(self._age(received, now))
+        return getattr(self, "input_errors", {}).get(channel, (-1, "timeout", "last valid range expired"))
 
     def _on_ceiling(self, message):
         now = rospy.Time.now()
         self.ceiling_latest_valid = is_valid_range(message)
+        self._record_input_error("ceiling", message, self.ceiling_latest_valid, now)
         if not self.ceiling_latest_valid:
             self.ceiling_invalid_count += 1
             rospy.logwarn_throttle(1.0, "invalid ceiling range input")
@@ -78,6 +134,7 @@ class SensorRangeManagerNode:
     def _on_front(self, message):
         now = rospy.Time.now()
         self.front_latest_valid = is_valid_range(message)
+        self._record_input_error("front", message, self.front_latest_valid, now)
         if not self.front_latest_valid:
             self.front_invalid_count += 1
             rospy.logwarn_throttle(1.0, "invalid front range input")
@@ -112,6 +169,11 @@ class SensorRangeManagerNode:
         status.front_sequence = self.front_sequence
         status.ceiling_invalid_count = self.ceiling_invalid_count
         status.front_invalid_count = self.front_invalid_count
+        for channel in ("front", "ceiling"):
+            code, kind, reason = self._channel_error(channel, getattr(status, channel + "_valid"), now)
+            setattr(status, channel + "_error_code", code)
+            setattr(status, channel + "_error_type", kind)
+            setattr(status, channel + "_error_reason", reason)
         return status
 
     def _on_timer(self, _event):

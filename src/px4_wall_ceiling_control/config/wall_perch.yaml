@@ -43,14 +43,14 @@ wall_perch_decision_node:
   hold_time_s: 0.00
   hold_entry_blend_s: 0.50
   # Bench starting gates for operator-triggered detach; tune from geometry/logs.
-  detach_reference_angle_deg: 10.0
+  # Detach starts from measured attitude; no original hold-reference angle gate.
   detach_axis_error_deg: 5.0
   detach_max_rate_rps: 0.15
   detach_max_abs_vertical_speed_mps: 1.00
   detach_stable_hold_s: 0.50
-  # Temporary constrained-rig tune: shorten weak vertical support during detach.
-  # 90 deg over 3 s (quintic setpoint); validate actual motion on the rig.
-  detach_time_s: 3.00
+  # Detach attitude trajectory duration.
+  # 90 deg over 5 s (quintic setpoint).
+  detach_time_s: 5.00
   recover_time_s: 1.00
   # Bench departure/recovery support only; retain through EXIT until ALTCTL.
   bench_detach_hover_thrust: 0.48
@@ -90,11 +90,16 @@ wall_perch_decision_node:
   capture_max_rate_rps: 4.5
   recover_max_rate_rps: 3.0
   max_down_velocity_mps: 0.80
+  # Ignore estimated descent limit only after wall contact is confirmed.
+  ignore_down_velocity_during_hold: true
   min_altitude_m: 0.30
   # Local ENU z can drift below zero on the ground; freeze ground z on arming.
   altitude_reference: arming_ground
   recover_angle_deg: 15.0
   sensor_timeout_s: 0.60
+  # Operator-requested hold-only bypass. No synthetic range/validity is sent.
+  # Acquisition, flip, capture, detach and recovery retain their range checks.
+  ignore_range_loss_during_hold: true
   sensor_health_timeout_s: 0.30
   # 侧吸取得 owner 前要求顶部传感器已有新鲜有效量测。
   require_top_sensor_on_acquire: true

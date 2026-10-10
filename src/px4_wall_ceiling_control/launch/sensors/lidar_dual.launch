@@ -1,9 +1,9 @@
 <launch>
   <!-- Two physical L1 sensors -> validation/distribution -> consumers. -->
   <arg name="ceiling_serial_port"
-       default="/dev/serial/by-path/pci-0000:04:00.3-usb-0:4.4:1.0-port0" />
+       default="/dev/serial/by-path/wall-top" />
   <arg name="front_serial_port"
-       default="/dev/serial/by-path/pci-0000:04:00.3-usb-0:4.1:1.0-port0" />
+       default="/dev/serial/by-path/wall-front" />
 
   <rosparam command="load"
             file="$(find px4_wall_ceiling_control)/config/sensors.yaml" />

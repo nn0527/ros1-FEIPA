@@ -4,10 +4,18 @@
 import math
 import re
 import json
+import time
 
 import rospy
 from sensor_msgs.msg import Range
 from std_msgs.msg import String
+
+
+class LidarInputError(ValueError):
+    def __init__(self, code, description, kind="sensor"):
+        self.code = code
+        self.kind = kind
+        super().__init__("{} error {} ({})".format("L1" if code > 0 else "lidar input", code, description))
 
 
 class LidarDistanceNode:
@@ -15,6 +23,7 @@ class LidarDistanceNode:
         self.serial_port = str(rospy.get_param("~serial_port", ""))
         self.baudrate = int(rospy.get_param("~baudrate", 38400))
         self.serial_timeout_s = float(rospy.get_param("~serial_timeout_s", 0.2))
+        self.data_timeout_s = float(rospy.get_param("~data_timeout_s", 0.60))
         self.input_format = str(rospy.get_param("~input_format", "l1_ascii"))
         self.startup_command = str(rospy.get_param("~startup_command", "iACM"))
         self.halt_on_shutdown = bool(rospy.get_param("~halt_on_shutdown", False))
@@ -93,7 +102,7 @@ class LidarDistanceNode:
                 290: "hardware fault",
             }
             description = descriptions.get(error_code, "unknown sensor error")
-            raise ValueError("L1 error {} ({})".format(error_code, description))
+            raise LidarInputError(error_code, description)
 
         measurement = re.fullmatch(
             r"D=([+-]?(?:\d+(?:\.\d*)?|\.\d+))m(?:,\d+)?#?", text
@@ -132,7 +141,9 @@ class LidarDistanceNode:
     def _publish_single(self, distance_m):
         distance_m *= self.input_scale_to_m
         if not math.isfinite(distance_m):
-            raise ValueError("distance is not finite")
+            raise LidarInputError(-3, "distance is not finite", "nonfinite")
+        if not self.min_range_m <= distance_m <= self.max_range_m:
+            raise LidarInputError(-4, "distance {} m outside [{}, {}] m".format(distance_m, self.min_range_m, self.max_range_m), "out_of_range")
         self.range_publisher.publish(
             self._make_range(distance_m, self.frame_id, rospy.Time.now())
         )
@@ -146,8 +157,19 @@ class LidarDistanceNode:
         else:
             raise ValueError("unsupported input_format: {}".format(self.input_format))
 
+    def _report_diagnostic(self, valid, code=0, kind="", reason="", raw_line=b""):
+        self.diagnostic_publisher.publish(String(data=json.dumps({
+            "stamp": rospy.Time.now().to_sec(), "valid": valid,
+            "error_code": code, "error_type": kind, "error": reason,
+            "raw_frame": raw_line.decode("ascii", errors="replace").strip()[:200],
+        })))
+        if not valid and self.input_format == "l1_ascii":
+            self.range_publisher.publish(self._make_range(
+                math.nan, self.frame_id, rospy.Time.now()))
+
     def run(self):
         if not self.serial_port:
+            self._report_diagnostic(False, -6, "configuration", "serial_port is empty")
             rospy.logwarn(
                 "serial_port is empty; lidar UART adapter is in placeholder mode"
             )
@@ -157,6 +179,7 @@ class LidarDistanceNode:
         try:
             import serial  # Imported lazily so the safe placeholder can still launch.
         except ImportError:
+            self._report_diagnostic(False, -7, "driver", "python3-serial is missing")
             rospy.logerr("pyserial is missing; install the python3-serial package")
             rospy.spin()
             return
@@ -180,28 +203,30 @@ class LidarDistanceNode:
                         device.flush()
                         rospy.loginfo("sent L1 startup command %s", self.startup_command)
                     try:
+                        last_frame_at = time.monotonic()
                         while not rospy.is_shutdown():
                             raw_line = device.readline()
                             if not raw_line:
+                                if time.monotonic() - last_frame_at > self.data_timeout_s:
+                                    self._report_diagnostic(False, -1, "timeout", "no lidar frame for {:.2f} s".format(self.data_timeout_s))
                                 continue
+                            last_frame_at = time.monotonic()
                             try:
                                 self._handle_line(raw_line)
-                                self.diagnostic_publisher.publish(String(data=json.dumps(
-                                    {"valid": True, "error": ""})))
+                                self._report_diagnostic(True, raw_line=raw_line)
                             except (UnicodeError, ValueError) as exc:
-                                self.diagnostic_publisher.publish(String(data=json.dumps(
-                                    {"valid": False, "error": str(exc)})))
+                                self._report_diagnostic(False, getattr(exc, "code", -5),
+                                    getattr(exc, "kind", "parse"),
+                                    str(exc), raw_line)
                                 # A sensor error is an invalid measurement, not
                                 # a new sample of the last successful distance.
-                                if self.input_format == "l1_ascii":
-                                    self.range_publisher.publish(self._make_range(
-                                        math.nan, self.frame_id, rospy.Time.now()))
                                 rospy.logwarn_throttle(2.0, "invalid lidar frame: %s", exc)
                     finally:
                         if self.input_format == "l1_ascii" and self.halt_on_shutdown:
                             device.write(b"iHALT")
                             device.flush()
             except (OSError, serial.SerialException) as exc:
+                self._report_diagnostic(False, -8, "serial", str(exc))
                 rospy.logerr_throttle(5.0, "lidar UART error: %s", exc)
                 rospy.sleep(1.0)
 
