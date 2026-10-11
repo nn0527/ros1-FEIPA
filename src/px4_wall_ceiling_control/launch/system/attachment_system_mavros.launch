@@ -32,6 +32,7 @@
   <arg name="thrust_handover_ramp_s" default="1.0" />
   <arg name="fcu_target_timeout_s" default="0.20" />
   <arg name="rc_assist_enabled" default="false" />
+  <arg name="rc_roll_yaw_enabled" default="false" />
   <arg name="require_rc_center" default="false" />
   <arg name="rc_roll_channel_index" default="-1" />
   <arg name="rc_pitch_channel_index" default="-1" />
@@ -154,6 +155,10 @@
     <param name="ceiling_output_enabled" value="$(arg ceiling_enabled)" />
     <param name="wall_output_enabled" value="$(arg wall_enabled)" />
     <param name="rc_assist_enabled" value="$(arg rc_assist_enabled)" />
+    <param name="rc_roll_yaw_enabled" value="$(arg rc_roll_yaw_enabled)" />
+    <param if="$(arg rc_roll_yaw_enabled)" name="rc_free_max_angle_deg" value="5.0" />
+    <param if="$(arg rc_roll_yaw_enabled)" name="rc_wall_detach_roll_deg" value="3.0" />
+    <param if="$(arg rc_roll_yaw_enabled)" name="rc_slew_deg_s" value="10.0" />
     <param name="rc_roll_channel_index" value="$(arg rc_roll_channel_index)" />
     <param name="rc_pitch_channel_index" value="$(arg rc_pitch_channel_index)" />
     <param name="rc_roll_reverse" value="$(arg rc_roll_reverse)" />

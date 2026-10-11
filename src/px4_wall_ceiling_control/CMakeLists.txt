@@ -86,6 +86,8 @@ install(FILES README.md
 )
 
 if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_attachment_range_loss.py)
+  catkin_add_nosetests(test/test_range_error_258.py)
   catkin_add_nosetests(test/test_detach_current_attitude.py)
   catkin_add_nosetests(test/test_hold_down_velocity.py)
   catkin_add_nosetests(test/test_hold_range_loss.py)

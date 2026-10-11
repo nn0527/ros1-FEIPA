@@ -2,10 +2,12 @@
 """Single MAVROS attitude publisher with bounded, direct RC stick trim."""
 
 import math
+import time
 
 import rospy
 from geometry_msgs.msg import Quaternion, Vector3Stamped
 from mavros_msgs.msg import AttitudeTarget, RCIn, State
+from mavros_msgs.srv import ParamGet
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, Float32, UInt8, String
 from px4_wall_ceiling_control.adapters.kill_switch import install_kill_guard, kill_clear
@@ -15,7 +17,7 @@ from px4_wall_ceiling_control.adapters.odometry import (
     odometry_is_finite,
     vertical_speed_enu_mps,
 )
-from px4_wall_ceiling_control.domain.geometry import euler_from_quaternion
+from px4_wall_ceiling_control.domain.geometry import euler_from_quaternion, quaternion_multiply, quaternion_normalize
 from px4_wall_ceiling_control.domain.owner_arbiter import (
     CandidateIntent,
     OWNER_CEILING,
@@ -111,6 +113,20 @@ class AttachmentOutputMuxNode:
         self.rc_wall_detach_pitch_deg = float(
             rospy.get_param("~rc_wall_detach_pitch_deg", 0.0)
         )
+        self.rc_roll_yaw_enabled = bool(rospy.get_param("~rc_roll_yaw_enabled", False))
+        self.rc_yaw_max_deg = float(rospy.get_param("~rc_yaw_max_deg", 15.0))
+        self.rc_yaw_contact_deg = float(rospy.get_param("~rc_yaw_contact_deg", 3.0))
+        self.rc_yaw_detach_deg = float(rospy.get_param("~rc_yaw_detach_deg", 5.0))
+        self.rc_yaw_slew_deg_s = float(rospy.get_param("~rc_yaw_slew_deg_s", 20.0))
+        self.rc_yaw_rad = 0.0
+        self.rc_calibration = {}
+        if self.rc_roll_yaw_enabled:
+            if not self.rc_assist_enabled:
+                raise ValueError("Roll/yaw correction requires rc_assist_enabled")
+            if not (0 <= self.rc_yaw_contact_deg <= self.rc_yaw_detach_deg <= self.rc_yaw_max_deg <= 30
+                    and 0 < self.rc_yaw_slew_deg_s <= 45):
+                raise ValueError("RC yaw correction limits are invalid")
+            self._load_rc_roll_yaw_calibration()
         self.status_timeout_s = float(rospy.get_param("~status_timeout_s", 0.30))
         self.match_fcu_thrust_on_handover = bool(
             rospy.get_param("~match_fcu_thrust_on_handover", False)
@@ -343,9 +359,96 @@ class AttachmentOutputMuxNode:
         self.odom = message
         self.odom_at = rospy.Time.now()
 
+    def _load_rc_roll_yaw_calibration(self):
+        # Fail startup rather than guess stick channels or direction.
+        rospy.wait_for_service("/mavros/param/get", timeout=5.0)
+        get = rospy.ServiceProxy("/mavros/param/get", ParamGet)
+        deadline = time.monotonic() + 20.0
+        def read(name, integer=False):
+            while not rospy.is_shutdown():
+                response = get(param_id=name)
+                if response.success:
+                    return response.value.integer if integer else response.value.real
+                if time.monotonic() >= deadline:
+                    raise ValueError("RC calibration unavailable after parameter-cache wait: " + name)
+                rospy.logwarn_throttle(2.0, "Waiting for MAVROS RC parameter cache: %s", name)
+                rospy.sleep(.25)
+            raise ValueError("RC calibration canceled during shutdown")
+        for axis in ("roll", "yaw"):
+            channel = int(read("RC_MAP_" + axis.upper(), True))
+            if channel <= 0:
+                raise ValueError("RC " + axis + " channel is not mapped")
+            low, center, high, reverse = (read("RC%d_%s" % (channel, suffix))
+                                         for suffix in ("MIN", "TRIM", "MAX", "REV"))
+            if not (all(math.isfinite(v) for v in (low, center, high, reverse))
+                    and low < center < high and reverse in (-1, 1)):
+                raise ValueError("Invalid RC " + axis + " calibration")
+            self.rc_calibration[axis] = (channel - 1, low, center, high, reverse < 0)
+        if self.rc_calibration["roll"][0] == self.rc_calibration["yaw"][0]:
+            raise ValueError("Roll and yaw require distinct RC channels")
+        self.rc_roll_channel_index = self.rc_calibration["roll"][0]
+        # Legacy roll/pitch assist is disabled by this path; satisfy its validation.
+        self.rc_pitch_channel_index = self.rc_calibration["yaw"][0]
+        rospy.loginfo("RC roll/yaw correction: calibrated channels %d/%d; pitch and thrust unchanged",
+                      self.rc_roll_channel_index + 1, self.rc_pitch_channel_index + 1)
+
+    def _roll_yaw_fraction(self, axis):
+        index, low, center, high, reverse = self.rc_calibration[axis]
+        value = stick_fraction(self.rc_channels, index, low, center, high, self.rc_deadzone, reverse)
+        # PX4 yaw is clockwise in NED; ROS heading is counterclockwise in ENU.
+        return -value if axis == "yaw" and value is not None else value
+
+    def _roll_yaw_limits(self, now, source):
+        roll = math.radians(self.rc_free_max_angle_deg)
+        yaw = math.radians(self.rc_yaw_max_deg)
+        if source == AttachmentControlCandidate.SOURCE_WALL:
+            if not is_fresh(self.wall_status_at, self.status_timeout_s, now):
+                return 0.0, 0.0
+            state = self.wall_status.state
+            if state in (WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE,
+                         WallPerchStatus.STATE_WALL_HOLD, WallPerchStatus.STATE_WALL_PIN,
+                         WallPerchStatus.STATE_DETACH_ROTATE):
+                # The wall maneuver owns these axes; no RC trim during flip-to-detach.
+                return 0.0, 0.0
+        return roll, yaw
+
+    def _roll_yaw_attitude(self, now, quaternion, source):
+        # Do not change ALTCTL prestream targets or retain a trim across handovers.
+        flight = getattr(self, "flight_state", None)
+        if (flight is None or not is_fresh(self.flight_state_at, self.state_timeout_s, now)
+                or flight.mode.upper() != "OFFBOARD"):
+            self.rc_roll_rad = self.rc_yaw_rad = 0.0
+            self.rc_trim_at = now
+            return quaternion
+        roll_limit, yaw_limit = self._roll_yaw_limits(now, source)
+        ready = self._rc_ready(now)
+        desired_roll = self._roll_yaw_fraction("roll") * roll_limit if ready else 0.0
+        desired_yaw = self._roll_yaw_fraction("yaw") * yaw_limit if ready else 0.0
+        if not ready:
+            rospy.logwarn_throttle(1.0, "RC roll/yaw unavailable; correction returning to zero")
+        self.rc_age_publisher.publish(Float32(data=(now-self.rc_at).to_sec()*1000 if ready else -1.0))
+        elapsed = max(0.0, min((now-self.rc_trim_at).to_sec() if self.rc_trim_at is not None else .02, .1))
+        self.rc_roll_rad = slew(max(-roll_limit, min(self.rc_roll_rad, roll_limit)), desired_roll,
+                                math.radians(self.rc_slew_deg_s)*elapsed)
+        self.rc_yaw_rad = slew(max(-yaw_limit, min(self.rc_yaw_rad, yaw_limit)), desired_yaw,
+                               math.radians(self.rc_yaw_slew_deg_s)*elapsed)
+        self.rc_pitch_rad = 0.0
+        self.rc_trim_at = now
+        # World-up yaw before body-axis roll avoids Euler singularities at the wall.
+        yaw_q = (0, 0, math.sin(self.rc_yaw_rad/2), math.cos(self.rc_yaw_rad/2))
+        values = (quaternion.x, quaternion.y, quaternion.z, quaternion.w)
+        values = quaternion_normalize(quaternion_multiply(yaw_q, trim_attitude(values, self.rc_roll_rad, 0)))
+        preview = Vector3Stamped();preview.header.stamp = now
+        preview.vector.x = math.degrees(self.rc_roll_rad)
+        preview.vector.y = 0.0;preview.vector.z = math.degrees(self.rc_yaw_rad)
+        self.rc_preview_publisher.publish(preview)
+        return Quaternion(x=values[0], y=values[1], z=values[2], w=values[3])
+
     def _on_rc(self, message):
         self.rc_channels = tuple(message.channels)
         self.rc_at = rospy.Time.now()
+        if getattr(self, "rc_roll_yaw_enabled", False):
+            return  # Publish applied correction from the output path, not raw sticks.
         roll = stick_fraction(
             self.rc_channels, self.rc_roll_channel_index, self.rc_pwm_low,
             self.rc_pwm_center, self.rc_pwm_high, self.rc_deadzone,
@@ -524,6 +627,8 @@ class AttachmentOutputMuxNode:
             return True
         if not is_fresh(self.rc_at, self.rc_timeout_s, now) or self.rc_channels is None:
             return False
+        if getattr(self, "rc_roll_yaw_enabled", False):
+            return all(self._roll_yaw_fraction(axis) is not None for axis in ("roll", "yaw"))
         return all(
             stick_fraction(
                 self.rc_channels, index, self.rc_pwm_low, self.rc_pwm_center,
@@ -576,6 +681,8 @@ class AttachmentOutputMuxNode:
     def _assisted_attitude(self, now, quaternion, source):
         if not getattr(self, "rc_assist_enabled", False):
             return quaternion
+        if getattr(self, "rc_roll_yaw_enabled", False):
+            return self._roll_yaw_attitude(now, quaternion, source)
         limits = self._rc_limits(now, source)
         if not self._rc_ready(now):
             rospy.logwarn_throttle(1.0, "RC attitude assist unavailable; trim returning to zero")

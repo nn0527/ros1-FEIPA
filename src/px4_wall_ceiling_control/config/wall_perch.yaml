@@ -34,6 +34,8 @@ wall_perch_decision_node:
 
   # 正常流程跳过STABILIZE_HOVER；保留参数仅用于旧状态兼容。
   stabilize_time_s: 0.00
+  # Valid raw front distance above this limit aborts pre-flip approach.
+  approach_abort_front_distance_m: 1.0
   approach_timeout_s: 20.00
   flip_time_s: 2.00
   capture_time_s: 0.50
@@ -45,13 +47,20 @@ wall_perch_decision_node:
   # Bench starting gates for operator-triggered detach; tune from geometry/logs.
   # Detach starts from measured attitude; no original hold-reference angle gate.
   detach_axis_error_deg: 5.0
-  detach_max_rate_rps: 0.15
+  detach_max_rate_rps: 0.436332313  # 25 deg/s
   detach_max_abs_vertical_speed_mps: 1.00
   detach_stable_hold_s: 0.50
   # Detach attitude trajectory duration.
-  # 90 deg over 5 s (quintic setpoint).
-  detach_time_s: 5.00
+  # 90 deg over 3 s (quintic setpoint).
+  detach_time_s: 3.00
   recover_time_s: 1.00
+  # Applied only in RECOVER and ABORT. ENU up is positive.
+  recovery_max_up_speed_mps: 0.10
+  recovery_max_down_speed_mps: 0.15
+  recovery_height_to_speed_kp: 0.50
+  recovery_velocity_kp: 0.30
+  recovery_positive_compensation_max: 0.08
+  recovery_max_thrust: 0.60
   # Bench departure/recovery support only; retain through EXIT until ALTCTL.
   bench_detach_hover_thrust: 0.48
   # Capture odometry Z when detach starts. As the body levels, use Z/vertical
@@ -100,6 +109,11 @@ wall_perch_decision_node:
   # Operator-requested hold-only bypass. No synthetic range/validity is sent.
   # Acquisition, flip, capture, detach and recovery retain their range checks.
   ignore_range_loss_during_hold: true
+  # Tolerate error 258 only while the last valid range is still fresh.
+  ignore_range_error_258: true
+  # Ignore range invalid/loss during approach, takeover, flip, capture and hold.
+  # Approach/takeover still wait for fresh valid front/top ranges before advancing.
+  ignore_range_loss_during_attachment: true
   sensor_health_timeout_s: 0.30
   # 侧吸取得 owner 前要求顶部传感器已有新鲜有效量测。
   require_top_sensor_on_acquire: true

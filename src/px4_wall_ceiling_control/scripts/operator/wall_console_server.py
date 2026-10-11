@@ -244,7 +244,8 @@ class RemoteRuntime:
                    and self.ros.get_param("/attachment_output_mux_node/output_enabled", False)
                    and self.ros.get_param("/wall_perch_decision_node/decision_enabled", False)
                    and not self.ros.get_param("/flight_mode_manager_node/require_rc_center", False)
-                   and not self.ros.get_param("/attachment_output_mux_node/rc_assist_enabled", False)
+                   and (not self.ros.get_param("/attachment_output_mux_node/rc_assist_enabled", False)
+                        or self.ros.get_param("/attachment_output_mux_node/rc_roll_yaw_enabled", False))
                    and not (nodes & {"/ceiling_attachment_decision_node", "/ceiling_motor_bench_output_node",
                                     "/flight_supervisor_node", "/setpoint_mux_node", "/ceiling_attachment_output_node"}))
         profile = "restrained_bench" if wall_bench and manager_bench else "flight"
@@ -332,7 +333,9 @@ class RemoteRuntime:
                 self.state.launch_error = ""
                 return {"message": "基础程序已运行，无需重复启动"}
             flight = self.state.snapshot()["status"]["state"]
-            if flight["value"] and (not flight["fresh"] or flight["value"].get("armed")):
+            # Stopped MAVROS leaves a cached heartbeat. Bootstrap MAVROS first;
+            # start_worker still requires NEW connected/disarmed feedback before controls.
+            if flight["fresh"] and flight["value"] and flight["value"].get("armed"):
                 raise ValueError("请在未解锁且飞控状态有效时启动基础程序")
             self.state.config = config
             self.state.starting = True
@@ -393,7 +396,7 @@ class RemoteRuntime:
             if not item["fresh"] or not item["value"]["connected"] or item["value"]["armed"]:
                 raise ValueError("飞控状态已变化，贴墙基础链路未启动；请在未解锁状态重试")
             self.spawn("wall_flight", launch_arguments(self.state.config))
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + 45
             while not (self.state.snapshot()["status"]["runtime"]["value"] or {}).get("enabled", False):
                 child = self.children["wall_flight"]
                 if child.poll() is not None:
@@ -514,6 +517,8 @@ class RemoteRuntime:
                 self.state.launch_error = "终止失败，残留 PID: " + str(remaining) if remaining else ""
             if remaining:
                 raise ValueError(self.state.launch_error)
+            with self.state.lock:
+                self.state.samples.clear()  # Removed producers must not leave stale action state.
             self.state.update("runtime", self.inspect_runtime() if self.ros else {"enabled": False, "nodes": [], "missing": []})
             self.state.event("已终止试验控制、MAVROS、雷达及记录进程；可以重新启动")
             return {"message": "现有试验进程已终止，可以重新启动基础程序"}

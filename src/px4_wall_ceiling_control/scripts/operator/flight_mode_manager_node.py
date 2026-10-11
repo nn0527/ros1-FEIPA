@@ -58,6 +58,9 @@ class FlightModeManagerNode:
         rospy.Subscriber("/wall_perch/cancel_wait", Bool, self._on_wait_cancel, queue_size=1)
         self.cancel_pub = rospy.Publisher("/attachment/terminal_command", String, queue_size=1)
         self.wall_bench_wait_for_ranges = bool(rospy.get_param("~wall_bench_wait_for_ranges", False))
+        self.ignore_range_loss_during_attachment = bool(rospy.get_param(
+            "~ignore_range_loss_during_attachment",
+            rospy.get_param("/wall_perch_decision_node/ignore_range_loss_during_attachment", False)))
         self.output_timeout_s = float(rospy.get_param("~output_timeout_s", 0.3))
         self.status_timeout_s = float(rospy.get_param("~status_timeout_s", 0.5))
         self.require_rc_center = bool(rospy.get_param("~require_rc_center", False))
@@ -99,6 +102,8 @@ class FlightModeManagerNode:
         self.stream_since = None
         self.last_request_at = None
         self.request_in_flight = False
+        self.takeover_attempt = 0
+        self.offboard_request = None
         self.lock_until_neutral = False
         self.owner_seen = False
         self.detach_seen = False
@@ -293,7 +298,10 @@ class FlightModeManagerNode:
             return "attitude or vertical velocity estimate invalid"
         if getattr(self, "require_rc_center", False) and not self._rc_fresh(now):
             return "RC input unavailable or invalid"
-        if selected == OperatorCommand.MODE_WALL and getattr(self, "wall_bench_wait_for_ranges", False):
+        if selected == OperatorCommand.MODE_WALL and (
+            getattr(self, "wall_bench_wait_for_ranges", False)
+            or getattr(self, "ignore_range_loss_during_attachment", False)
+        ):
             return None  # The wall decision holds neutral until real ranges recover.
         if self.sensor is None:
             return "sensor health unavailable"
@@ -451,6 +459,29 @@ class FlightModeManagerNode:
             ):
                 self.completed = True
 
+    def _wall_approach_aborted(self, now):
+        return bool(self.selected_mode == OperatorCommand.MODE_WALL
+                    and self.wall is not None and is_fresh(self.wall_at, self.status_timeout_s, now)
+                    and self.wall.state == WallPerchStatus.STATE_ABORT
+                    and str(self.wall.reason).startswith("approach front distance "))
+
+    def _wall_flip_started(self, now):
+        return bool(
+            self.wall is not None
+            and is_fresh(self.wall_at, self.status_timeout_s, now)
+            and self.wall.state == WallPerchStatus.STATE_FLIP_TO_WALL
+            and self.wall.candidate_valid and not self.wall.fault_detected
+        )
+
+    def _current_offboard_request(self, monotonic_now):
+        request = getattr(self, "offboard_request", None)
+        return bool(
+            request is not None
+            and request[0] == getattr(self, "takeover_attempt", 0)
+            and request[1] == self.selected_mode
+            and 0.0 <= monotonic_now - request[2] <= self.enter_timeout_s
+        )
+
     def _acquire_failure_reason(self, now):
         if self.selected_mode == OperatorCommand.MODE_CEILING:
             status, received_at, label = self.ceiling, self.ceiling_at, "ceiling"
@@ -475,10 +506,10 @@ class FlightModeManagerNode:
         self.last_request_at = now
         self.request_in_flight = True
         threading.Thread(
-            target=self._send_mode_request, args=(mode,), daemon=True
+            target=self._send_mode_request, args=(mode, getattr(self, "takeover_attempt", 0)), daemon=True
         ).start()
 
-    def _send_mode_request(self, mode):
+    def _send_mode_request(self, mode, attempt=None):
         try:
             rospy.wait_for_service("/mavros/set_mode", timeout=0.2)
             if not kill_clear(self, rospy.Time.now()):
@@ -497,6 +528,11 @@ class FlightModeManagerNode:
                     rospy.Time.now()
                 ):
                     return
+            if attempt is not None and attempt != getattr(self, "takeover_attempt", 0):
+                return  # A canceled/previous attempt must not send a late mode change.
+            if mode == "OFFBOARD":
+                self.offboard_request = (getattr(self, "takeover_attempt", 0),
+                                         self.selected_mode, time.monotonic())
             request = SetModeRequest()
             request.custom_mode = mode
             response = self.set_mode(request)
@@ -508,6 +544,8 @@ class FlightModeManagerNode:
             self.request_in_flight = False
 
     def _reset(self, lock=False, reason=None):
+        self.takeover_attempt = getattr(self, "takeover_attempt", 0) + 1
+        self.offboard_request = None
         self.selected_mode = None
         self.manual_wall_wait_started = None
         self.manual_wait_canceled = False
@@ -544,6 +582,8 @@ class FlightModeManagerNode:
                 and flight_mode == "ALTCTL"
                 and self._preflight_ready(now, requested)
             ):
+                self.takeover_attempt = getattr(self, "takeover_attempt", 0) + 1
+                self.offboard_request = None
                 self.selected_mode = requested
                 if self._manual_wall_selected():
                     self.manual_wall_wait_started = monotonic_now
@@ -556,6 +596,24 @@ class FlightModeManagerNode:
                 self.cancel_pub.publish(String(data="cancel"))
             elif requested != self.selected_mode:
                 self._reset(lock=requested is not None, reason="manual wall request canceled")
+            elif self._wall_approach_aborted(now):
+                self._reset(lock=True, reason=self.wall.reason)
+                self.cancel_pub.publish(String(data="cancel"))
+            elif flight_fresh and flight_mode == "OFFBOARD":
+                # Recognize this attempt's handover despite delayed phase feedback.
+                # An unrelated/stale OFFBOARD change must never start a flip.
+                if (self._current_offboard_request(monotonic_now)
+                    and self._preflight_ready(now, self.selected_mode)
+                    and self._stream_ready(now)):
+                    if self._wall_flip_started(now):
+                        self._set_phase(self.ACTIVE, reason="本次接管已确认：PX4 OFFBOARD，贴墙节点已开始翻转")
+                    else:
+                        self._set_phase(self.ENTERING, reason="本次 OFFBOARD 请求已确认；等待贴墙节点及有效距离")
+                else:
+                    reason = (self._preflight_failure_reason(now, self.selected_mode)
+                              or "OFFBOARD 不属于本次有效接管，或预发送反馈已过期")
+                    self._reset(lock=True, reason=reason)
+                    self.cancel_pub.publish(String(data="cancel"))
             elif flight_mode != "ALTCTL" or not self._preflight_ready(now, self.selected_mode):
                 self._reset(lock=True, reason=self._preflight_failure_reason(now, self.selected_mode) or "manual approach requires ALTCTL")
                 self.cancel_pub.publish(String(data="cancel"))
@@ -605,12 +663,19 @@ class FlightModeManagerNode:
             else:
                 self.stream_since = None
         elif self.phase == self.ENTERING:
-            if flight_fresh and flight_mode == "OFFBOARD":
+            if self._wall_approach_aborted(now):
+                if flight_fresh and flight_mode == "OFFBOARD":
+                    self._set_phase(self.RETURNING, reason=self.wall.reason)
+                else:
+                    self._reset(lock=True, reason=self.wall.reason)
+                self.cancel_pub.publish(String(data="cancel"))
+            elif flight_fresh and flight_mode == "OFFBOARD":
                 if (self._manual_wall_selected() and not self._manual_wall_ready(now)
-                    and not (self.wall is not None and is_fresh(self.wall_at, self.status_timeout_s, now)
-                             and self.wall.state == WallPerchStatus.STATE_FLIP_TO_WALL and self.wall.candidate_valid
-                             and not self.wall.fault_detected)):
-                    self._set_phase(self.RETURNING, reason="OFFBOARD 确认时距离条件失效，恢复水平并交回 ALTCTL")
+                    and not self._wall_flip_started(now)):
+                    if getattr(self, "ignore_range_loss_during_attachment", False):
+                        self.phase_reason = "接管等待：距离条件失效，保持中性输出，等待有效距离后翻转"
+                    else:
+                        self._set_phase(self.RETURNING, reason="OFFBOARD 确认时距离条件失效，恢复水平并交回 ALTCTL")
                 else:
                     self._set_phase(self.ACTIVE, reason="PX4 entered OFFBOARD")
             else:

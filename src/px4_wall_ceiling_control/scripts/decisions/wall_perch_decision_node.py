@@ -110,7 +110,7 @@ class WallPerchDecisionNode:
             float(rospy.get_param("~detach_axis_error_deg", 5.0))
         )
         self.detach_max_rate_rps = float(
-            rospy.get_param("~detach_max_rate_rps", 0.15)
+            rospy.get_param("~detach_max_rate_rps", math.radians(25.0))
         )
         self.detach_max_abs_vertical_speed_mps = float(
             rospy.get_param("~detach_max_abs_vertical_speed_mps", 1.00)
@@ -122,6 +122,21 @@ class WallPerchDecisionNode:
             0.01, float(rospy.get_param("~detach_time_s", 1.0))
         )
         self.recover_time_s = float(rospy.get_param("~recover_time_s", 0.50))
+        # Recovery-only vertical velocity loop; all thrust values are normalized.
+        self.recovery_max_up_speed_mps = float(rospy.get_param("~recovery_max_up_speed_mps", 0.10))
+        self.recovery_max_down_speed_mps = float(rospy.get_param("~recovery_max_down_speed_mps", 0.15))
+        self.recovery_height_to_speed_kp = float(rospy.get_param("~recovery_height_to_speed_kp", 0.50))
+        self.recovery_velocity_kp = float(rospy.get_param("~recovery_velocity_kp", 0.30))
+        self.recovery_positive_compensation_max = float(rospy.get_param("~recovery_positive_compensation_max", 0.08))
+        self.recovery_max_thrust = float(rospy.get_param("~recovery_max_thrust", 0.60))
+        if (not all(math.isfinite(v) and v >= 0.0 for v in (
+                self.recovery_max_up_speed_mps, self.recovery_max_down_speed_mps,
+                self.recovery_height_to_speed_kp, self.recovery_velocity_kp,
+                self.recovery_positive_compensation_max))
+                or not math.isfinite(self.recovery_max_thrust)
+                or not 0.1 <= self.recovery_max_thrust <= 1.0):
+            raise ValueError("invalid recovery velocity/thrust limits")
+
         self.wall_angle_rad = math.radians(
             float(rospy.get_param("~wall_angle_deg", 90.0))
         )
@@ -209,6 +224,12 @@ class WallPerchDecisionNode:
         self.min_altitude_m = float(rospy.get_param("~min_altitude_m", 0.30))
         self.altitude_reference = rospy.get_param("~altitude_reference", "arming_ground")
         self.bench_wait_for_ranges = bool(rospy.get_param("~bench_wait_for_ranges", False))
+        self.ignore_range_loss_during_attachment = bool(
+            rospy.get_param("~ignore_range_loss_during_attachment", False)
+        )
+        self.ignore_range_error_258 = bool(
+            rospy.get_param("~ignore_range_error_258", False)
+        )
         self.ignore_range_loss_during_hold = bool(
             rospy.get_param("~ignore_range_loss_during_hold", False)
         )
@@ -272,6 +293,8 @@ class WallPerchDecisionNode:
         self.state_entered_at = rospy.Time.now()
         self.front_range = None
         self.front_received_at = None
+        self.approach_abort_front_distance_m = float(rospy.get_param("~approach_abort_front_distance_m", 1.0))
+        self.approach_far_sample = None
         self.front_filtered_m = None
         self.top_range = None
         self.top_received_at = None
@@ -458,6 +481,8 @@ class WallPerchDecisionNode:
             if not is_fresh(self.front_received_at, self.sensor_timeout_s, now)
             else self.front_filtered_m
         )
+        if self._approach_stage() and self._mode_requested(now) and message.range > getattr(self, "approach_abort_front_distance_m", 1.0):
+            self.approach_far_sample = (now, float(message.range))
         self.front_range = message
         self.front_received_at = now
         self.front_filtered_m = self._filter_range(message, previous)
@@ -723,8 +748,36 @@ class WallPerchDecisionNode:
                                WallPerchStatus.STATE_WALL_PIN)
         )
 
+    def _ignore_attachment_range_loss(self):
+        return bool(
+            getattr(self, "ignore_range_loss_during_attachment", False)
+            and self.state in (
+                WallPerchStatus.STATE_IDLE,
+                WallPerchStatus.STATE_FRONT_WALL_DETECT,
+                WallPerchStatus.STATE_STABILIZE_HOVER,
+                WallPerchStatus.STATE_SLOW_APPROACH,
+                WallPerchStatus.STATE_FLIP_TO_WALL,
+                WallPerchStatus.STATE_WALL_CAPTURE,
+                WallPerchStatus.STATE_WALL_HOLD,
+                WallPerchStatus.STATE_WALL_PIN,
+            )
+        )
+
+    def _range_valid_for_safety(self, side, now):
+        if not self._sensor_health_fresh(now):
+            return False
+        health = self.sensor_health
+        if getattr(health, side + "_valid", False):
+            return True
+        fresh = self._top_fresh(now) if side == "ceiling" else self._front_fresh(now)
+        return bool(
+            getattr(self, "ignore_range_error_258", False)
+            and getattr(health, side + "_error_code", 0) == 258
+            and fresh
+        )
+
     def _top_preflight_ready(self, now):
-        if self._ignore_hold_range_loss():
+        if self._ignore_hold_range_loss() or self._ignore_attachment_range_loss():
             return True
         if getattr(self, "bench_wait_for_ranges", False) and self.state in (
             WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE,
@@ -744,7 +797,7 @@ class WallPerchDecisionNode:
             return True
         return bool(
             self._sensor_health_fresh(now)
-            and self.sensor_health.ceiling_valid
+            and self._range_valid_for_safety("ceiling", now)
         )
 
     def _odom_fresh(self, now):
@@ -767,7 +820,7 @@ class WallPerchDecisionNode:
         return True
 
     def _top_required(self):
-        if self._ignore_hold_range_loss():
+        if self._ignore_hold_range_loss() or self._ignore_attachment_range_loss():
             return False
         if getattr(self, "bench_wait_for_ranges", False) and self.state in (
             WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER,
@@ -783,7 +836,7 @@ class WallPerchDecisionNode:
         )
 
     def _front_required(self):
-        if self._bench_waiting():
+        if self._bench_waiting() or self._ignore_attachment_range_loss():
             return False
         # The forward-facing lidar is only a decision/safety input until the
         # flip starts.  After rotation it may no longer face the wall.
@@ -813,6 +866,24 @@ class WallPerchDecisionNode:
         return bool(getattr(self, "bench_wait_for_ranges", False) and self.state in (
             WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_FRONT_WALL_DETECT,
             WallPerchStatus.STATE_SLOW_APPROACH))
+
+    def _approach_stage(self):
+        return getattr(self, "state", None) in (
+            WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_FRONT_WALL_DETECT,
+            WallPerchStatus.STATE_STABILIZE_HOVER, WallPerchStatus.STATE_SLOW_APPROACH,
+        )
+
+    def _approach_far_distance(self, now):
+        sample = getattr(self, "approach_far_sample", None)
+        if sample is not None and is_fresh(sample[0], self.sensor_timeout_s, now):
+            return sample[1]
+        # Also check the latest valid input when a request is first enabled.
+        message = getattr(self, "front_range", None)
+        if (message is not None and self._front_fresh(now) and is_valid_range(message)
+                and self._sensor_health_fresh(now) and self.sensor_health.front_valid
+                and message.range > getattr(self, "approach_abort_front_distance_m", 1.0)):
+            return float(message.range)
+        return None
 
     def _bench_ranges_ready(self, now):
         return bool(self._sensor_health_fresh(now) and self.sensor_health.front_valid
@@ -869,6 +940,24 @@ class WallPerchDecisionNode:
             return 0.1
         return clamp(vertical_demand / max(vertical_fraction, 1.0e-3), 0.1, self.max_thrust)
 
+    def _recovery_height_thrust(self):
+        """RECOVER/ABORT: bounded ENU speed target and total positive correction."""
+        feedback = self._height_feedback()
+        attitude = self._current_quaternion()
+        cap = min(self.max_thrust, self.recovery_max_thrust)
+        if self.detach_altitude_m is None or feedback is None or attitude is None:
+            return clamp(self.hover_thrust * self.recover_thrust_multiplier, 0.1, cap)
+        altitude, speed = feedback
+        target_speed = clamp(
+            self.recovery_height_to_speed_kp * (self.detach_altitude_m - altitude),
+            -self.recovery_max_down_speed_mps, self.recovery_max_up_speed_mps)
+        # This includes braking a descent, not just the height-error contribution.
+        correction = min(self.recovery_positive_compensation_max,
+                         self.recovery_velocity_kp * (target_speed - speed))
+        vertical_demand = max(0.0, self.hover_thrust + correction)
+        vertical_fraction = max(0.0, rotate_vector(attitude, (0.0, 0.0, 1.0))[2])
+        return clamp(vertical_demand / max(vertical_fraction, 1.0e-3), 0.1, cap)
+
     def _detach_height_settled(self):
         if getattr(self, "bench_wait_for_ranges", False):
             return self._height_feedback() is not None
@@ -894,7 +983,7 @@ class WallPerchDecisionNode:
             return False
         if self._front_required() and not self._front_fresh(now):
             return False
-        if self._front_required() and self._sensor_health_fresh(now) and not self.sensor_health.front_valid:
+        if self._front_required() and self._sensor_health_fresh(now) and not self._range_valid_for_safety("front", now):
             return False
         if self._top_required() and not self._top_fresh(now):
             return False
@@ -1134,6 +1223,20 @@ class WallPerchDecisionNode:
             self.fault_count += 1
             self._enter_state(WallPerchStatus.STATE_ABORT, now, "cancel or wall mode released")
 
+        if not mode_requested:
+            self.approach_far_sample = None
+        if mode_requested and self._approach_stage() and not getattr(self, "rearm_required", False):
+            far_distance = self._approach_far_distance(now)
+            if far_distance is not None:
+                if self.state == WallPerchStatus.STATE_IDLE:
+                    self._capture_attitude_references()
+                self.fault_count += 1
+                self.approach_far_sample = None
+                self._enter_state(WallPerchStatus.STATE_ABORT, now,
+                    "approach front distance {:.3f} m exceeds {:.3f} m".format(
+                        far_distance, getattr(self, "approach_abort_front_distance_m", 1.0)))
+                return
+
         if self.state == WallPerchStatus.STATE_IDLE:
             if not mode_requested:
                 self.rearm_required = False
@@ -1141,7 +1244,13 @@ class WallPerchDecisionNode:
                 self.cancel_requested = False
             altitude_ok = self._entry_height_ready()
             safety_ok = self._safety_ok(now)
-            if mode_requested and not self.rearm_required and altitude_ok and safety_ok:
+            if (mode_requested and not self.rearm_required and altitude_ok and safety_ok
+                    and self._ignore_attachment_range_loss()
+                    and (not self._bench_ranges_ready(now)
+                         or (getattr(self, "manual_approach", False) and not self._flip_ready(now)))):
+                self.last_reason = "接管等待：需要两路新鲜有效距离"
+                self.flip_ready_since = self.flip_ready_last_sample_at = None
+            elif mode_requested and not self.rearm_required and altitude_ok and safety_ok:
                 self._enter_state(WallPerchStatus.STATE_FRONT_WALL_DETECT, now, "wall mode armed")
                 if getattr(self, "manual_approach", False):
                     ready = (self._flip_ready(now) and self._top_fresh(now)
@@ -1165,14 +1274,14 @@ class WallPerchDecisionNode:
             if not self._safety_ok(now):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "front detect safety failure")
-            elif self._front_ready(now) and (not self._bench_waiting() or self._bench_ranges_ready(now)):
+            elif self._front_ready(now) and (not (self._bench_waiting() or self._ignore_attachment_range_loss()) or self._bench_ranges_ready(now)):
                 self._enter_state(
                     WallPerchStatus.STATE_SLOW_APPROACH,
                     now,
                     "front wall ready; begin 3 deg approach",
                 )
-            elif self._bench_waiting():
-                self.last_reason = "bench hover: waiting for valid front/top ranges and wall distance"
+            elif self._bench_waiting() or self._ignore_attachment_range_loss():
+                self.last_reason = "接近等待：需要两路新鲜有效距离及墙面距离条件"
 
         elif self.state == WallPerchStatus.STATE_STABILIZE_HOVER:
             if not self._safety_ok(now):
@@ -1189,8 +1298,8 @@ class WallPerchDecisionNode:
             if not self._safety_ok(now):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "approach safety failure")
-            elif self._bench_waiting() and not self._bench_ranges_ready(now):
-                self.last_reason = "台架接近暂停：等待两路有效距离，不凭无效距离触发翻转"
+            elif (self._bench_waiting() or self._ignore_attachment_range_loss()) and not self._bench_ranges_ready(now):
+                self.last_reason = "接近暂停：等待两路新鲜有效距离，不凭无效距离触发翻转"
                 self.state_entered_at = now
                 self.flip_ready_since = self.flip_ready_last_sample_at = None
             elif self._state_age(now) > self.approach_timeout_s:
@@ -1328,7 +1437,8 @@ class WallPerchDecisionNode:
 
     def _candidate(self, now):
         if (self.state == WallPerchStatus.STATE_SLOW_APPROACH
-                and self._bench_waiting() and not self._bench_ranges_ready(now)):
+                and (self._bench_waiting() or self._ignore_attachment_range_loss())
+                and not self._bench_ranges_ready(now)):
             return True, None, math.nan, 0.0
         neutral = self.state in (
             WallPerchStatus.STATE_FRONT_WALL_DETECT,
@@ -1396,7 +1506,7 @@ class WallPerchDecisionNode:
             thrust = hold_thrust + blend * (self._height_hold_thrust() - hold_thrust)
         elif self.state == WallPerchStatus.STATE_RECOVER:
             quaternion = self.q_hover
-            thrust = self._height_hold_thrust()
+            thrust = self._recovery_height_thrust()
         elif self.state == WallPerchStatus.STATE_EXIT:
             quaternion = self.q_hover
             thrust = (self._height_hold_thrust()
@@ -1404,11 +1514,7 @@ class WallPerchDecisionNode:
                       else self.hover_thrust)
         elif self.state == WallPerchStatus.STATE_ABORT:
             quaternion = self.q_hover
-            thrust = (
-                self._height_hold_thrust()
-                if self.detach_altitude_m is not None and self._height_feedback() is not None
-                else self.hover_thrust * self.recover_thrust_multiplier
-            )
+            thrust = self._recovery_height_thrust()
 
         if quaternion is not None:
             if (getattr(self, "bench_wait_for_ranges", False) and getattr(self, "detach_altitude_m", None) is not None
@@ -1417,6 +1523,8 @@ class WallPerchDecisionNode:
                 thrust = clamp(thrust, self.bench_detach_thrust_value - delta, self.bench_detach_thrust_value + delta)
                 self.bench_detach_thrust_value, self.bench_detach_thrust_at = thrust, now
             thrust = clamp(thrust, 0.1, self.max_thrust)
+            if self.state in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT):
+                thrust = min(thrust, self.recovery_max_thrust)
         return neutral, quaternion, thrust, progress
 
     def _acquire_requested(self, now):

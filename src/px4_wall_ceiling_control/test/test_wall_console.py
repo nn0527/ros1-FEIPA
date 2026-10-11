@@ -22,6 +22,34 @@ spec.loader.exec_module(server)
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_restart_with_stale_stopped_mavros_feedback_bootstraps_connection(self):
+        for old_armed in (False, True):
+            now = [0.0]
+            runtime = object.__new__(server.RemoteRuntime)
+            runtime.state = ConsoleState(clock=lambda: now[0])
+            runtime.state.update("state", {"connected": True, "armed": old_armed, "mode": "ALTCTL"})
+            now[0] = 10.0
+            runtime.ros = None
+            runtime.nodes = lambda: set()
+            runtime.stop_requested = True
+            with mock.patch.object(server.threading, "Thread") as thread:
+                runtime.start(dict(DEFAULT_CONFIG))
+            thread.return_value.start.assert_called_once()
+            self.assertTrue(runtime.state.starting)
+            self.assertFalse(runtime.stop_requested)
+
+    def test_restart_fresh_armed_feedback_still_blocks(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = ConsoleState()
+        runtime.state.update("state", {"connected": True, "armed": True, "mode": "ALTCTL"})
+        runtime.ros = None
+        runtime.nodes = lambda: set()
+        with mock.patch.object(server.threading, "Thread") as thread:
+            with self.assertRaises(ValueError):
+                runtime.start(dict(DEFAULT_CONFIG))
+        thread.assert_not_called()
+
+
     def test_stop_rejects_armed_or_expired_state(self):
         runtime = object.__new__(server.RemoteRuntime)
         runtime.state = ConsoleState()
@@ -53,6 +81,7 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(runtime.state.launch_error, '')
         self.assertFalse(runtime.state.snapshot()['status']['runtime']['value']['enabled'])
         self.assertTrue(runtime.stop_requested)
+        self.assertIsNone(runtime.state.snapshot()["status"]["state"]["value"])
 
     def test_mavros_replacement_clears_old_exit_and_reports_new_failure(self):
         runtime = object.__new__(server.RemoteRuntime)
@@ -411,9 +440,9 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(args[:3], ["roslaunch", "px4_wall_ceiling_control", "wall_console_flight.launch"])
         path = pathlib.Path(__file__).resolve().parents[1] / "launch/system/wall_console_flight.launch"
         values = {arg.attrib["name"]: arg.attrib["value"] for arg in ET.parse(str(path)).findall("./include/arg")}
-        for key in ("flight_mode_enabled", "output_enabled", "wall_enabled"):
+        for key in ("flight_mode_enabled", "output_enabled", "wall_enabled", "rc_assist_enabled", "rc_roll_yaw_enabled"):
             self.assertEqual(values[key], "true")
-        for key in ("rc_assist_enabled", "require_rc_center", "ceiling_enabled"):
+        for key in ("require_rc_center", "ceiling_enabled"):
             self.assertEqual(values[key], "false")
         self.assertEqual(values["wall_hold_time_s"], "0.0")
 
@@ -503,6 +532,24 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(runtime.state.config["test_profile"], "restrained_bench")
         self.assertEqual(runtime.state.config["fcu_port"], "/dev/ttyUSB3")
         self.assertEqual(runtime.state.config["hover_thrust"], 0.52)
+
+    def test_runtime_accepts_roll_yaw_assist_but_rejects_legacy_assist(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = self.state
+        names = {"/mavros", "/terminal_operator_node", "/flight_mode_manager_node",
+                 "/attachment_output_mux_node", "/wall_perch_decision_node", "/sensor_range_manager_node",
+                 "/ceiling_lidar_node", "/front_lidar_node"}
+        for roll_yaw in (False, True):
+            values = {"/mavros/fcu_url": "/dev/ttyUSB3:230400",
+                      "/ceiling_lidar_node/serial_port": "/dev/ttyUSB1",
+                      "/front_lidar_node/serial_port": "/dev/ttyUSB4",
+                      "/wall_perch_decision_node/hover_thrust": 0.52,
+                      "/attachment_output_mux_node/rc_assist_enabled": True,
+                      "/attachment_output_mux_node/rc_roll_yaw_enabled": roll_yaw}
+            runtime.ros = SimpleNamespace(get_param=lambda name, default=False:
+                values.get(name, False if name.endswith("require_rc_center") else True))
+            with mock.patch.object(runtime, "nodes", return_value=names):
+                self.assertEqual(runtime.inspect_runtime()["enabled"], roll_yaw)
 
     def test_armed_vehicle_blocks_new_pipeline_start(self):
         self.ready()
