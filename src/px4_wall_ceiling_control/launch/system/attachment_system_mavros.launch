@@ -26,6 +26,7 @@
   <arg name="wall_bench_wait_for_ranges" default="false" />
   <arg name="wall_bench_range_timeout_s" default="1.2" />
   <arg name="wall_manual_approach" default="false" />
+  <arg name="wall_auto_approach" default="false" />
   <arg name="wall_flip_thrust_follow_tilt" default="false" />
   <arg name="output_max_thrust" default="0.85" />
   <arg name="match_fcu_thrust_on_handover" default="false" />
@@ -100,6 +101,7 @@
     <param name="wall_bench_wait_for_ranges" value="$(arg wall_bench_wait_for_ranges)" />
     <param name="motor_output_telemetry_enabled" value="$(arg wall_bench_wait_for_ranges)" />
     <param name="wall_manual_approach" value="$(arg wall_manual_approach)" />
+    <param name="wall_auto_approach" value="$(arg wall_auto_approach)" />
     <param name="estimator_timeout_s"
            value="$(arg flight_estimator_timeout_s)" />
     <param name="state_timeout_s"
@@ -134,6 +136,7 @@
     <param name="kill_guard_enabled" value="$(arg kill_guard_enabled)" />
     <param name="decision_enabled" value="true" />
     <param name="manual_approach" value="$(arg wall_manual_approach)" />
+    <param name="auto_approach" value="$(arg wall_auto_approach)" />
     <param name="flip_thrust_follow_tilt" value="$(arg wall_flip_thrust_follow_tilt)" />
     <param name="hold_time_s" value="$(arg wall_hold_time_s)" />
     <param name="min_altitude_m" value="$(arg wall_min_altitude_m)" />
@@ -159,6 +162,10 @@
     <param name="rc_assist_enabled" value="$(arg rc_assist_enabled)" />
     <param name="rc_roll_yaw_enabled" value="$(arg rc_roll_yaw_enabled)" />
     <param name="preflip_right_roll_deg" value="$(arg preflip_right_roll_deg)" />
+    <param name="approach_attitude_limits_enabled" value="$(arg wall_auto_approach)" />
+    <param name="approach_max_tilt_deg" value="5.0" />
+    <param name="approach_tilt_slew_deg_s" value="10.0" />
+    <param name="approach_yaw_slew_deg_s" value="20.0" />
     <param name="recovery_attitude_limits_enabled" value="$(arg recovery_attitude_limits_enabled)" />
     <param name="recovery_max_tilt_deg" value="5.0" />
     <param name="recovery_tilt_slew_deg_s" value="10.0" />

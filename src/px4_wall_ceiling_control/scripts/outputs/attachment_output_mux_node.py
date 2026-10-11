@@ -127,6 +127,15 @@ class AttachmentOutputMuxNode:
         if not (0 < self.recovery_max_tilt_deg < 45 and 0 < self.recovery_tilt_slew_deg_s <= 90
                 and 0 < self.recovery_yaw_slew_deg_s <= 90 and 0.1 <= self.recovery_final_thrust_cap <= 1.0):
             raise ValueError("invalid final recovery attitude limits")
+        self.approach_attitude_limits_enabled = bool(rospy.get_param("~approach_attitude_limits_enabled", False))
+        self.approach_max_tilt_deg = float(rospy.get_param("~approach_max_tilt_deg", 5.0))
+        self.approach_tilt_slew_deg_s = float(rospy.get_param("~approach_tilt_slew_deg_s", 10.0))
+        self.approach_yaw_slew_deg_s = float(rospy.get_param("~approach_yaw_slew_deg_s", 20.0))
+        if not (0 < self.approach_max_tilt_deg <= 5 and 0 < self.approach_tilt_slew_deg_s <= 10
+                and 0 < self.approach_yaw_slew_deg_s <= 20):
+            raise ValueError("invalid final automatic approach attitude limits")
+        self.approach_previous_target = self.approach_previous_at = None
+        self.approach_target_publisher = rospy.Publisher("/attachment/approach_target_deg", Vector3Stamped, queue_size=10)
         self.recovery_previous_target = None
         self.recovery_previous_at = None
         self.recovery_target_publisher = rospy.Publisher("/attachment/recovery_target_deg", Vector3Stamped, queue_size=10)
@@ -752,6 +761,9 @@ class AttachmentOutputMuxNode:
             and status is not None and is_fresh(self.wall_status_at, self.status_timeout_s, now)
             and status.state in (WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_FRONT_WALL_DETECT,
                                  WallPerchStatus.STATE_STABILIZE_HOVER, WallPerchStatus.STATE_SLOW_APPROACH))
+        if getattr(self, "approach_attitude_limits_enabled", False):
+            # Automatic bias belongs only to confirmed approach, never to takeover fallback.
+            allowed = allowed and status.state == WallPerchStatus.STATE_SLOW_APPROACH and not status.approach_paused
         applied = 0.0
         if allowed:
             previous_at = getattr(self, "preflip_bias_at", None)
@@ -761,7 +773,7 @@ class AttachmentOutputMuxNode:
             values = (quaternion.x, quaternion.y, quaternion.z, quaternion.w)
             roll = euler_from_quaternion(values)[0]
             bound = math.radians(min(5.0, getattr(self, "rc_free_max_angle_deg", 5.0)))
-            applied = max(-bound, min(bound, roll+bias))-roll
+            applied = bias if getattr(self, "approach_attitude_limits_enabled", False) else max(-bound, min(bound, roll+bias))-roll
             values = trim_attitude(values, applied, 0.0)
             quaternion = Quaternion(x=values[0], y=values[1], z=values[2], w=values[3])
             self.preflip_bias_rad = bias
@@ -890,6 +902,42 @@ class AttachmentOutputMuxNode:
             target.thrust = min(1.0, max(0.0, float(thrust)))
         return target
 
+    def _limit_final_approach_target(self, now, target, source):
+        if not getattr(self, "approach_attitude_limits_enabled", False):
+            return target
+        status = getattr(self, "wall_status", None)
+        flight = getattr(self, "flight_state", None)
+        active = bool(getattr(self, "approach_attitude_limits_enabled", False)
+                      and source == AttachmentControlCandidate.SOURCE_WALL
+                      and status is not None and status.state == WallPerchStatus.STATE_SLOW_APPROACH
+                      and is_fresh(self.wall_status_at, self.status_timeout_s, now)
+                      and flight is not None and flight.mode.upper() == "OFFBOARD"
+                      and is_fresh(self.flight_state_at, self.state_timeout_s, now))
+        q = tuple(getattr(target.orientation, k) for k in "xyzw")
+        previous = getattr(self, "approach_previous_target", None)
+        previous_at = getattr(self, "approach_previous_at", None)
+        if active:
+            dt = max(0.0, min((now-previous_at).to_sec(), .1)) if previous_at is not None else .02
+            if previous is None or not is_fresh(previous_at, self.status_timeout_s, now):
+                measured = self.odom.pose.pose.orientation
+                previous = (measured.x, measured.y, measured.z, measured.w)
+                dt = .02
+            q, projected = limit_recovery_attitude(q, previous, dt,
+                math.radians(self.approach_max_tilt_deg), math.radians(self.approach_tilt_slew_deg_s),
+                math.radians(self.approach_yaw_slew_deg_s))
+            if projected:
+                rospy.logwarn_throttle(1.0, "Approach entry target outside cone: immediate projection before slew limiting")
+            target.orientation = Quaternion(x=q[0],y=q[1],z=q[2],w=q[3])
+            roll,pitch,_ = euler_from_quaternion(q)
+            axis,_ = axis_yaw(q)
+            telemetry = Vector3Stamped();telemetry.header.stamp = now
+            telemetry.vector.x = math.degrees(roll);telemetry.vector.y = math.degrees(pitch)
+            telemetry.vector.z = math.degrees(math.acos(max(-1.,min(1.,axis[2]))))
+            self.approach_target_publisher.publish(telemetry)
+        # Keep final sent history through ALTCTL prestream, including the RC correction.
+        self.approach_previous_target, self.approach_previous_at = q, now
+        return target
+
     def _limit_final_recovery_target(self, now, target, source):
         # This is after RC trim and setpoint-builder thrust handling.
         status = getattr(self, "wall_status", None)
@@ -928,6 +976,7 @@ class AttachmentOutputMuxNode:
             )
             if target is None:
                 return self.OUTPUT_NONE
+            target = self._limit_final_approach_target(now, target, candidate.source)
             self.attitude_publisher.publish(target)
             return self.OUTPUT_ATTITUDE_THRUST
         if candidate.kind == AttachmentControlCandidate.KIND_ATTITUDE_THRUST:
@@ -939,6 +988,7 @@ class AttachmentOutputMuxNode:
             )
             if target is not None:
                 target = self._limit_final_recovery_target(now, target, candidate.source)
+                target = self._limit_final_approach_target(now, target, candidate.source)
                 self.attitude_publisher.publish(target)
                 return self.OUTPUT_ATTITUDE_THRUST
         return self.OUTPUT_NONE
@@ -967,6 +1017,7 @@ class AttachmentOutputMuxNode:
                 if self._rc_ready(now):
                     target = self._prestream_attitude_target(now)
                     if target is not None:
+                        target = self._limit_final_approach_target(now, target, AttachmentControlCandidate.SOURCE_NONE)
                         self.attitude_publisher.publish(target)
                         output_mode = self.OUTPUT_ATTITUDE_THRUST
         elif self.output_enabled and self.owner != self.OWNER_NONE:

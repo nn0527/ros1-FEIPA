@@ -32,6 +32,7 @@ TOPICS = [
     "/attachment/rc_preview_deg",
     "/attachment/recovery_target_deg",
     "/attachment/preflip_roll_bias_deg",
+    "/attachment/approach_target_deg",
     "/attachment/recovery_horizontal_command", "/attachment/rc_input_age_ms",
     "/rosout", "/rosout_agg", "/clock",
 ]

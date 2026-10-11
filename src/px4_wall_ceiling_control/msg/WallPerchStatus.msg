@@ -55,3 +55,7 @@ bool detach_completed
 bool recovery_completed
 bool detach_pending
 string detach_block_reason
+
+# Automatic pre-flip approach mode and live sensor pause state.
+bool auto_approach_enabled
+bool approach_paused

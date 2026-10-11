@@ -54,6 +54,12 @@ class WallPerchDecisionNode:
     def __init__(self):
         install_kill_guard(self, rospy, String)
         self.manual_approach = bool(rospy.get_param("~manual_approach", False))
+        self.manager_phase = None
+        self.manager_phase_received_at = None
+        self.manager_phase_timeout_s = 0.5
+        self.auto_approach = bool(rospy.get_param("~auto_approach", False))
+        if self.manual_approach and self.auto_approach:
+            raise ValueError("manual and automatic approach cannot both be enabled")
         self.flip_thrust_follow_tilt = bool(rospy.get_param("~flip_thrust_follow_tilt", False))
         self.decision_enabled = bool(rospy.get_param("~decision_enabled", False))
         self.front_ready_distance_m = float(
@@ -347,6 +353,7 @@ class WallPerchDecisionNode:
             AttachmentControlCandidate,
             queue_size=10,
         )
+        rospy.Subscriber("/attachment/flight_phase", String, self._on_manager_phase, queue_size=10)
         rospy.Subscriber(
             rospy.get_param("~front_range_topic", "/sensor/front/range"),
             Range,
@@ -474,6 +481,9 @@ class WallPerchDecisionNode:
 
     def _on_front_range(self, message):
         if not is_valid_range(message):
+            if getattr(self, "auto_approach", False) and self._approach_stage():
+                self.front_ready_since = self.front_ready_last_sample_at = None
+                self.flip_ready_since = self.flip_ready_last_sample_at = None
             return
         now = rospy.Time.now()
         previous = (
@@ -490,7 +500,8 @@ class WallPerchDecisionNode:
             self.front_ready_since,
             self.front_ready_last_sample_at,
         ) = self._record_hold_sample(
-            self.front_filtered_m < self.front_ready_distance_m,
+            self.front_filtered_m <= self.front_ready_distance_m
+            and (not getattr(self, "auto_approach", False) or not self._approach_stage() or self._auto_approach_ranges_ready(now)),
             now,
             self.front_ready_since,
         )
@@ -498,13 +509,17 @@ class WallPerchDecisionNode:
             self.flip_ready_since,
             self.flip_ready_last_sample_at,
         ) = self._record_hold_sample(
-            self.front_filtered_m <= self.flip_trigger_distance_m,
+            self.front_filtered_m <= self.flip_trigger_distance_m
+            and (not getattr(self, "auto_approach", False) or not self._approach_stage() or self._auto_approach_ranges_ready(now)),
             now,
             self.flip_ready_since,
         )
 
     def _on_top_range(self, message):
         if not is_valid_range(message):
+            if getattr(self, "auto_approach", False) and self._approach_stage():
+                self.front_ready_since = self.front_ready_last_sample_at = None
+                self.flip_ready_since = self.flip_ready_last_sample_at = None
             # A bad sample must not count toward continuous contact confirmation.
             # Keep the last valid range and its original timestamp for the
             # bounded bench safety grace; never refresh them with invalid data.
@@ -566,6 +581,9 @@ class WallPerchDecisionNode:
     def _on_sensor_health(self, message):
         self.sensor_health = message
         self.sensor_health_received_at = rospy.Time.now()
+        if getattr(self, "auto_approach", False) and self._approach_stage() and not (message.front_valid and message.ceiling_valid):
+            self.front_ready_since = self.front_ready_last_sample_at = None
+            self.flip_ready_since = self.flip_ready_last_sample_at = None
 
     def _on_odom(self, message):
         self.odom = message
@@ -885,6 +903,19 @@ class WallPerchDecisionNode:
             return float(message.range)
         return None
 
+    def _on_manager_phase(self, message):
+        self.manager_phase = message.data
+        self.manager_phase_received_at = rospy.Time.now()
+
+    def _auto_takeover_confirmed(self, now):
+        received = self.manager_phase_received_at
+        return bool(self.manager_phase == "ACTIVE" and received is not None
+                    and 0.0 <= (now - received).to_sec() <= self.manager_phase_timeout_s)
+
+    def _auto_approach_ranges_ready(self, now):
+        # Strict measured-input gate; no error-code grace or retained valid bit.
+        return self._bench_ranges_ready(now)
+
     def _bench_ranges_ready(self, now):
         return bool(self._sensor_health_fresh(now) and self.sensor_health.front_valid
                     and self.sensor_health.ceiling_valid and self._front_fresh(now)
@@ -979,6 +1010,9 @@ class WallPerchDecisionNode:
     def _safety_ok(self, now):
         if not self._flight_ready(now) or not self._odom_fresh(now):
             return False
+        if getattr(self, "auto_approach", False) and self._approach_stage():
+            # Sensor loss pauses autonomous motion, while flight/odom/kill failures still abort.
+            return self._rates_safe() and self._vertical_speed_safe()
         if not self._top_preflight_ready(now):
             return False
         if self._front_required() and not self._front_fresh(now):
@@ -1244,7 +1278,15 @@ class WallPerchDecisionNode:
                 self.cancel_requested = False
             altitude_ok = self._entry_height_ready()
             safety_ok = self._safety_ok(now)
-            if (mode_requested and not self.rearm_required and altitude_ok and safety_ok
+            if (getattr(self, "auto_approach", False) and mode_requested
+                    and not self._auto_takeover_confirmed(now)):
+                self.last_reason = "等待本次 OFFBOARD 接管确认"
+                return
+            if (getattr(self, "auto_approach", False) and mode_requested and not self.rearm_required
+                    and altitude_ok and safety_ok):
+                self._enter_state(WallPerchStatus.STATE_FRONT_WALL_DETECT, now, "automatic wall takeover confirmed")
+                self._enter_state(WallPerchStatus.STATE_SLOW_APPROACH, now, "自动接近：前倾3°；总时限20秒")
+            elif (mode_requested and not self.rearm_required and altitude_ok and safety_ok
                     and self._ignore_attachment_range_loss()
                     and (not self._bench_ranges_ready(now)
                          or (getattr(self, "manual_approach", False) and not self._flip_ready(now)))):
@@ -1295,7 +1337,21 @@ class WallPerchDecisionNode:
                 self._enter_state(WallPerchStatus.STATE_SLOW_APPROACH, now, "hover stabilized")
 
         elif self.state == WallPerchStatus.STATE_SLOW_APPROACH:
-            if not self._safety_ok(now):
+            if getattr(self, "auto_approach", False):
+                if not self._safety_ok(now):
+                    self.fault_count += 1
+                    self._enter_state(WallPerchStatus.STATE_ABORT, now, "automatic approach flight or odometry failure")
+                elif self._state_age(now) >= self.approach_timeout_s:
+                    self.fault_count += 1
+                    self._enter_state(WallPerchStatus.STATE_ABORT, now, "自动接近超时：总时限20秒，含测距暂停")
+                elif not self._auto_approach_ranges_ready(now):
+                    self.flip_ready_since = self.flip_ready_last_sample_at = None
+                    self.last_reason = "自动接近暂停：雷达无效或过期，自主目标返回水平；总时限20秒"
+                elif self._flip_ready(now):
+                    self._enter_state(WallPerchStatus.STATE_FLIP_TO_WALL, now, "flip distance reached")
+                else:
+                    self.last_reason = "自动接近：前倾3°；等待前距≤0.20 m连续0.30 s"
+            elif not self._safety_ok(now):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "approach safety failure")
             elif (self._bench_waiting() or self._ignore_attachment_range_loss()) and not self._bench_ranges_ready(now):
@@ -1437,6 +1493,7 @@ class WallPerchDecisionNode:
 
     def _candidate(self, now):
         if (self.state == WallPerchStatus.STATE_SLOW_APPROACH
+                and not getattr(self, "auto_approach", False)
                 and (self._bench_waiting() or self._ignore_attachment_range_loss())
                 and not self._bench_ranges_ready(now)):
             return True, None, math.nan, 0.0
@@ -1449,7 +1506,10 @@ class WallPerchDecisionNode:
         progress = 0.0
 
         if self.state == WallPerchStatus.STATE_SLOW_APPROACH:
-            pitch = (0.0, math.sin(self.approach_pitch_rad * 0.5), 0.0, math.cos(self.approach_pitch_rad * 0.5))
+            angle = self.approach_pitch_rad
+            if getattr(self, "auto_approach", False) and not self._auto_approach_ranges_ready(now):
+                angle = 0.0
+            pitch = (0.0, math.sin(angle * 0.5), 0.0, math.cos(angle * 0.5))
             quaternion = self._quat_normalize(self._quat_multiply(self.q_hover, pitch))
             thrust = self.approach_thrust
         elif self.state == WallPerchStatus.STATE_FLIP_TO_WALL:
@@ -1529,6 +1589,7 @@ class WallPerchDecisionNode:
 
     def _acquire_requested(self, now):
         return bool((self.state == WallPerchStatus.STATE_FRONT_WALL_DETECT
+                     or (getattr(self, "auto_approach", False) and self.state == WallPerchStatus.STATE_SLOW_APPROACH)
                      or (getattr(self, "manual_approach", False) and self.state == WallPerchStatus.STATE_FLIP_TO_WALL))
                     and self._mode_requested(now) and self._safety_ok(now))
 
@@ -1560,9 +1621,12 @@ class WallPerchDecisionNode:
             and self._safety_ok(now) and self._detach_pose_ready(now)
             and self.top_filtered_m is not None and self.top_filtered_m <= self.top_clear_distance_m)
         status.flight_state_fresh = self._flight_ready(now)
+        status.auto_approach_enabled = getattr(self, "auto_approach", False)
+        status.approach_paused = bool(status.auto_approach_enabled and self.state == WallPerchStatus.STATE_SLOW_APPROACH
+                                      and not self._auto_approach_ranges_ready(now))
         status.front_ready = self._held_status(
             status.front_range_fresh
-            and self.front_filtered_m < self.front_ready_distance_m,
+            and self.front_filtered_m <= self.front_ready_distance_m,
             self.front_ready_since,
             self.front_ready_last_sample_at,
             self.front_ready_hold_s,

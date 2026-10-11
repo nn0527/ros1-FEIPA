@@ -85,7 +85,8 @@ class ConsoleState:
             self.samples[name] = {"at": self.clock(), "value": value}
             if name in ("phase", "reason", "owner") and (not previous or previous["value"] != value):
                 self.event({"phase": "控制阶段", "reason": "阶段反馈", "owner": "输出归属"}[name] + ": " + str(value))
-            if name == "wall" and (not previous or previous["value"]["state_name"] != value["state_name"]):
+            if name == "wall" and (not previous or previous["value"]["state_name"] != value["state_name"]
+                    or previous["value"].get("reason") != value.get("reason")):
                 self.event("贴墙阶段: " + value["state_name"] + " · " + value["reason"])
             if name == "state" and (not previous or previous["value"] != value):
                 self.event("飞控: {} / {} / {}".format("已连接" if value["connected"] else "断开",

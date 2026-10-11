@@ -52,6 +52,9 @@ class FlightModeManagerNode:
         self.operator_timeout_s = float(rospy.get_param("~operator_timeout_s", 0.5))
         self.sensor_timeout_s = float(rospy.get_param("~sensor_timeout_s", 0.5))
         self.wall_manual_approach = bool(rospy.get_param("~wall_manual_approach", False))
+        self.wall_auto_approach = bool(rospy.get_param("~wall_auto_approach", False))
+        if self.wall_manual_approach and self.wall_auto_approach:
+            raise ValueError("manual and automatic wall approach cannot both be enabled")
         self.manual_wall_wait_timeout_s = max(2.0, float(rospy.get_param("~manual_wall_wait_timeout_s", 60.0)))
         self.manual_wall_wait_started = None
         self.manual_wait_canceled = False
@@ -324,6 +327,23 @@ class FlightModeManagerNode:
         if message.data and self.phase == self.WAITING_WALL:
             self.manual_wait_canceled = True
 
+    def _auto_wall_selected(self):
+        return getattr(self, "wall_auto_approach", False) and self.selected_mode == OperatorCommand.MODE_WALL
+
+    def _gated_wall_selected(self):
+        return self._manual_wall_selected() or self._auto_wall_selected()
+
+    def _wall_takeover_ready(self, now):
+        if not self._auto_wall_selected():
+            return self._manual_wall_ready(now)
+        wall = self.wall
+        return bool(wall is not None and is_fresh(self.wall_at, self.status_timeout_s, now)
+                    and wall.state == WallPerchStatus.STATE_IDLE and wall.front_ready
+                    and wall.front_range_fresh and wall.top_range_fresh and wall.sensor_health_fresh
+                    and wall.top_preflight_ready and wall.entry_height_ready
+                    and self.sensor is not None and is_fresh(self.sensor_at, self.sensor_timeout_s, now)
+                    and self.sensor.front_valid and self.sensor.ceiling_valid)
+
     def _manual_wall_selected(self):
         return getattr(self, "wall_manual_approach", False) and self.selected_mode == OperatorCommand.MODE_WALL
 
@@ -341,6 +361,8 @@ class FlightModeManagerNode:
 
     def _manual_wait_reason(self, now, monotonic_now):
         remaining = max(0.0, self.manual_wall_wait_timeout_s - self._manual_wait_elapsed(monotonic_now))
+        if self._auto_wall_selected():
+            return "等待自动接近接管：保持 ALTCTL；前距≤0.50 m连续0.40 s且两路雷达有效，等待窗口剩余 {:.0f} 秒".format(remaining)
         return "等待飞手手动接近：保持 ALTCTL；需有效距离连续满足翻转阈值，等待窗口剩余 {:.0f} 秒".format(remaining)
 
     def _stream_ready(self, now):
@@ -520,7 +542,7 @@ class FlightModeManagerNode:
                     or self._requested_mode(rospy.Time.now()) != self.selected_mode
                     or not self._preflight_ready(rospy.Time.now(), self.selected_mode)
                     or not self._stream_ready(rospy.Time.now())
-                    or (self._manual_wall_selected() and not self._manual_wall_ready(rospy.Time.now()))
+                    or (self._gated_wall_selected() and not self._wall_takeover_ready(rospy.Time.now()))
                 ):
                     return
             elif mode == "ALTCTL":
@@ -585,7 +607,7 @@ class FlightModeManagerNode:
                 self.takeover_attempt = getattr(self, "takeover_attempt", 0) + 1
                 self.offboard_request = None
                 self.selected_mode = requested
-                if self._manual_wall_selected():
+                if self._gated_wall_selected():
                     self.manual_wall_wait_started = monotonic_now
                     self._set_phase(self.WAITING_WALL, reason=self._manual_wait_reason(now, monotonic_now))
                 else:
@@ -629,10 +651,10 @@ class FlightModeManagerNode:
                     self.stream_since = monotonic_now
                 stream_warm = (self.stream_since is not None
                                and monotonic_now - self.stream_since >= self.prestream_s)
-                if stream_warm and self._manual_wall_ready(now):
+                if stream_warm and self._wall_takeover_ready(now):
                     self._set_phase(self.ENTERING)
                     self._request_mode("OFFBOARD")
-                elif self._manual_wall_ready(now):
+                elif self._wall_takeover_ready(now):
                     self.phase_reason = "距离条件已满足；等待并行预发送完成，仍由飞手控制 ALTCTL"
                 else:
                     self.phase_reason = self._manual_wait_reason(now, monotonic_now)
@@ -670,7 +692,13 @@ class FlightModeManagerNode:
                     self._reset(lock=True, reason=self.wall.reason)
                 self.cancel_pub.publish(String(data="cancel"))
             elif flight_fresh and flight_mode == "OFFBOARD":
-                if (self._manual_wall_selected() and not self._manual_wall_ready(now)
+                if self._auto_wall_selected():
+                    if self._current_offboard_request(monotonic_now):
+                        self._set_phase(self.ACTIVE, reason="PX4 OFFBOARD接管已确认；开始受限自动接近")
+                    else:
+                        self._set_phase(self.RETURNING, reason="未确认本次 OFFBOARD 请求；取消自动接近")
+                        self.cancel_pub.publish(String(data="cancel"))
+                elif (self._manual_wall_selected() and not self._manual_wall_ready(now)
                     and not self._wall_flip_started(now)):
                     if getattr(self, "ignore_range_loss_during_attachment", False):
                         self.phase_reason = "接管等待：距离条件失效，保持中性输出，等待有效距离后翻转"
@@ -712,6 +740,10 @@ class FlightModeManagerNode:
                 self._reset(lock=True, reason=failure_reason)
             else:
                 self._observe_completion(now)
+                if (self._auto_wall_selected() and self.wall is not None
+                        and is_fresh(self.wall_at, self.status_timeout_s, now)
+                        and self.wall.state == WallPerchStatus.STATE_SLOW_APPROACH):
+                    self.phase_reason = self.wall.reason
                 if (self.completed and self.owner_seen
                     and (self.owner == 0 or (self.selected_mode == OperatorCommand.MODE_WALL and self.owner == 2))
                     and is_fresh(self.owner_at, self.output_timeout_s, now)):
