@@ -949,5 +949,76 @@ class FlightHandoverTest(unittest.TestCase):
         self.assertEqual(node.mode, OperatorCommand.MODE_STANDBY)
 
 
+class PreflipBiasTest(unittest.TestCase):
+    def node(self):
+        node = OutputMux.__new__(OutputMux)
+        now = rospy.Time.from_sec(10)
+        node.preflip_right_roll_deg = 1.0
+        node.preflip_roll_slew_deg_s = 5.0
+        node.preflip_bias_rad = 0.0
+        node.preflip_bias_at = rospy.Time.from_sec(9.9)
+        node.preflip_bias_publisher = mock.Mock()
+        node.flight_state = State(connected=True, armed=True, mode="OFFBOARD")
+        node.flight_state_at = node.wall_status_at = node.operator_at = now
+        node.state_timeout_s = 1.5
+        node.status_timeout_s = .3
+        node.operator_timeout_s = .5
+        node.wall_status = WallPerchStatus(state=WallPerchStatus.STATE_IDLE)
+        node.operator = OperatorCommand(enable_control=True, mode=OperatorCommand.MODE_WALL)
+        node.rc_free_max_angle_deg = 5.0
+        return node, now
+
+    def test_right_thrust_direction_and_ramp(self):
+        from px4_wall_ceiling_control.domain.geometry import rotate_vector
+        node, now = self.node()
+        q = Quaternion(w=1)
+        first = node._preflip_bias_attitude(now, q, AttachmentControlCandidate.SOURCE_NONE)
+        self.assertAlmostEqual(math.degrees(euler_from_quaternion((first.x,first.y,first.z,first.w))[0]), .5)
+        later = node._preflip_bias_attitude(rospy.Time.from_sec(10.1), q, AttachmentControlCandidate.SOURCE_NONE)
+        v = rotate_vector((later.x,later.y,later.z,later.w), (0,0,1))
+        self.assertLess(v[1], 0)  # FLU -Y is aircraft right.
+        self.assertAlmostEqual(math.degrees(math.asin(-v[1])), 1)
+
+    def test_only_preflip_phases_and_immediate_clear(self):
+        node, now = self.node()
+        for state in range(WallPerchStatus.STATE_ABORT+1):
+            node.wall_status.state = state
+            node.preflip_bias_rad = math.radians(1)
+            q = node._preflip_bias_attitude(now, Quaternion(w=1), AttachmentControlCandidate.SOURCE_WALL)
+            roll = euler_from_quaternion((q.x,q.y,q.z,q.w))[0]
+            if state <= WallPerchStatus.STATE_SLOW_APPROACH:
+                self.assertAlmostEqual(roll, math.radians(1))
+            else:
+                self.assertEqual(roll, 0)
+                self.assertEqual(node.preflip_bias_rad, 0)
+
+    def test_combined_roll_cap_and_preserves_yaw(self):
+        from px4_wall_ceiling_control.domain.geometry import quaternion_multiply
+        node, now = self.node()
+        node.preflip_bias_rad = math.radians(1)
+        q = quaternion_multiply((0,0,math.sin(.7),math.cos(.7)),
+                                (math.sin(math.radians(5)/2),0,0,math.cos(math.radians(5)/2)))
+        out = node._preflip_bias_attitude(now, Quaternion(x=q[0],y=q[1],z=q[2],w=q[3]), AttachmentControlCandidate.SOURCE_NONE)
+        roll,pitch,yaw = euler_from_quaternion((out.x,out.y,out.z,out.w))
+        self.assertAlmostEqual(math.degrees(roll), 5)
+        self.assertAlmostEqual(pitch, 0)
+        self.assertAlmostEqual(yaw, 1.4)
+
+    def test_invalid_feedback_altctl_ceiling_and_released_request_clear(self):
+        for case in ("stale_status", "stale_fcu", "ALTCTL", "ceiling", "released", "disarmed"):
+            node, now = self.node()
+            node.preflip_bias_rad = math.radians(1)
+            source = AttachmentControlCandidate.SOURCE_NONE
+            if case == "stale_status": node.wall_status_at = rospy.Time.from_sec(9)
+            if case == "stale_fcu": node.flight_state_at = rospy.Time.from_sec(8)
+            if case == "ALTCTL": node.flight_state.mode = "ALTCTL"
+            if case == "ceiling": source = AttachmentControlCandidate.SOURCE_CEILING
+            if case == "released": node.operator.enable_control = False
+            if case == "disarmed": node.flight_state.armed = False
+            q = node._preflip_bias_attitude(now, Quaternion(w=1), source)
+            self.assertEqual(q.x, 0)
+            self.assertEqual(node.preflip_bias_rad, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

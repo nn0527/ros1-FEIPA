@@ -131,6 +131,14 @@ class AttachmentOutputMuxNode:
         self.recovery_previous_at = None
         self.recovery_target_publisher = rospy.Publisher("/attachment/recovery_target_deg", Vector3Stamped, queue_size=10)
         self.recovery_horizontal_publisher = rospy.Publisher("/attachment/recovery_horizontal_command", Float32, queue_size=10)
+        self.preflip_right_roll_deg = float(rospy.get_param("~preflip_right_roll_deg", 0.0))
+        self.preflip_roll_slew_deg_s = float(rospy.get_param("~preflip_roll_slew_deg_s", 5.0))
+        if not (math.isfinite(self.preflip_right_roll_deg) and 0 <= self.preflip_right_roll_deg <= 5
+                and math.isfinite(self.preflip_roll_slew_deg_s) and 0 < self.preflip_roll_slew_deg_s <= 10):
+            raise ValueError("invalid preflip right-roll compensation")
+        self.preflip_bias_rad = 0.0
+        self.preflip_bias_at = None
+        self.preflip_bias_publisher = rospy.Publisher("/attachment/preflip_roll_bias_deg", Float32, queue_size=10)
         self.rc_yaw_rad = 0.0
         self.rc_calibration = {}
         if self.rc_roll_yaw_enabled:
@@ -693,9 +701,9 @@ class AttachmentOutputMuxNode:
 
     def _assisted_attitude(self, now, quaternion, source):
         if not getattr(self, "rc_assist_enabled", False):
-            return quaternion
+            return self._preflip_bias_attitude(now, quaternion, source)
         if getattr(self, "rc_roll_yaw_enabled", False):
-            return self._roll_yaw_attitude(now, quaternion, source)
+            return self._preflip_bias_attitude(now, self._roll_yaw_attitude(now, quaternion, source), source)
         limits = self._rc_limits(now, source)
         if not self._rc_ready(now):
             rospy.logwarn_throttle(1.0, "RC attitude assist unavailable; trim returning to zero")
@@ -729,7 +737,42 @@ class AttachmentOutputMuxNode:
         self.rc_trim_at = now
         values = (quaternion.x, quaternion.y, quaternion.z, quaternion.w)
         x, y, z, w = trim_attitude(values, self.rc_roll_rad, self.rc_pitch_rad)
-        return Quaternion(x=x, y=y, z=z, w=w)
+        return self._preflip_bias_attitude(now, Quaternion(x=x, y=y, z=z, w=w), source)
+
+    def _preflip_bias_attitude(self, now, quaternion, source):
+        # ROS body FLU: positive roll tilts upward thrust toward body right (-Y).
+        flight = getattr(self, "flight_state", None)
+        status = getattr(self, "wall_status", None)
+        allowed = bool(
+            getattr(self, "preflip_right_roll_deg", 0.0) > 0
+            and source in (AttachmentControlCandidate.SOURCE_NONE, AttachmentControlCandidate.SOURCE_WALL)
+            and flight is not None and flight.connected and flight.armed and flight.mode.upper() == "OFFBOARD"
+            and is_fresh(self.flight_state_at, self.state_timeout_s, now)
+            and self._operator_mode(now) == OperatorCommand.MODE_WALL
+            and status is not None and is_fresh(self.wall_status_at, self.status_timeout_s, now)
+            and status.state in (WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_FRONT_WALL_DETECT,
+                                 WallPerchStatus.STATE_STABILIZE_HOVER, WallPerchStatus.STATE_SLOW_APPROACH))
+        applied = 0.0
+        if allowed:
+            previous_at = getattr(self, "preflip_bias_at", None)
+            dt = max(0.0, min((now-previous_at).to_sec() if previous_at is not None else .02, .1))
+            bias = slew(getattr(self, "preflip_bias_rad", 0.0), math.radians(self.preflip_right_roll_deg),
+                        math.radians(self.preflip_roll_slew_deg_s)*dt)
+            values = (quaternion.x, quaternion.y, quaternion.z, quaternion.w)
+            roll = euler_from_quaternion(values)[0]
+            bound = math.radians(min(5.0, getattr(self, "rc_free_max_angle_deg", 5.0)))
+            applied = max(-bound, min(bound, roll+bias))-roll
+            values = trim_attitude(values, applied, 0.0)
+            quaternion = Quaternion(x=values[0], y=values[1], z=values[2], w=values[3])
+            self.preflip_bias_rad = bias
+        else:
+            # Clear immediately on phase loss; never carry this bias into flip or recovery.
+            self.preflip_bias_rad = 0.0
+        self.preflip_bias_at = now
+        publisher = getattr(self, "preflip_bias_publisher", None)
+        if publisher is not None:
+            publisher.publish(Float32(data=math.degrees(applied)))
+        return quaternion
 
     def _level_attitude(self):
         orientation = self.odom.pose.pose.orientation
