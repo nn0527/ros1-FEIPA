@@ -3,7 +3,7 @@
   <arg name="ceiling_serial_port" default="/dev/ttyUSB1" />
   <arg name="front_serial_port" default="/dev/ttyUSB2" />
   <arg name="hover_thrust" default="0.45" />
-  <arg name="preflip_right_roll_deg" default="1.0" />
+  <arg name="preflip_right_roll_deg" default="1.7" />
   <arg name="restrained_bench" default="false" />
   <include file="$(find px4_wall_ceiling_control)/launch/system/attachment_system_mavros.launch">
     <arg name="ceiling_serial_port" value="$(arg ceiling_serial_port)" />
