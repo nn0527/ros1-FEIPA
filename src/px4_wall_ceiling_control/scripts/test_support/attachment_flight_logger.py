@@ -29,7 +29,9 @@ TOPICS = [
     "/sensor/front/raw", "/sensor/front/range", "/sensor/ceiling/raw", "/sensor/ceiling/range",
     "/sensor/health", "/operator/command", "/attachment/output_owner", "/attachment/output_mode",
     "/attachment/flight_phase", "/attachment/flight_phase_reason", "/attachment/prestream",
-    "/attachment/rc_preview_deg", "/attachment/rc_input_age_ms",
+    "/attachment/rc_preview_deg",
+    "/attachment/recovery_target_deg",
+    "/attachment/recovery_horizontal_command", "/attachment/rc_input_age_ms",
     "/rosout", "/rosout_agg", "/clock",
 ]
 

@@ -33,6 +33,7 @@
   <arg name="fcu_target_timeout_s" default="0.20" />
   <arg name="rc_assist_enabled" default="false" />
   <arg name="rc_roll_yaw_enabled" default="false" />
+  <arg name="recovery_attitude_limits_enabled" default="false" />
   <arg name="require_rc_center" default="false" />
   <arg name="rc_roll_channel_index" default="-1" />
   <arg name="rc_pitch_channel_index" default="-1" />
@@ -156,6 +157,11 @@
     <param name="wall_output_enabled" value="$(arg wall_enabled)" />
     <param name="rc_assist_enabled" value="$(arg rc_assist_enabled)" />
     <param name="rc_roll_yaw_enabled" value="$(arg rc_roll_yaw_enabled)" />
+    <param name="recovery_attitude_limits_enabled" value="$(arg recovery_attitude_limits_enabled)" />
+    <param name="recovery_max_tilt_deg" value="5.0" />
+    <param name="recovery_tilt_slew_deg_s" value="10.0" />
+    <param name="recovery_yaw_slew_deg_s" value="20.0" />
+    <param name="recovery_final_thrust_cap" value="0.60" />
     <param if="$(arg rc_roll_yaw_enabled)" name="rc_free_max_angle_deg" value="5.0" />
     <param if="$(arg rc_roll_yaw_enabled)" name="rc_wall_detach_roll_deg" value="3.0" />
     <param if="$(arg rc_roll_yaw_enabled)" name="rc_slew_deg_s" value="10.0" />

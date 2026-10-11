@@ -30,6 +30,7 @@ from px4_wall_ceiling_control.domain.rc_attitude_assist import (
     stick_fraction,
     trim_attitude,
 )
+from px4_wall_ceiling_control.domain.recovery_attitude_limits import limit_recovery_attitude, axis_yaw
 from px4_wall_ceiling_control.domain.safety import flight_state_ready
 from px4_wall_ceiling_control.freshness import is_fresh
 from px4_wall_ceiling_control.msg import (
@@ -118,6 +119,18 @@ class AttachmentOutputMuxNode:
         self.rc_yaw_contact_deg = float(rospy.get_param("~rc_yaw_contact_deg", 3.0))
         self.rc_yaw_detach_deg = float(rospy.get_param("~rc_yaw_detach_deg", 5.0))
         self.rc_yaw_slew_deg_s = float(rospy.get_param("~rc_yaw_slew_deg_s", 20.0))
+        self.recovery_attitude_limits_enabled = bool(rospy.get_param("~recovery_attitude_limits_enabled", False))
+        self.recovery_max_tilt_deg = float(rospy.get_param("~recovery_max_tilt_deg", 5.0))
+        self.recovery_tilt_slew_deg_s = float(rospy.get_param("~recovery_tilt_slew_deg_s", 10.0))
+        self.recovery_yaw_slew_deg_s = float(rospy.get_param("~recovery_yaw_slew_deg_s", 20.0))
+        self.recovery_final_thrust_cap = float(rospy.get_param("~recovery_final_thrust_cap", 0.60))
+        if not (0 < self.recovery_max_tilt_deg < 45 and 0 < self.recovery_tilt_slew_deg_s <= 90
+                and 0 < self.recovery_yaw_slew_deg_s <= 90 and 0.1 <= self.recovery_final_thrust_cap <= 1.0):
+            raise ValueError("invalid final recovery attitude limits")
+        self.recovery_previous_target = None
+        self.recovery_previous_at = None
+        self.recovery_target_publisher = rospy.Publisher("/attachment/recovery_target_deg", Vector3Stamped, queue_size=10)
+        self.recovery_horizontal_publisher = rospy.Publisher("/attachment/recovery_horizontal_command", Float32, queue_size=10)
         self.rc_yaw_rad = 0.0
         self.rc_calibration = {}
         if self.rc_roll_yaw_enabled:
@@ -834,6 +847,37 @@ class AttachmentOutputMuxNode:
             target.thrust = min(1.0, max(0.0, float(thrust)))
         return target
 
+    def _limit_final_recovery_target(self, now, target, source):
+        # This is after RC trim and setpoint-builder thrust handling.
+        status = getattr(self, "wall_status", None)
+        flight = getattr(self, "flight_state", None)
+        active = (getattr(self, "recovery_attitude_limits_enabled", False)
+                  and source == AttachmentControlCandidate.SOURCE_WALL
+                  and status is not None
+                  and status.state in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT)
+                  and is_fresh(self.wall_status_at, self.status_timeout_s, now)
+                  and flight is not None and flight.mode.upper() == "OFFBOARD"
+                  and is_fresh(self.flight_state_at, self.state_timeout_s, now))
+        q = tuple(getattr(target.orientation, k) for k in "xyzw")
+        if active:
+            dt = max(0.0, min((now-self.recovery_previous_at).to_sec(), .1)) if self.recovery_previous_at is not None else .02
+            q, projected = limit_recovery_attitude(
+                q, self.recovery_previous_target, dt, math.radians(self.recovery_max_tilt_deg),
+                math.radians(self.recovery_tilt_slew_deg_s), math.radians(self.recovery_yaw_slew_deg_s))
+            if projected:
+                rospy.logwarn_throttle(1.0, "Recovery entry target outside cone: immediate projection before slew limiting")
+            target.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+            target.thrust = min(target.thrust, self.recovery_final_thrust_cap)
+            axis, yaw = axis_yaw(q)
+            preview = Vector3Stamped();preview.header.stamp = now
+            preview.vector.x = math.degrees(math.acos(max(-1.0, min(1.0, axis[2]))))
+            preview.vector.y = math.degrees(yaw);preview.vector.z = target.thrust
+            self.recovery_target_publisher.publish(preview)
+            self.recovery_horizontal_publisher.publish(Float32(data=target.thrust*math.hypot(axis[0], axis[1])))
+        # Record the actual final target also in preceding protected phases.
+        self.recovery_previous_target, self.recovery_previous_at = q, now
+        return target
+
     def _publish_candidate(self, now, candidate):
         if candidate.kind == AttachmentControlCandidate.KIND_VERTICAL_VELOCITY:
             target = self._vertical_attitude_target(
@@ -851,6 +895,7 @@ class AttachmentOutputMuxNode:
                 now, orientation, candidate.thrust_normalized
             )
             if target is not None:
+                target = self._limit_final_recovery_target(now, target, candidate.source)
                 self.attitude_publisher.publish(target)
                 return self.OUTPUT_ATTITUDE_THRUST
         return self.OUTPUT_NONE
