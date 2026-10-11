@@ -293,7 +293,7 @@ class WallPerchDecisionNode:
         self.state_entered_at = rospy.Time.now()
         self.front_range = None
         self.front_received_at = None
-        self.approach_abort_front_distance_m = float(rospy.get_param("~approach_abort_front_distance_m", 1.0))
+        self.approach_abort_front_distance_m = float(rospy.get_param("~approach_abort_front_distance_m", 1.3))
         self.approach_far_sample = None
         self.front_filtered_m = None
         self.top_range = None
@@ -481,7 +481,7 @@ class WallPerchDecisionNode:
             if not is_fresh(self.front_received_at, self.sensor_timeout_s, now)
             else self.front_filtered_m
         )
-        if self._approach_stage() and self._mode_requested(now) and message.range > getattr(self, "approach_abort_front_distance_m", 1.0):
+        if self._approach_stage() and self._mode_requested(now) and message.range > getattr(self, "approach_abort_front_distance_m", 1.3):
             self.approach_far_sample = (now, float(message.range))
         self.front_range = message
         self.front_received_at = now
@@ -881,7 +881,7 @@ class WallPerchDecisionNode:
         message = getattr(self, "front_range", None)
         if (message is not None and self._front_fresh(now) and is_valid_range(message)
                 and self._sensor_health_fresh(now) and self.sensor_health.front_valid
-                and message.range > getattr(self, "approach_abort_front_distance_m", 1.0)):
+                and message.range > getattr(self, "approach_abort_front_distance_m", 1.3)):
             return float(message.range)
         return None
 
@@ -1234,7 +1234,7 @@ class WallPerchDecisionNode:
                 self.approach_far_sample = None
                 self._enter_state(WallPerchStatus.STATE_ABORT, now,
                     "approach front distance {:.3f} m exceeds {:.3f} m".format(
-                        far_distance, getattr(self, "approach_abort_front_distance_m", 1.0)))
+                        far_distance, getattr(self, "approach_abort_front_distance_m", 1.3)))
                 return
 
         if self.state == WallPerchStatus.STATE_IDLE:

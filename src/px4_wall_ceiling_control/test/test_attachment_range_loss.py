@@ -66,10 +66,10 @@ class AttachmentRangeLossTest(m.HoldRangeLossTest):
   node._capture_attitude_references=lambda:None
   entered=[];node._enter_state=lambda state,now,reason:entered.append((state,reason))
   for state in [S.STATE_IDLE,S.STATE_FRONT_WALL_DETECT,S.STATE_STABILIZE_HOVER,S.STATE_SLOW_APPROACH]:
-   node.state=state;node.approach_far_sample=(self.now,1.001)
+   node.state=state;node.approach_far_sample=(self.now,1.301)
    node._update_state_machine(self.now)
    self.assertEqual(entered[-1][0],S.STATE_ABORT)
-   self.assertIn("1.001 m exceeds 1.000 m",entered[-1][1])
+   self.assertIn("1.301 m exceeds 1.300 m",entered[-1][1])
   self.assertEqual(node.fault_count,4)
   for state in [S.STATE_FLIP_TO_WALL,S.STATE_WALL_CAPTURE,S.STATE_WALL_HOLD,S.STATE_DETACH_ROTATE,S.STATE_RECOVER]:
    node.state=state;self.assertFalse(node._approach_stage())
@@ -80,11 +80,11 @@ class AttachmentRangeLossTest(m.HoldRangeLossTest):
   node._front_fresh=lambda now:True;node._sensor_health_fresh=lambda now:True
   from px4_wall_ceiling_control.msg import SensorHealth
   node.sensor_health=SensorHealth(front_valid=True)
-  node.front_range=Range(min_range=.01,max_range=40,range=1.0)
+  node.front_range=Range(min_range=.01,max_range=40,range=1.3)
   self.assertIsNone(node._approach_far_distance(self.now))
-  node.front_range.range=1.01;self.assertAlmostEqual(node._approach_far_distance(self.now),1.01)
+  node.front_range.range=1.31;self.assertAlmostEqual(node._approach_far_distance(self.now),1.31)
   node.front_range.range=float("nan");self.assertIsNone(node._approach_far_distance(self.now))
-  node.front_range.range=1.01;node._front_fresh=lambda now:False
+  node.front_range.range=1.31;node._front_fresh=lambda now:False
   self.assertIsNone(node._approach_far_distance(self.now))
   node.approach_far_sample=(rospy.Time.from_sec(9),1.5)
   self.assertIsNone(node._approach_far_distance(self.now))

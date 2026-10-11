@@ -35,7 +35,7 @@ wall_perch_decision_node:
   # 正常流程跳过STABILIZE_HOVER；保留参数仅用于旧状态兼容。
   stabilize_time_s: 0.00
   # Valid raw front distance above this limit aborts pre-flip approach.
-  approach_abort_front_distance_m: 1.0
+  approach_abort_front_distance_m: 1.3
   approach_timeout_s: 20.00
   flip_time_s: 2.00
   capture_time_s: 0.50
