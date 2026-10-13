@@ -19,7 +19,7 @@ import zipfile
 
 TOPICS = [
     "/wall_perch/status", "/wall_perch/control_candidate", "/wall_perch/detach", "/wall_perch/cancel",
-    "/ceiling_attachment/status", "/ceiling_attachment/control_candidate",
+    "/ceiling_attachment/status", "/ceiling_attachment/control_candidate", "/ceiling_attachment/detach",
     "/mavros/setpoint_raw/attitude", "/mavros/setpoint_raw/target_attitude",
     "/mavros/state", "/mavros/local_position/odom", "/mavros/local_position/velocity_local",
     "/mavros/imu/data", "/mavros/estimator_status", "/mavros/rc/in", "/mavros/rc/out",
@@ -154,10 +154,13 @@ class SignalSummary:
         if topic == "/wall_perch/status":
             event = "wall state={} reason={} faults={} candidate_valid={}".format(
                 message.state_name, message.reason, message.fault_count, message.candidate_valid)
+        elif topic == "/ceiling_attachment/status":
+            event = "ceiling state={} reason={} faults={} candidate_valid={}".format(
+                message.state_name, message.reason, message.fault_count, message.candidate_valid)
         elif topic == "/mavros/state":
             event = "PX4 connected={} armed={} mode={}".format(message.connected, message.armed, message.mode)
         elif topic in ("/attachment/flight_phase", "/attachment/flight_phase_reason",
-                       "/attachment/output_owner", "/attachment/output_mode", "/wall_perch/detach", "/wall_perch/cancel"):
+                       "/attachment/output_owner", "/attachment/output_mode", "/wall_perch/detach", "/wall_perch/cancel", "/ceiling_attachment/detach"):
             event = "{} {}".format(topic, message.data)
         elif topic in ("/rosout", "/rosout_agg") and message.level >= 4:
             event = "ROS level={} node={} {}".format(message.level, message.name, message.msg)
@@ -190,6 +193,12 @@ class SignalSummary:
                     "front_distance_raw_m", "front_distance_filtered_m", "top_distance_raw_m",
                     "top_distance_filtered_m", "top_range_fresh", "top_preflight_ready", "odom_fresh"):
             row["wall_" + key] = getattr(wall, key, None)
+        ceiling = sample("/ceiling_attachment/status", "ceiling")
+        for key in ("state_name", "reason", "candidate_valid", "fault_count", "range_fresh", "odom_fresh",
+                    "ceiling_distance_raw_m", "ceiling_distance_filtered_m", "activation_ready",
+                    "attach_confirmed", "detach_start_height_m", "descended_height_m", "detach_height_ready",
+                    "thrust_body_z_normalized", "approach_velocity_z_enu_mps", "detach_failed"):
+            row["ceiling_" + key] = getattr(ceiling, key, None)
         odom = sample("/mavros/local_position/odom", "odom")
         for key in ("x", "y", "z"):
             row["position_" + key + "_m"] = getattr(odom.pose.pose.position, key) if odom else None

@@ -187,10 +187,10 @@ class ConsoleState:
             ceiling_detach_ok = bool(runtime.get("enabled") and runtime.get("ceiling_enabled") and kill_ok
                 and flight.get("connected") and flight.get("armed") and flight.get("mode") == "OFFBOARD"
                 and ceiling.get("state_name") == "SURFACE_HOLD" and not ceiling.get("fault_detected")
-                and ceiling.get("range_fresh") and ceiling.get("odom_fresh")
+                and ceiling.get("odom_fresh")
                 and val("phase") == "ACTIVE" and val("owner") == 1
                 and val("operator", {}).get("mode") == 2 and val("operator", {}).get("enabled")
-                and status["setpoint"]["fresh"] and health.get("ceiling_valid")
+                and status["setpoint"]["fresh"]
                 and val("odom", {}).get("finite") and estimator.get("attitude") and estimator.get("vertical_velocity"))
             return {"can_ceiling": not ceiling_blockers, "ceiling_blockers": ceiling_blockers,
                     "can_ceiling_detach": ceiling_detach_ok, "status": status, "checks": [{"id": i, "label": label, "ok": ok, "reason": reason}
@@ -222,7 +222,7 @@ class ConsoleState:
             if not self.snapshot()["can_ceiling_detach"]:
                 raise ValueError("离顶要求当前吸顶保持、OFFBOARD及新鲜有效反馈")
             publish("detach")
-            self.event("已发送离顶请求；等待距离增加及恢复反馈")
+            self.event("已发送离顶请求；按PX4高度下降20cm后交回ALTCTL")
 
     def send_wall(self, publish):
         # Serialize the preflight check and dispatch across tabs and double clicks.

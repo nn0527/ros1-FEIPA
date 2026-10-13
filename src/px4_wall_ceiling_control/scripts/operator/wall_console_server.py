@@ -526,7 +526,7 @@ class RemoteRuntime:
                                   for a in text_args) and not any("wall_console_server.py" in a for a in text_args)
                     is_mavros = "/opt/ros/noetic/lib/mavros/mavros_node" in text_args
                     is_record = any("rosbag" in a for a in text_args) and any(
-                        a.startswith("/root/wall_test_records/") for a in text_args)
+                        a.startswith(("/root/wall_test_records/", "/root/ceiling_test/")) for a in text_args)
                     if is_launch or is_node or is_mavros or is_record:
                         targets[int(item.parent.name)] = item.read_bytes()
                 except (OSError, ValueError):
@@ -696,9 +696,10 @@ class SSHTransport:
                 result["can_detach"] = False
             ceiling_sources = ("runtime", "state", "odom", "estimator", "operator", "phase", "owner", "health", "kill", "ceiling_status", "ceiling")
             if not connected or not self.session.get("control") or any(not result["status"][n]["fresh"] for n in ceiling_sources):
-                result["can_ceiling"] = result["can_ceiling_detach"] = False
+                result["can_ceiling"] = False
                 result["ceiling_blockers"] = list(dict.fromkeys(result.get("ceiling_blockers", []) + ["吸顶所需实时反馈或控制权缺失"]))
-            if not result["status"]["setpoint"]["fresh"]:
+            ceiling_detach_sources = tuple(n for n in ceiling_sources if n not in ("health", "ceiling")) + ("setpoint",)
+            if not connected or not self.session.get("control") or any(not result["status"][n]["fresh"] for n in ceiling_detach_sources):
                 result["can_ceiling_detach"] = False
             result["config"] = config
             if not connected or stale:

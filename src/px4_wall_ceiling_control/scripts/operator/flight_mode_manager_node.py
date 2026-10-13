@@ -307,6 +307,8 @@ class FlightModeManagerNode:
             or getattr(self, "ignore_range_loss_during_attachment", False)
         ):
             return None  # The wall decision holds neutral until real ranges recover.
+        if selected == OperatorCommand.MODE_CEILING and getattr(self, "ceiling_distance_gate_enabled", False):
+            return None  # Decision pauses on range loss; takeover still requires its valid gate.
         if self.sensor is None:
             return "sensor health unavailable"
         if not is_fresh(self.sensor_at, self.sensor_timeout_s, now):
@@ -691,9 +693,6 @@ class FlightModeManagerNode:
                     if self._ceiling_takeover_ready(now):
                         self._set_phase(self.ENTERING)
                         self._request_mode("OFFBOARD")
-                    elif monotonic_now-self.phase_since >= 60:
-                        self.cancel_pub.publish(String(data="cancel"))
-                        self._reset(lock=True, reason="吸顶距离等待超过60秒；请释放请求后重试")
                     else:
                         self.phase_reason = "吸顶等待：有效顶距≤1 m连续0.30秒；仍由飞手在 ALTCTL 控制"
             else:

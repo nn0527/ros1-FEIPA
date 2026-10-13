@@ -24,6 +24,37 @@ class CeilingConsoleFlowTests(unittest.TestCase):
         self.n._on_odom(m)
     def sample(self,t,d):
         self.clock=t;self.n._on_range(Range(range=d,min_range=.03,max_range=40.))
+    def test_invalid_range_pauses_approach_and_preserves_timeout_budget(self):
+        self.n.approach_settle_time_s=0.0
+        self.n._enter_state(S.STATE_APPROACH,rospy.Time.now(),"test")
+        self.sample(10,.5);self.n._update_state_machine(rospy.Time.now())
+        for t in [11,15,25]:
+            self.sample(t,255);self.odom(2.);self.n._update_state_machine(rospy.Time.now())
+            self.assertEqual(self.n.state,S.STATE_APPROACH)
+            status=self.n._build_status(rospy.Time.now(),.02)
+            self.assertEqual(status.approach_velocity_z_enu_mps,0.)
+            self.assertTrue(status.candidate_valid)
+        self.sample(25.1,.5);self.odom(2.);self.n._update_state_machine(rospy.Time.now())
+        self.assertEqual(self.n.state,S.STATE_APPROACH)
+        self.assertGreater(self.n._build_status(rospy.Time.now(),.02).approach_velocity_z_enu_mps,0.)
+    def test_hold_invalid_range_keeps_point_five_and_allows_detach(self):
+        self.n._enter_state(S.STATE_SURFACE_HOLD,rospy.Time.now(),"test")
+        self.sample(10,255);self.n._update_state_machine(rospy.Time.now())
+        self.assertEqual(self.n.state,S.STATE_SURFACE_HOLD)
+        status=self.n._build_status(rospy.Time.now(),.02)
+        self.assertFalse(status.range_fresh);self.assertFalse(status.fault_detected)
+        self.assertAlmostEqual(status.thrust_body_z_normalized,-.5)
+        self.n.detach_requested=True;self.n._update_state_machine(rospy.Time.now())
+        self.assertEqual(self.n.state,S.STATE_DETACH)
+        self.assertTrue(self.n._build_status(rospy.Time.now(),.02).candidate_valid)
+        for t in [10.1,10.2,10.3,10.4]:
+            self.clock=t;self.odom(1.8);self.n._update_state_machine(rospy.Time.now())
+        self.assertEqual(self.n.state,S.STATE_RECOVERY_HOVER)
+    def test_invalid_range_does_not_hide_missing_odometry(self):
+        self.n.approach_settle_time_s=0.0
+        self.n._enter_state(S.STATE_APPROACH,rospy.Time.now(),"test")
+        self.sample(12,255);self.n._update_state_machine(rospy.Time.now())
+        self.assertEqual(self.n.state,S.STATE_FAULT)
     def test_one_metre_requires_continuous_samples_for_point_three_seconds(self):
         for t in [10,10.1,10.2]:self.sample(t,1.)
         self.assertFalse(self.n._activation_ready(rospy.Time.now()))

@@ -608,6 +608,17 @@ class CeilingAttachmentDecisionNode:
         )
 
     def _update_state_machine(self, now):
+        profile = getattr(self, "console_contact_profile", False)
+        previous_tick = getattr(self, "range_wait_tick", now)
+        previous_wait = getattr(self, "range_wait_active", False)
+        self.range_wait_tick = now
+        self.range_wait_active = profile and not self._range_fresh(now)
+        if profile and (self.range_wait_active or previous_wait) and self.state in (
+            CeilingAttachmentStatus.STATE_CEILING_ARMED,
+            CeilingAttachmentStatus.STATE_APPROACH,
+            CeilingAttachmentStatus.STATE_ATTACH_CONTROL,
+        ):
+            self.state_entered_at += rospy.Duration(max(0.0, (now-previous_tick).to_sec()))
         mode_requested = self._mode_requested(now)
         arm_requested = self._arm_requested(now)
         range_fresh = self._range_fresh(now)
@@ -625,10 +636,10 @@ class CeilingAttachmentDecisionNode:
                 "detach requested or ceiling mode released",
             )
         elif attached_state and (
-            not range_fresh
+            (not range_fresh and not profile)
             or not odom_fresh
             or self._tilt_fault(now)
-            or self._contact_lost()
+            or (range_fresh and self._contact_lost())
         ):
             self.fault_count += 1
             target = (
@@ -637,6 +648,14 @@ class CeilingAttachmentDecisionNode:
                 else CeilingAttachmentStatus.STATE_FAULT
             )
             self._enter_state(target, now, "attached input or contact safety lost")
+
+        if (self.range_wait_active and mode_requested and arm_requested
+                and flight_ready and odom_fresh and not self._tilt_fault(now)
+                and self.state in (CeilingAttachmentStatus.STATE_NORMAL_FLIGHT,
+                    CeilingAttachmentStatus.STATE_CEILING_ARMED,
+                    CeilingAttachmentStatus.STATE_APPROACH,
+                    CeilingAttachmentStatus.STATE_ATTACH_CONTROL)):
+            return  # Wait without advancing contact confirmation or timeout.
 
         if self.state == CeilingAttachmentStatus.STATE_NORMAL_FLIGHT:
             if not mode_requested:
@@ -754,7 +773,7 @@ class CeilingAttachmentDecisionNode:
             self._distance_stable(now)
 
         elif self.state == CeilingAttachmentStatus.STATE_DETACH:
-            if not flight_ready or not range_fresh or not odom_fresh or (getattr(self, "console_contact_profile", False) and self._height_feedback(now) is None):
+            if not flight_ready or (not range_fresh and not profile) or not odom_fresh or (getattr(self, "console_contact_profile", False) and self._height_feedback(now) is None):
                 self.detach_failed = True
                 self.fault_count += 1
                 self._enter_state(
@@ -774,7 +793,7 @@ class CeilingAttachmentDecisionNode:
                     now,
                     "attachment mechanism release timeout",
                 )
-            elif self._mechanism_release_confirmed(now) and self._detach_clear(now) and (not getattr(self, "console_contact_profile", False) or self._detach_height_ready(now)):
+            elif self._mechanism_release_confirmed(now) and (self._detach_height_ready(now) if profile else self._detach_clear(now)):
                 self._enter_state(
                     CeilingAttachmentStatus.STATE_RECOVERY_HOVER,
                     now,
@@ -911,7 +930,7 @@ class CeilingAttachmentDecisionNode:
         status.attach_confirmed = self._attach_confirmed(now)
         status.distance_stable = self._distance_stable(now)
         status.fault_detected = bool(
-            not status.range_fresh
+            (not status.range_fresh and not getattr(self, "console_contact_profile", False))
             or not status.odom_fresh
             or self._tilt_fault(now)
             or not status.flight_state_fresh
@@ -922,7 +941,7 @@ class CeilingAttachmentDecisionNode:
                     CeilingAttachmentStatus.STATE_ATTACH_CONTROL,
                     CeilingAttachmentStatus.STATE_SURFACE_HOLD,
                 )
-                and self._contact_lost()
+                and status.range_fresh and self._contact_lost()
             )
         )
         status.detach_failed = self.detach_failed
@@ -947,11 +966,11 @@ class CeilingAttachmentDecisionNode:
         if self.state == CeilingAttachmentStatus.STATE_APPROACH:
             status.approach_velocity_z_enu_mps = (
                 0.0
-                if self._state_age_s(now) < self.approach_settle_time_s
+                if self._state_age_s(now) < self.approach_settle_time_s or not status.range_fresh
                 else abs(self.approach_speed_mps)
             )
         elif self.state == CeilingAttachmentStatus.STATE_ATTACH_CONTROL:
-            status.thrust_body_z_normalized = -self._attach_thrust(dt)
+            status.thrust_body_z_normalized = -self._attach_thrust(dt) if status.range_fresh else -self.hover_thrust
             status.attitude_setpoint_valid = True
             status.attitude_setpoint = self.q_hover
         elif self.state == CeilingAttachmentStatus.STATE_SURFACE_HOLD:
@@ -960,7 +979,7 @@ class CeilingAttachmentDecisionNode:
             status.attitude_setpoint = self.q_hover
         elif (
             self.state == CeilingAttachmentStatus.STATE_DETACH
-            and status.range_fresh
+            and (status.range_fresh or getattr(self, "console_contact_profile", False))
         ):
             if self._mechanism_release_confirmed(now):
                 status.thrust_body_z_normalized = self._detach_thrust(dt)
@@ -992,6 +1011,11 @@ class CeilingAttachmentDecisionNode:
 
         status.fault_count = self.fault_count
         status.reason = self.last_reason
+        if getattr(self, "console_contact_profile", False) and not status.range_fresh:
+            action = ("按PX4高度下降20cm并交回ALTCTL" if self.state == CeilingAttachmentStatus.STATE_DETACH
+                      else "保持推力0.50" if self.state == CeilingAttachmentStatus.STATE_SURFACE_HOLD
+                      else "暂停接近，等待有效数据")
+            status.reason += "; 顶部雷达无效或过期：" + action
         return status
 
     @staticmethod
