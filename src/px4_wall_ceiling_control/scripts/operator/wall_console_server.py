@@ -159,7 +159,7 @@ class RemoteRuntime:
             from sensor_msgs.msg import Range, BatteryState
             from std_msgs.msg import String, UInt8, Bool
             from rosgraph_msgs.msg import Log
-            from px4_wall_ceiling_control.msg import SensorHealth, WallPerchStatus, OperatorCommand
+            from px4_wall_ceiling_control.msg import SensorHealth, WallPerchStatus, CeilingAttachmentStatus, OperatorCommand
             rospy.init_node("wall_console_bridge", anonymous=True, disable_signals=True)
             self.publisher = rospy.Publisher("/attachment/terminal_command", String, queue_size=1)
             self.wait_cancel_publisher = rospy.Publisher("/wall_perch/cancel_wait", Bool, queue_size=1)
@@ -167,6 +167,7 @@ class RemoteRuntime:
                       "estimator": ("/mavros/estimator_status", EstimatorStatus),
                       "odom": ("/mavros/local_position/odom", Odometry),
                       "health": ("/sensor/health", SensorHealth), "wall": ("/wall_perch/status", WallPerchStatus),
+                      "ceiling_status": ("/ceiling_attachment/status", CeilingAttachmentStatus),
                       "phase": ("/attachment/flight_phase", String), "reason": ("/attachment/flight_phase_reason", String),
                       "owner": ("/attachment/output_owner", UInt8), "operator": ("/operator/command", OperatorCommand),
                       "front": ("/sensor/front/range", Range), "ceiling": ("/sensor/ceiling/range", Range),
@@ -190,6 +191,8 @@ class RemoteRuntime:
         elif name == "health":
             value = {"ceiling_valid": msg.ceiling_valid, "front_valid": msg.front_valid,
                      "ceiling_age_s": msg.ceiling_age_s, "front_age_s": msg.front_age_s}
+        elif name == "ceiling_status":
+            value = {key: getattr(msg, key) for key in ("state_name", "reason", "fault_detected", "attach_confirmed", "distance_stable", "range_fresh", "odom_fresh", "candidate_valid", "ceiling_distance_filtered_m", "compression_m", "target_distance_m", "detach_failed")}
         elif name == "wall":
             value = {key: getattr(msg, key) for key in ("state_name", "reason", "progress", "fault_detected",
                       "front_distance_filtered_m", "top_distance_filtered_m", "thrust_normalized", "top_contact_ready",
@@ -222,7 +225,7 @@ class RemoteRuntime:
         self.state.update(name, finite_json(value))
 
     def roslog(self, msg):
-        if msg.level >= 4 and msg.name in ("/flight_mode_manager_node", "/wall_perch_decision_node",
+        if msg.level >= 4 and msg.name in ("/ceiling_attachment_decision_node", "/flight_mode_manager_node", "/wall_perch_decision_node",
                 "/attachment_output_mux_node", "/terminal_operator_node", "/mavros"):
             # Keep repeated MAVROS warnings from burying operator events.
             now = time.monotonic()
@@ -247,7 +250,7 @@ class RemoteRuntime:
                    and not self.ros.get_param("/flight_mode_manager_node/require_rc_center", False)
                    and (not self.ros.get_param("/attachment_output_mux_node/rc_assist_enabled", False)
                         or self.ros.get_param("/attachment_output_mux_node/rc_roll_yaw_enabled", False))
-                   and not (nodes & {"/ceiling_attachment_decision_node", "/ceiling_motor_bench_output_node",
+                   and not (nodes & {"/ceiling_motor_bench_output_node",
                                     "/flight_supervisor_node", "/setpoint_mux_node", "/ceiling_attachment_output_node"}))
         profile = "restrained_bench" if wall_bench and manager_bench else "flight"
         with self.state.lock:
@@ -266,7 +269,10 @@ class RemoteRuntime:
                     self.state.config = validate_config(migrate_legacy_ports(running))
                 except (ValueError, TypeError):
                     enabled = False
-        return {"enabled": bool(enabled), "test_profile": profile, "nodes": sorted(nodes),
+        return {"ceiling_enabled": "/ceiling_attachment_decision_node" in nodes,
+                "ceiling_activation_distance_m": self.ros.get_param("/ceiling_attachment_decision_node/activation_distance_m", .5),
+                "ceiling_vertical_speed_gate_mps": self.ros.get_param("/ceiling_attachment_decision_node/vertical_speed_gate_mps", .2),
+                "enabled": bool(enabled), "test_profile": profile, "nodes": sorted(nodes),
                 "missing": sorted(required - nodes), "logger": "/attachment_flight_logger" in nodes}
 
     def update_process_errors(self, runtime):
@@ -434,6 +440,22 @@ class RemoteRuntime:
                     Path(actual_port).resolve() == Path(expected_port).resolve())
         except (ValueError, TypeError):
             return False
+
+    def ceiling(self):
+        def publish(command):
+            if not self.publisher or self.publisher.get_num_connections() == 0:
+                raise ValueError("终端指令节点未订阅，消息未发送")
+            self.publisher.publish(command)
+        self.state.send_ceiling(publish)
+        return {"message": "吸顶请求已提交；等待 OFFBOARD 接管与顶部接触确认"}
+
+    def ceiling_detach(self):
+        def publish(command):
+            if not self.publisher or self.publisher.get_num_connections() == 0:
+                raise ValueError("终端指令节点未订阅，消息未发送")
+            self.publisher.publish(command)
+        self.state.send_ceiling_detach(publish)
+        return {"message": "离顶请求已提交；等待吸顶节点确认"}
 
     def wall(self):
         def publish(command):
@@ -659,6 +681,12 @@ class SSHTransport:
                 if not connected or result["can_detach"]:
                     result["detach_blockers"] = ["离墙所需实时反馈中断或过期"]
                 result["can_detach"] = False
+            ceiling_sources = ("runtime", "state", "odom", "estimator", "operator", "phase", "owner", "health", "kill", "ceiling_status", "ceiling")
+            if not connected or not self.session.get("control") or any(not result["status"][n]["fresh"] for n in ceiling_sources):
+                result["can_ceiling"] = result["can_ceiling_detach"] = False
+                result["ceiling_blockers"] = list(dict.fromkeys(result.get("ceiling_blockers", []) + ["吸顶所需实时反馈或控制权缺失"]))
+            if not result["status"]["setpoint"]["fresh"]:
+                result["can_ceiling_detach"] = False
             result["config"] = config
             if not connected or stale:
                 result["can_cancel_wait"] = False
@@ -764,6 +792,8 @@ def http_main(args):
                     if type(data.get("enabled")) is not bool:
                         raise ValueError("enabled 必须为布尔值")
                     result = transport.request("push", data)
+                elif self.path in ("/api/ceiling", "/api/ceiling-detach"):
+                    result = transport.request("ceiling" if self.path == "/api/ceiling" else "ceiling_detach")
                 elif self.path == "/api/wall":
                     result = transport.request("wall")
                 elif self.path == "/api/cancel-wait":

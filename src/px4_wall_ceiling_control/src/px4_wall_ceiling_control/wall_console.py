@@ -32,6 +32,7 @@ LIMITS = {"state": 1.5, "odom": 0.5, "estimator": 1.5, "rc": 0.2,
           "battery": 5.0, "front": 0.6, "ceiling": 0.6, "runtime": 3.0}
 LIMITS.update({"front_diagnostic": 3.0, "ceiling_diagnostic": 3.0})
 LIMITS["kill"] = 0.35
+LIMITS["ceiling_status"] = 0.5
 
 
 def validate_config(values):
@@ -85,9 +86,9 @@ class ConsoleState:
             self.samples[name] = {"at": self.clock(), "value": value}
             if name in ("phase", "reason", "owner") and (not previous or previous["value"] != value):
                 self.event({"phase": "控制阶段", "reason": "阶段反馈", "owner": "输出归属"}[name] + ": " + str(value))
-            if name == "wall" and (not previous or previous["value"]["state_name"] != value["state_name"]
+            if name in ("wall", "ceiling_status") and (not previous or previous["value"]["state_name"] != value["state_name"]
                     or previous["value"].get("reason") != value.get("reason")):
-                self.event("贴墙阶段: " + value["state_name"] + " · " + value["reason"])
+                self.event(("吸顶阶段: " if name == "ceiling_status" else "贴墙阶段: ") + value["state_name"] + " · " + value["reason"])
             if name == "state" and (not previous or previous["value"] != value):
                 self.event("飞控: {} / {} / {}".format("已连接" if value["connected"] else "断开",
                            "已解锁" if value["armed"] else "未解锁", value["mode"] or "未知模式"))
@@ -167,7 +168,31 @@ class ConsoleState:
                 detach_blockers.insert(0, "离墙请求已发送，等待节点反馈")
             if self.launch_error or self.starting:
                 detach_blockers.insert(0, "基础程序未就绪")
-            return {"status": status, "checks": [{"id": i, "label": label, "ok": ok, "reason": reason}
+            ceiling = val("ceiling_status", {})
+            common = [reason for i, _, ok, reason in checks if i not in ("height", "health") and not ok]
+            ceiling_checks = [
+                (runtime.get("ceiling_enabled"), "吸顶节点未启用；请在落地后重新启动基础程序"),
+                (status["ceiling_status"]["fresh"] and ceiling.get("state_name") == "NORMAL_FLIGHT", "吸顶决策未待命或反馈过期"),
+                (health.get("ceiling_valid") and status["ceiling"]["fresh"], "顶部雷达无效或过期"),
+                (isinstance(val("ceiling", {}).get("range_m"), (int,float)) and 0 < val("ceiling", {}).get("range_m", 99) < runtime.get("ceiling_activation_distance_m", .5), "需手动接近顶部至激活距离内"),
+                (isinstance(val("odom", {}).get("vertical_speed"), (int,float)) and abs(val("odom", {}).get("vertical_speed", 99)) < runtime.get("ceiling_vertical_speed_gate_mps", .2), "竖直速度未满足吸顶入口条件"),
+            ]
+            ceiling_blockers = common + [reason for ok, reason in ceiling_checks if not ok]
+            ceiling_pending = getattr(self, "ceiling_pending_since", None)
+            if ceiling_pending is not None and now-ceiling_pending < 5:
+                ceiling_blockers.insert(0, "吸顶请求已发送，等待节点反馈")
+            if self.starting or self.launch_error:
+                ceiling_blockers.insert(0, self.launch_error or "基础程序正在启动")
+            ceiling_detach_ok = bool(runtime.get("enabled") and runtime.get("ceiling_enabled") and kill_ok
+                and flight.get("connected") and flight.get("armed") and flight.get("mode") == "OFFBOARD"
+                and ceiling.get("state_name") == "SURFACE_HOLD" and not ceiling.get("fault_detected")
+                and ceiling.get("range_fresh") and ceiling.get("odom_fresh")
+                and val("phase") == "ACTIVE" and val("owner") == 1
+                and val("operator", {}).get("mode") == 2 and val("operator", {}).get("enabled")
+                and status["setpoint"]["fresh"] and health.get("ceiling_valid")
+                and val("odom", {}).get("finite") and estimator.get("attitude") and estimator.get("vertical_velocity"))
+            return {"can_ceiling": not ceiling_blockers, "ceiling_blockers": ceiling_blockers,
+                    "can_ceiling_detach": ceiling_detach_ok, "status": status, "checks": [{"id": i, "label": label, "ok": ok, "reason": reason}
                     for i, label, ok, reason in checks], "blockers": blockers, "can_wall": not blockers and not self.starting,
                     "success": bool(success), "starting": self.starting, "pending": pending,
                     "can_detach": not detach_blockers, "detach_blockers": detach_blockers,
@@ -177,6 +202,26 @@ class ConsoleState:
                         and val("operator", {}).get("enabled") and val("operator", {}).get("mode") == 3),
                     "sensor_warnings": sensor_reasons,
                     "launch_error": self.launch_error, "config": dict(self.config), "events": list(self.events)}
+
+    def send_ceiling(self, publish):
+        with self.lock:
+            current = self.snapshot()
+            if not current["can_ceiling"]:
+                raise ValueError(current["ceiling_blockers"][0])
+            self.ceiling_pending_since = self.clock()
+            try:
+                publish("ceiling")
+            except Exception:
+                self.ceiling_pending_since = None
+                raise
+            self.event("已发送 ceiling；等待吸顶控制节点确认")
+
+    def send_ceiling_detach(self, publish):
+        with self.lock:
+            if not self.snapshot()["can_ceiling_detach"]:
+                raise ValueError("离顶要求当前吸顶保持、OFFBOARD及新鲜有效反馈")
+            publish("detach")
+            self.event("已发送离顶请求；等待距离增加及恢复反馈")
 
     def send_wall(self, publish):
         # Serialize the preflight check and dispatch across tabs and double clicks.

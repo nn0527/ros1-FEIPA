@@ -40,6 +40,12 @@ function pair(label, value, className=""){
 }
 function paint(s){
   latest=s; token=s.token;
+  const ceilingStatus=fresh(s,"ceiling_status");
+  $("ceilingAction").disabled=requestBusy || !s.session?.feedback_live || !s.session?.control || !s.can_ceiling;
+  $("ceilingDetach").disabled=requestBusy || !s.session?.feedback_live || !s.session?.control || !s.can_ceiling_detach;
+  text("ceilingBlockReason",s.can_ceiling?"吸顶入口条件已满足":(s.ceiling_blockers || ["等待吸顶服务升级"]).join("；"));
+  const ceilingNames={NORMAL_FLIGHT:"待命",CEILING_ARMED:"吸顶准备",APPROACH:"向上接近",ATTACH_CONTROL:"接触控制",SURFACE_HOLD:"吸顶保持",DETACH:"脱离顶部",RECOVERY_HOVER:"恢复悬停",FAULT:"故障"};
+  text("ceilingStage",ceilingStatus?"吸顶："+(ceilingNames[ceilingStatus.state_name]||ceilingStatus.state_name)+" · "+ceilingStatus.reason+" · 顶距 "+n(ceilingStatus.ceiling_distance_filtered_m,3)+" m":"吸顶：无新鲜状态反馈");
   if(!loaded || fresh(s,"runtime")?.enabled){for(const input of form.elements) if(input.name in s.config) input.value=s.config[input.name];loaded=true;}
   const ssh=s.ssh.connected, session=s.session || {}, live=!!session.feedback_live, control=!!session.control, state=fresh(s,"state"), runtime=fresh(s,"runtime"), phase=fresh(s,"phase"), wall=fresh(s,"wall"), health=fresh(s,"health"), odom=fresh(s,"odom");
   text("connectionText",ssh?"SSH 已连接":"SSH 未连接");text("host",s.ssh.host);
@@ -72,7 +78,7 @@ function paint(s){
   else if(phase==="PRESTREAM"){title="预发送姿态目标";reason="建立连续设定值流，等待模式交接";step=1;}
   else if(phase==="ENTERING"){title="进入 OFFBOARD";reason="等待飞控确认模式切换";step=2;}
   else if(phase==="ACTIVE"){
-    title=wallNames[wall?.state_name] || "贴墙控制中";reason=wall?.reason || "等待贴墙状态反馈";
+    title=fresh(s,"operator")?.mode===2 ? "吸顶："+(ceilingNames[ceilingStatus?.state_name]||"等待反馈") : wallNames[wall?.state_name] || "贴墙控制中";reason=fresh(s,"operator")?.mode===2 ? ceilingStatus?.reason || "等待吸顶状态反馈" : wall?.reason || "等待贴墙状态反馈";
     step=wall?.state_name==="WALL_HOLD"?5:["FLIP_TO_WALL","WALL_CAPTURE","WALL_PIN"].includes(wall?.state_name)?4:3;
   } else if(phase==="LOCKED"){title="动作受阻";reason=fresh(s,"reason") || reason;}
   else if(phase && phase!=="IDLE"){title=phase;reason=fresh(s,"reason") || reason;}
@@ -118,7 +124,7 @@ function paint(s){
 $("control").addEventListener("click",()=>action(latest?.session?.control?"/api/release":"/api/acquire",{}));
 $("push").addEventListener("click",()=>action("/api/push",{enabled:!latest?.session?.push}));
 async function action(path, data){
-  if(requestBusy)return;requestBusy=true;$("stop").disabled=true;$("start").disabled=true;$("wall").disabled=true;$("detach").disabled=true;
+  if(requestBusy)return;requestBusy=true;$("ceilingAction").disabled=true;$("ceilingDetach").disabled=true;$("stop").disabled=true;$("start").disabled=true;$("wall").disabled=true;$("detach").disabled=true;
   message(path==="/api/stop"?"正在终止现有进程…":path==="/api/wall"?"正在发送 wall…":path==="/api/detach"?"正在发送 detach…":path==="/api/start"?"正在请求启动…":"正在更新连接设置…");
   try{
     const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Console-Token":token},body:JSON.stringify(data),signal:AbortSignal.timeout(9000)});
@@ -132,6 +138,8 @@ $("start").addEventListener("click",()=>{
   if(latest && fresh(latest,"runtime")?.enabled){action("/api/start",latest.config);return;}
   data.baud=Number(data.baud);data.hover_thrust=Number(data.hover_thrust);action("/api/start",data);
 });
+$("ceilingAction").addEventListener("click",()=>action("/api/ceiling",{}));
+$("ceilingDetach").addEventListener("click",()=>action("/api/ceiling-detach",{}));
 $("wall").addEventListener("click",()=>action("/api/wall",{}));
 $("detach").addEventListener("click",()=>action("/api/detach",{}));
 $("stop").addEventListener("click",()=>{
@@ -145,7 +153,7 @@ async function poll(){
     const response=await fetch("/api/status",{cache:"no-store",signal:AbortSignal.timeout(2500)});
     if(!response.ok)throw new Error("本机服务响应异常");paint(await response.json());
   }catch(error){
-    $("stop").disabled=true;$("control").disabled=true;$("push").disabled=true;text("connectionText","本机服务无响应");$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;
+    $("ceilingAction").disabled=true;$("ceilingDetach").disabled=true;text("ceilingStage","吸顶：实时反馈中断");$("stop").disabled=true;$("control").disabled=true;$("push").disabled=true;text("connectionText","本机服务无响应");$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;
     if(!$("successNote").hidden)text("successNote","本轮曾成功进入贴墙保持；当前反馈中断，不能确认现在的状态。");
     text("stageTitle","反馈中断");text("stageReason","无法确认当前阶段，请核对飞控状态");
     text("killState","急停反馈中断，动作禁用");text("detachCondition","实时反馈中断，离墙禁用");

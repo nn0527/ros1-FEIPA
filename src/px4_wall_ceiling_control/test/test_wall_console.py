@@ -286,6 +286,51 @@ class ConsoleTests(unittest.TestCase):
             self.state.update(name, value)
         self.state.update("kill", {"valid": True, "active": False, "channel": 7})
 
+    def ceiling_ready(self):
+        self.ready()
+        self.state.update("runtime", {"enabled": True, "ceiling_enabled": True})
+        self.state.update("ceiling_status", {"state_name": "NORMAL_FLIGHT", "reason": "idle"})
+        self.state.update("ceiling", {"range_m": .4})
+        self.state.update("odom", {"finite": True, "vertical_speed": 0.0})
+
+    def test_ceiling_entry_and_duplicate_request(self):
+        self.ceiling_ready()
+        self.state.send_ceiling(self.publisher)
+        self.publisher.assert_called_once_with("ceiling")
+        with self.assertRaises(ValueError):
+            self.state.send_ceiling(self.publisher)
+
+    def test_ceiling_requires_top_but_not_front_or_wall_height(self):
+        self.ceiling_ready()
+        self.state.update("health", {"ceiling_valid": True, "front_valid": False})
+        self.state.update("wall", {"state_name": "IDLE", "reason": "idle", "entry_height_ready": False})
+        self.assertTrue(self.state.snapshot()["can_ceiling"])
+        self.state.update("health", {"ceiling_valid": False})
+        self.assertFalse(self.state.snapshot()["can_ceiling"])
+
+    def test_ceiling_stale_kill_and_distance_gate_block(self):
+        self.ceiling_ready()
+        self.state.update("ceiling", {"range_m": .5})
+        self.assertFalse(self.state.snapshot()["can_ceiling"])
+        self.state.update("ceiling", {"range_m": .4})
+        self.state.update("kill", {"valid": True, "active": True})
+        self.assertFalse(self.state.snapshot()["can_ceiling"])
+        self.ceiling_ready();self.now += 2
+        self.assertFalse(self.state.snapshot()["can_ceiling"])
+
+    def test_ceiling_detach_requires_ceiling_owner(self):
+        self.ceiling_ready()
+        self.state.update("state", {"connected": True, "armed": True, "mode": "OFFBOARD"})
+        self.state.update("phase", "ACTIVE");self.state.update("owner", 1)
+        self.state.update("operator", {"mode": 2, "enabled": True})
+        self.state.update("setpoint", {"thrust": .48})
+        self.state.update("ceiling_status", {"state_name": "SURFACE_HOLD", "reason": "hold", "range_fresh": True, "odom_fresh": True, "fault_detected": False})
+        self.assertTrue(self.state.snapshot()["can_ceiling_detach"])
+        self.state.send_ceiling_detach(self.publisher)
+        self.publisher.assert_called_once_with("detach")
+        self.state.update("owner", 2)
+        self.assertFalse(self.state.snapshot()["can_ceiling_detach"])
+
     def test_ready_dispatches_exactly_one_wall(self):
         self.ready()
         self.state.send_wall(self.publisher)
@@ -440,9 +485,9 @@ class ConsoleTests(unittest.TestCase):
         self.assertEqual(args[:3], ["roslaunch", "px4_wall_ceiling_control", "wall_console_flight.launch"])
         path = pathlib.Path(__file__).resolve().parents[1] / "launch/system/wall_console_flight.launch"
         values = {arg.attrib["name"]: arg.attrib["value"] for arg in ET.parse(str(path)).findall("./include/arg")}
-        for key in ("flight_mode_enabled", "output_enabled", "wall_enabled", "rc_assist_enabled", "rc_roll_yaw_enabled"):
+        for key in ("flight_mode_enabled", "output_enabled", "wall_enabled", "ceiling_enabled", "rc_assist_enabled", "rc_roll_yaw_enabled"):
             self.assertEqual(values[key], "true")
-        for key in ("require_rc_center", "ceiling_enabled"):
+        for key in ("require_rc_center",):
             self.assertEqual(values[key], "false")
         self.assertEqual(values["wall_hold_time_s"], "0.0")
 
