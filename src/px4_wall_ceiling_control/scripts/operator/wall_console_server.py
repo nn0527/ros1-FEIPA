@@ -287,7 +287,6 @@ class RemoteRuntime:
                     enabled = False
         return {"front_sensor_masked": self.ros.get_param("/attachment/front_sensor_masked", False), "ceiling_distance_gate_enabled": self.ros.get_param("/flight_mode_manager_node/ceiling_distance_gate_enabled", False), "ceiling_enabled": "/ceiling_attachment_decision_node" in nodes,
                 "ceiling_activation_distance_m": self.ros.get_param("/ceiling_attachment_decision_node/activation_distance_m", .5),
-                "ceiling_vertical_speed_gate_mps": self.ros.get_param("/ceiling_attachment_decision_node/vertical_speed_gate_mps", .2),
                 "enabled": bool(enabled), "test_profile": profile, "nodes": sorted(nodes),
                 "missing": sorted(required - nodes), "logger": "/attachment_flight_logger" in nodes}
 

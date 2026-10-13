@@ -180,7 +180,6 @@ class ConsoleState:
                 (status["ceiling_status"]["fresh"] and ceiling.get("state_name") == "NORMAL_FLIGHT", "吸顶决策未待命或反馈过期"),
                 (runtime.get("ceiling_distance_gate_enabled") or (health.get("ceiling_valid") and status["ceiling"]["fresh"]), "顶部雷达无效或过期"),
                 ((runtime.get("ceiling_distance_gate_enabled") or (isinstance(val("ceiling", {}).get("range_m"), (int,float)) and 0 < val("ceiling", {}).get("range_m", 99) < runtime.get("ceiling_activation_distance_m", .5))), "需手动接近顶部至激活距离内"),
-                (runtime.get("ceiling_distance_gate_enabled") or (isinstance(val("odom", {}).get("vertical_speed"), (int,float)) and abs(val("odom", {}).get("vertical_speed", 99)) < runtime.get("ceiling_vertical_speed_gate_mps", .2)), "竖直速度未满足吸顶入口条件"),
             ]
             ceiling_blockers = common + [reason for ok, reason in ceiling_checks if not ok]
             ceiling_pending = getattr(self, "ceiling_pending_since", None)

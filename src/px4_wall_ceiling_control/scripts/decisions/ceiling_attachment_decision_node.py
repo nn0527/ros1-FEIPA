@@ -67,9 +67,6 @@ class CeilingAttachmentDecisionNode:
         self.state_timeout_s = float(rospy.get_param("~state_timeout_s", 1.50))
         self.require_armed = bool(rospy.get_param("~require_armed", True))
         self.require_offboard = bool(rospy.get_param("~require_offboard", True))
-        self.vertical_speed_gate_mps = float(
-            rospy.get_param("~vertical_speed_gate_mps", 0.20)
-        )
         self.max_roll_rad = math.radians(
             float(rospy.get_param("~max_roll_deg", 15.0))
         )
@@ -750,20 +747,18 @@ class CeilingAttachmentDecisionNode:
                     "armed input or flight state lost",
                 )
             else:
-                vertical_speed = abs(
-                    vertical_speed_enu_mps(
-                        self.odom,
-                        getattr(self, "odom_twist_in_child_frame", True),
-                    )
+                vertical_speed = vertical_speed_enu_mps(
+                    self.odom,
+                    getattr(self, "odom_twist_in_child_frame", True),
                 )
                 if (
                     (self._activation_ready(now) if getattr(self, "console_contact_profile", False) else self.distance_filtered_m < self.activation_distance_m)
-                    and vertical_speed < self.vertical_speed_gate_mps
+                    and math.isfinite(vertical_speed)
                 ):
                     self._enter_state(
                         CeilingAttachmentStatus.STATE_APPROACH,
                         now,
-                        "ceiling acquired and vertical speed is low",
+                        "ceiling distance confirmed; begin approach",
                     )
 
         elif self.state == CeilingAttachmentStatus.STATE_APPROACH:

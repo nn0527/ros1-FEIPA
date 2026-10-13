@@ -52,7 +52,6 @@ class FlightModeManagerNode:
         self.operator_timeout_s = float(rospy.get_param("~operator_timeout_s", 0.5))
         self.sensor_timeout_s = float(rospy.get_param("~sensor_timeout_s", 0.5))
         self.wall_manual_approach = bool(rospy.get_param("~wall_manual_approach", False))
-        self.ceiling_vertical_speed_gate_mps=float(rospy.get_param("~ceiling_vertical_speed_gate_mps",rospy.get_param("/ceiling_attachment_decision_node/vertical_speed_gate_mps",.2)))
         self.ceiling_baro_handover_enabled = bool(rospy.get_param("~ceiling_baro_handover_enabled", False))
         self.ceiling_distance_gate_enabled = bool(rospy.get_param("~ceiling_distance_gate_enabled", False))
         self.wall_auto_approach = bool(rospy.get_param("~wall_auto_approach", False))
@@ -339,7 +338,7 @@ class FlightModeManagerNode:
         if not (status is not None and is_fresh(self.ceiling_at,self.status_timeout_s,now) and status.activation_ready):return False
         if self.odom is None or not is_fresh(self.odom_at,self.odom_timeout_s,now) or not odometry_is_finite(self.odom):return False
         speed=vertical_speed_enu_mps(self.odom,self.odom_twist_in_child_frame)
-        return math.isfinite(speed) and abs(speed)<self.ceiling_vertical_speed_gate_mps
+        return math.isfinite(speed)
 
     def _ceiling_wait_reason(self,now):
         if self.ceiling is None or not is_fresh(self.ceiling_at,self.status_timeout_s,now):
@@ -348,8 +347,7 @@ class FlightModeManagerNode:
             return "吸顶请求已接收：等待有效顶距≤1m连续0.30秒；仍由飞手控制ALTCTL"
         if self.odom is None or not is_fresh(self.odom_at,self.odom_timeout_s,now) or not odometry_is_finite(self.odom):
             return "吸顶请求已接收：等待新鲜有效里程计；仍由飞手控制ALTCTL"
-        speed=vertical_speed_enu_mps(self.odom,self.odom_twist_in_child_frame)
-        return "吸顶请求已接收：等待竖直速度绝对值<%.2fm/s，当前%.2fm/s；仍由飞手控制ALTCTL" % (self.ceiling_vertical_speed_gate_mps,speed)
+        return "吸顶请求已接收：等待有效竖直速度估计；仍由飞手控制ALTCTL"
 
     def _auto_wall_selected(self):
         return getattr(self, "wall_auto_approach", False) and self.selected_mode == OperatorCommand.MODE_WALL

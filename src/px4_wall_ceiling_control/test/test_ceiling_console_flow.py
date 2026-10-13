@@ -171,14 +171,23 @@ class CeilingConsoleFlowTests(unittest.TestCase):
             n._on_command(String(data=json.dumps({'id':'r1','command':'ceiling'})))
             self.assertFalse(json.loads(n.command_ack_pub.publish.call_args.args[0].data)['accepted'])
             n.command_pub.publish.assert_not_called();self.assertEqual(n.mode,OperatorCommand.MODE_STANDBY)
-    def test_speed_gate_waits_before_requesting_offboard(self):
+    def test_ceiling_takeover_ignores_speed_magnitude_but_requires_fresh_valid_odom(self):
         m=Manager.__new__(Manager);m.ceiling_distance_gate_enabled=True;m.selected_mode=OperatorCommand.MODE_CEILING
         m.ceiling=S(activation_ready=True);m.ceiling_at=rospy.Time.now();m.status_timeout_s=.5
-        m.odom=self.n.odom;m.odom_at=rospy.Time.now();m.odom_timeout_s=.5;m.odom_twist_in_child_frame=True;m.ceiling_vertical_speed_gate_mps=.2
-        m.odom.twist.twist.linear.z=.6
+        m.odom=self.n.odom;m.odom_at=rospy.Time.now();m.odom_timeout_s=.5;m.odom_twist_in_child_frame=True
+        for speed in (.6,-1.0):
+            m.odom.twist.twist.linear.z=speed
+            self.assertTrue(m._ceiling_takeover_ready(rospy.Time.now()))
+        m.odom_at=rospy.Time.from_sec(5.)
         self.assertFalse(m._ceiling_takeover_ready(rospy.Time.now()))
-        self.assertIn('0.60',m._ceiling_wait_reason(rospy.Time.now()))
-        m.odom.twist.twist.linear.z=.1;self.assertTrue(m._ceiling_takeover_ready(rospy.Time.now()))
+        self.assertIn('里程计',m._ceiling_wait_reason(rospy.Time.now()))
+    def test_ceiling_decision_enters_approach_with_speed_above_old_gate(self):
+        self.odom(2.,.6)
+        for t in [10.,10.1,10.2,10.3]:self.sample(t,.8)
+        self.n._update_state_machine(rospy.Time.now())
+        self.assertEqual(self.n.state,S.STATE_CEILING_ARMED)
+        self.n._update_state_machine(rospy.Time.now())
+        self.assertEqual(self.n.state,S.STATE_APPROACH)
     def test_one_metre_requires_continuous_samples_for_point_three_seconds(self):
         for t in [10,10.1,10.2]:self.sample(t,1.)
         self.assertFalse(self.n._activation_ready(rospy.Time.now()))
@@ -288,7 +297,7 @@ class CeilingConsoleFlowTests(unittest.TestCase):
     def test_manager_requires_fresh_activation_confirmation(self):
         m=Manager.__new__(Manager);m.ceiling_distance_gate_enabled=True;m.selected_mode=OperatorCommand.MODE_CEILING
         m.status_timeout_s=.5;m.ceiling_at=rospy.Time.now();m.ceiling=S(activation_ready=False)
-        m.odom=self.n.odom;m.odom_at=rospy.Time.now();m.odom_timeout_s=.5;m.odom_twist_in_child_frame=True;m.ceiling_vertical_speed_gate_mps=.2
+        m.odom=self.n.odom;m.odom_at=rospy.Time.now();m.odom_timeout_s=.5;m.odom_twist_in_child_frame=True
         self.assertFalse(m._ceiling_takeover_ready(rospy.Time.now()))
         m.ceiling.activation_ready=True;self.assertTrue(m._ceiling_takeover_ready(rospy.Time.now()))
         self.clock=11.;self.assertFalse(m._ceiling_takeover_ready(rospy.Time.now()))

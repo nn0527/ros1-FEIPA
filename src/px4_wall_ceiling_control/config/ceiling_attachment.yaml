@@ -21,7 +21,7 @@ ceiling_attachment_decision_node:
   # 2. 机械结构与距离标定（最先修改）
   # contact_distance_m：机构刚接触天花板时，雷达实际读数 d0。
   # target_compression_m：期望压缩量；目标顶距=d0-target_compression_m。
-  # activation_distance_m：小于该距离，且竖直速度足够低，才开始自动接近。
+  # activation_distance_m：小于该距离后，开始自动接近。
   # contact_margin_m：允许从 APPROACH 进入接触控制的额外距离裕量。
   # lost_contact_margin_m：贴顶时顶距大于 d0+该值，判定接触丢失并脱离。
   # 必须满足：0 < target_compression_m < contact_distance_m
@@ -51,7 +51,6 @@ ceiling_attachment_decision_node:
   # ===========================================================================
   # 4. 进入条件与姿态保护
   # ===========================================================================
-  vertical_speed_gate_mps: 0.20
   max_roll_deg: 15.0
   max_pitch_deg: 15.0
 
