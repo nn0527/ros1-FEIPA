@@ -300,6 +300,16 @@ class ConsoleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.state.send_ceiling(self.publisher)
 
+    def test_ceiling_request_can_wait_outside_one_metre(self):
+        self.ceiling_ready()
+        self.state.update("runtime", {"enabled": True, "ceiling_enabled": True, "ceiling_distance_gate_enabled": True, "ceiling_activation_distance_m": 1.0})
+        self.state.update("ceiling", {"range_m": 2.0})
+        self.assertTrue(self.state.snapshot()["can_ceiling"])
+    def test_latched_front_mask_blocks_wall_but_allows_ceiling(self):
+        self.ceiling_ready()
+        self.state.update("runtime", {"enabled": True, "ceiling_enabled": True, "front_sensor_masked": True})
+        self.assertFalse(self.state.snapshot()["can_wall"])
+        self.assertTrue(self.state.snapshot()["can_ceiling"])
     def test_ceiling_requires_top_but_not_front_or_wall_height(self):
         self.ceiling_ready()
         self.state.update("health", {"ceiling_valid": True, "front_valid": False})

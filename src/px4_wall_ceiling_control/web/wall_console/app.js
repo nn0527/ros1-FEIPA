@@ -45,7 +45,7 @@ function paint(s){
   $("ceilingDetach").disabled=requestBusy || !s.session?.feedback_live || !s.session?.control || !s.can_ceiling_detach;
   text("ceilingBlockReason",s.can_ceiling?"吸顶入口条件已满足":(s.ceiling_blockers || ["等待吸顶服务升级"]).join("；"));
   const ceilingNames={NORMAL_FLIGHT:"待命",CEILING_ARMED:"吸顶准备",APPROACH:"向上接近",ATTACH_CONTROL:"接触控制",SURFACE_HOLD:"吸顶保持",DETACH:"脱离顶部",RECOVERY_HOVER:"恢复悬停",FAULT:"故障"};
-  text("ceilingStage",ceilingStatus?"吸顶："+(ceilingNames[ceilingStatus.state_name]||ceilingStatus.state_name)+" · "+ceilingStatus.reason+" · 顶距 "+n(ceilingStatus.ceiling_distance_filtered_m,3)+" m":"吸顶：无新鲜状态反馈");
+  text("ceilingStage",ceilingStatus?"吸顶："+(ceilingNames[ceilingStatus.state_name]||ceilingStatus.state_name)+" · "+ceilingStatus.reason+" · 顶距 "+n(ceilingStatus.ceiling_distance_filtered_m,3)+" m"+(fresh(s,"runtime")?.front_sensor_masked?" · 前部雷达已屏蔽（重启恢复）":"")+(typeof ceilingStatus.descended_height_m === "number"?" · 已下降 "+n(ceilingStatus.descended_height_m*100,1)+" / 20 cm":""):"吸顶：无新鲜状态反馈");
   if(!loaded || fresh(s,"runtime")?.enabled){for(const input of form.elements) if(input.name in s.config) input.value=s.config[input.name];loaded=true;}
   const ssh=s.ssh.connected, session=s.session || {}, live=!!session.feedback_live, control=!!session.control, state=fresh(s,"state"), runtime=fresh(s,"runtime"), phase=fresh(s,"phase"), wall=fresh(s,"wall"), health=fresh(s,"health"), odom=fresh(s,"odom");
   text("connectionText",ssh?"SSH 已连接":"SSH 未连接");text("host",s.ssh.host);
@@ -58,6 +58,7 @@ function paint(s){
   text("flightConnection",state ? (state.connected?"已连接":"未连接") : "无有效反馈");
   text("armed",state ? (state.armed?"已解锁":"未解锁") : "—");text("mode",state?.mode || "—");
   const enabled=!!runtime?.enabled;
+  if(runtime?.front_sensor_masked)text("front","已屏蔽");
   $("start").disabled=requestBusy || !live || !control || s.starting || (state?.armed && !enabled);
   text("startLabel",s.starting?"正在启动…":enabled?"基础程序已启动":"启动基础程序");
   $("wall").disabled=requestBusy || !live || !control || !s.can_wall;
@@ -106,6 +107,7 @@ function paint(s){
   const thrust=fresh(s,"setpoint")?.thrust;text("thrust",typeof thrust==="number"?n(thrust*100,1):"—");
   text("velocity",n(odom?.vertical_speed));text("battery",n(fresh(s,"battery")?.voltage,1));
   text("height",n(wall?.height_above_takeoff_m));
+  if(runtime?.front_sensor_masked)text("front","已屏蔽");
   text("rangeWarning",(s.sensor_warnings || []).join("；") +
     (s.config.test_profile==="restrained_bench"?"　有约束台架：高度和雷达入口门槛关闭；距离恢复前悬停等待，接近／翻转仍需有效雷达。":""));
   const owner=fresh(s,"owner");text("owner",owner===2?"侧吸":owner===1?"吸顶":owner===0?"无":"—");

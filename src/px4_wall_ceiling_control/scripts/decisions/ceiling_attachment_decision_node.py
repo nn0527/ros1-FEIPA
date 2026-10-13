@@ -6,6 +6,7 @@ The shared two-sensor range arbiter feeds this decision. MAVROS translation belo
 """
 
 import math
+from statistics import median
 
 import rospy
 from geometry_msgs.msg import Quaternion
@@ -14,7 +15,7 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Range
 from std_msgs.msg import Bool
 
-from px4_wall_ceiling_control.adapters.odometry import vertical_speed_enu_mps
+from px4_wall_ceiling_control.adapters.odometry import vertical_speed_enu_mps, odometry_is_finite
 from px4_wall_ceiling_control.domain.geometry import euler_from_quaternion
 from px4_wall_ceiling_control.domain.sample_hold import held_samples, record_hold_sample
 from px4_wall_ceiling_control.freshness import clamp, is_fresh, is_valid_range
@@ -24,6 +25,7 @@ from px4_wall_ceiling_control.msg import (
     AttachmentMechanismStatus,
     CeilingAttachmentStatus,
     OperatorCommand,
+    SensorHealth,
 )
 
 
@@ -153,6 +155,30 @@ class CeilingAttachmentDecisionNode:
             rospy.get_param("~mechanism_timeout_s", 1.0)
         )
 
+        self.console_contact_profile = bool(rospy.get_param("~console_contact_profile", False))
+        self.activation_hold_s = float(rospy.get_param("~activation_hold_s", 0.30))
+        self.wall_contact_distance_m = float(rospy.get_param("~wall_contact_distance_m", 0.056))
+        self.wall_contact_hold_s = float(rospy.get_param("~wall_contact_hold_s", 1.0))
+        self.wall_contact_window_samples = max(3, int(rospy.get_param("~wall_contact_window_samples", 3)))
+        self.surface_hold_thrust = float(rospy.get_param("~surface_hold_thrust", 0.50))
+        self.detach_drop_m = float(rospy.get_param("~detach_drop_m", 0.20))
+        self.detach_height_tolerance_m = float(rospy.get_param("~detach_height_tolerance_m", 0.01))
+        self.detach_height_hold_s = float(rospy.get_param("~detach_height_hold_s", 0.20))
+        self.detach_settled_speed_mps = float(rospy.get_param("~detach_settled_speed_mps", 0.10))
+        self.detach_down_speed_mps = float(rospy.get_param("~detach_down_speed_mps", 0.15))
+        self.detach_height_kp = float(rospy.get_param("~detach_height_kp", 0.50))
+        self.detach_velocity_kp = float(rospy.get_param("~detach_velocity_kp", 0.30))
+        if not (0 < self.surface_hold_thrust <= self.max_thrust and 0 < self.detach_height_tolerance_m < self.detach_drop_m
+                and self.activation_hold_s > 0 and self.wall_contact_hold_s > 0 and self.detach_height_hold_s > 0
+                and self.detach_down_speed_mps > 0 and self.detach_height_kp > 0 and self.detach_velocity_kp > 0):
+            raise ValueError("invalid ceiling console profile parameters")
+        self.activation_since = self.activation_last_sample_at = None
+        self.contact_samples = []
+        self.contact_near_samples = 0
+        self.detach_start_height_m = None
+        self.detach_height_since = self.detach_height_last_sample_at = None
+        self.detach_height_processed_at = None
+
         self.state = CeilingAttachmentStatus.STATE_NORMAL_FLIGHT
         self.state_entered_at = rospy.Time.now()
         self.range_message = None
@@ -224,6 +250,7 @@ class CeilingAttachmentDecisionNode:
             operator_topic, OperatorCommand, self._on_operator, queue_size=10
         )
         rospy.Subscriber(detach_topic, Bool, self._on_detach, queue_size=10)
+        rospy.Subscriber("/sensor/health", SensorHealth, self._on_sensor_health, queue_size=1)
         rospy.Subscriber(
             rospy.get_param(
                 "~mechanism_status_topic", "/attachment/mechanism_status"
@@ -247,6 +274,8 @@ class CeilingAttachmentDecisionNode:
         )
 
     def _surface_hold_thrust(self):
+        if getattr(self, "console_contact_profile", False):
+            return min(self.surface_hold_thrust, self.max_thrust)
         return min(
             self.hover_thrust * self.surface_thrust_multiplier,
             self.attach_max_thrust,
@@ -277,6 +306,11 @@ class CeilingAttachmentDecisionNode:
 
     def _on_range(self, message):
         if not is_valid_range(message):
+            if getattr(self, "console_contact_profile", False):
+                self.range_received_at = None
+                self.activation_since = self.activation_last_sample_at = None
+                self.attach_detected_at = self.attach_last_sample_at = None
+                self.contact_samples = []; self.contact_near_samples = 0
             return
         now = rospy.Time.now()
         reset_filter = not is_fresh(
@@ -290,12 +324,27 @@ class CeilingAttachmentDecisionNode:
             self.distance_filtered_m += self.filter_alpha * (
                 message.range - self.distance_filtered_m
             )
+        if getattr(self, "console_contact_profile", False):
+            if reset_filter:
+                self.activation_since = self.activation_last_sample_at = None
+                self.attach_detected_at = self.attach_last_sample_at = None
+                self.contact_samples = []; self.contact_near_samples = 0
+            self.activation_since, self.activation_last_sample_at = self._record_hold_sample(
+                message.range <= self.activation_distance_m, now, self.activation_since)
+            if self.state in (CeilingAttachmentStatus.STATE_APPROACH, CeilingAttachmentStatus.STATE_ATTACH_CONTROL):
+                self.contact_samples.append(message.range)
+                self.contact_samples = self.contact_samples[-self.wall_contact_window_samples:]
+                self.distance_filtered_m = median(self.contact_samples)
+                self.contact_near_samples = self.contact_near_samples + 1 if message.range <= self.wall_contact_distance_m + 1.0e-7 else 0
+            condition = message.range <= self.wall_contact_distance_m + 1.0e-7 and self.distance_filtered_m <= self.wall_contact_distance_m + 1.0e-7
+        else:
+            condition = self.contact_distance_m - self.distance_filtered_m >= self.attach_confirm_compression_m
         compression = self.contact_distance_m - self.distance_filtered_m
         (
             self.attach_detected_at,
             self.attach_last_sample_at,
         ) = self._record_hold_sample(
-            compression >= self.attach_confirm_compression_m,
+            condition,
             now,
             self.attach_detected_at,
         )
@@ -317,6 +366,13 @@ class CeilingAttachmentDecisionNode:
             self.detach_clear_since,
         )
 
+    def _on_sensor_health(self, message):
+        if getattr(self, "console_contact_profile", False) and not message.ceiling_valid:
+            self.range_received_at = None
+            self.activation_since = self.activation_last_sample_at = None
+            self.attach_detected_at = self.attach_last_sample_at = None
+            self.contact_samples = []; self.contact_near_samples = 0
+
     def _on_odom(self, message):
         self.odom = message
         self.odom_received_at = rospy.Time.now()
@@ -326,6 +382,9 @@ class CeilingAttachmentDecisionNode:
         self.flight_state_received_at = rospy.Time.now()
 
     def _on_operator(self, message):
+        if (getattr(self, "console_contact_profile", False) and message.mode == OperatorCommand.MODE_CEILING
+                and message.enable_control and (self.operator is None or self.operator.mode != message.mode or not self.operator.enable_control)):
+            self.activation_since = self.activation_last_sample_at = None
         self.operator = message
         self.operator_received_at = rospy.Time.now()
 
@@ -426,6 +485,13 @@ class CeilingAttachmentDecisionNode:
         self.state = new_state
         self.state_entered_at = now
         self.last_reason = reason
+        if getattr(self, "console_contact_profile", False):
+            self.contact_samples = []; self.contact_near_samples = 0
+            if new_state == CeilingAttachmentStatus.STATE_DETACH:
+                self.detach_start_height_m = self._height_feedback(now)
+                self.detach_height_since = self.detach_height_last_sample_at = self.detach_height_processed_at = None
+            elif new_state == CeilingAttachmentStatus.STATE_NORMAL_FLIGHT:
+                self.detach_start_height_m = None
         self.attach_detected_at = None
         self.attach_last_sample_at = None
         self.stable_detected_at = None
@@ -460,7 +526,7 @@ class CeilingAttachmentDecisionNode:
         self.previous_distance_error = 0.0
 
     def _tilt_fault(self, now):
-        if not self._odom_fresh(now) or self.odom is None:
+        if not self._odom_fresh(now) or self.odom is None or not odometry_is_finite(self.odom):
             return False
         roll, pitch = self._roll_pitch_from_quaternion(self.odom.pose.pose.orientation)
         return abs(roll) > self.max_roll_rad or abs(pitch) > self.max_pitch_rad
@@ -480,16 +546,41 @@ class CeilingAttachmentDecisionNode:
     def _held_samples(fresh, since, last_sample_at, duration):
         return held_samples(fresh, since, last_sample_at, duration)
 
+    def _activation_ready(self, now):
+        return self._held_samples(self._range_fresh(now), self.activation_since,
+                                  self.activation_last_sample_at, self.activation_hold_s)
+
+    def _height_feedback(self, now):
+        if not self._odom_fresh(now) or self.odom is None:
+            return None
+        z = self.odom.pose.pose.position.z
+        return z if math.isfinite(z) else None
+
+    def _detach_height_ready(self, now):
+        z = self._height_feedback(now)
+        if z is None or self.detach_start_height_m is None:
+            self.detach_height_since = self.detach_height_last_sample_at = None
+            return False
+        if self.detach_height_processed_at != self.odom_received_at:
+            self.detach_height_processed_at = self.odom_received_at
+            speed = vertical_speed_enu_mps(self.odom, self.odom_twist_in_child_frame)
+            condition = abs((self.detach_start_height_m-z)-self.detach_drop_m) <= self.detach_height_tolerance_m and math.isfinite(speed) and abs(speed) <= self.detach_settled_speed_mps
+            self.detach_height_since, self.detach_height_last_sample_at = self._record_hold_sample(
+                condition, self.odom_received_at, self.detach_height_since)
+        return self._held_samples(True, self.detach_height_since, self.detach_height_last_sample_at, self.detach_height_hold_s)
+
     def _attach_confirmed(self, now):
         fresh = self._range_fresh(now)
         if not fresh:
             self.attach_detected_at = None
             self.attach_last_sample_at = None
+        if getattr(self, "console_contact_profile", False) and self.contact_near_samples < self.wall_contact_window_samples:
+            return False
         return self._held_samples(
             fresh,
             self.attach_detected_at,
             self.attach_last_sample_at,
-            self.attach_confirm_time_s,
+            self.wall_contact_hold_s if getattr(self, "console_contact_profile", False) else self.attach_confirm_time_s,
         )
 
     def _distance_stable(self, now):
@@ -591,7 +682,7 @@ class CeilingAttachmentDecisionNode:
                     )
                 )
                 if (
-                    self.distance_filtered_m < self.activation_distance_m
+                    (self._activation_ready(now) if getattr(self, "console_contact_profile", False) else self.distance_filtered_m < self.activation_distance_m)
                     and vertical_speed < self.vertical_speed_gate_mps
                 ):
                     self._enter_state(
@@ -629,7 +720,7 @@ class CeilingAttachmentDecisionNode:
             elif (
                 self._state_age_s(now) >= self.approach_settle_time_s
                 and self.distance_filtered_m
-                <= self.contact_distance_m + self.contact_margin_m
+                <= (self.wall_contact_distance_m + 1.0e-7 if getattr(self, "console_contact_profile", False) else self.contact_distance_m + self.contact_margin_m)
             ):
                 self._enter_state(
                     CeilingAttachmentStatus.STATE_ATTACH_CONTROL,
@@ -642,9 +733,8 @@ class CeilingAttachmentDecisionNode:
             stable = self._distance_stable(now)
             time_ready = self._state_age_s(now) >= self.attach_control_time_s
             if (
-                time_ready
-                and stable
-                and (confirmed or not self.require_attach_confirmation)
+                confirmed if getattr(self, "console_contact_profile", False) else
+                time_ready and stable and (confirmed or not self.require_attach_confirmation)
             ):
                 self._enter_state(
                     CeilingAttachmentStatus.STATE_SURFACE_HOLD,
@@ -664,7 +754,7 @@ class CeilingAttachmentDecisionNode:
             self._distance_stable(now)
 
         elif self.state == CeilingAttachmentStatus.STATE_DETACH:
-            if not flight_ready or not range_fresh or not odom_fresh:
+            if not flight_ready or not range_fresh or not odom_fresh or (getattr(self, "console_contact_profile", False) and self._height_feedback(now) is None):
                 self.detach_failed = True
                 self.fault_count += 1
                 self._enter_state(
@@ -684,7 +774,7 @@ class CeilingAttachmentDecisionNode:
                     now,
                     "attachment mechanism release timeout",
                 )
-            elif self._mechanism_release_confirmed(now) and self._detach_clear(now):
+            elif self._mechanism_release_confirmed(now) and self._detach_clear(now) and (not getattr(self, "console_contact_profile", False) or self._detach_height_ready(now)):
                 self._enter_state(
                     CeilingAttachmentStatus.STATE_RECOVERY_HOVER,
                     now,
@@ -718,6 +808,17 @@ class CeilingAttachmentDecisionNode:
                 )
 
     def _detach_thrust(self, dt):
+        if getattr(self, "console_contact_profile", False):
+            z = self._height_feedback(rospy.Time.now())
+            if z is None or self.detach_start_height_m is None:
+                return -self.hover_thrust
+            target_z = self.detach_start_height_m - self.detach_drop_m
+            target_vz = clamp(self.detach_height_kp*(target_z-z), -self.detach_down_speed_mps, 0.10)
+            vz = vertical_speed_enu_mps(self.odom, self.odom_twist_in_child_frame)
+            if not math.isfinite(vz):
+                return -self.hover_thrust
+            thrust = self.hover_thrust + self.detach_velocity_kp*(target_vz-vz)
+            return -clamp(thrust, self.detach_min_thrust, min(self.max_thrust, self.hover_thrust+0.08))
         self.target_distance_m = min(
             self.detach_safe_distance_m,
             self.target_distance_m + self.detach_distance_ramp_mps * dt,
@@ -764,6 +865,11 @@ class CeilingAttachmentDecisionNode:
     def _build_status(self, now, dt):
         status = CeilingAttachmentStatus()
         status.header.stamp = now
+        status.activation_ready = self._activation_ready(now) if getattr(self, "console_contact_profile", False) else False
+        z = self._height_feedback(now) if getattr(self, "console_contact_profile", False) else None
+        status.detach_start_height_m = self.detach_start_height_m if getattr(self, "detach_start_height_m", None) is not None else math.nan
+        status.descended_height_m = self.detach_start_height_m-z if z is not None and self.detach_start_height_m is not None else math.nan
+        status.detach_height_ready = self._detach_height_ready(now) if self.state == CeilingAttachmentStatus.STATE_DETACH and getattr(self, "console_contact_profile", False) else False
         status.state = self.state
         status.state_name = self.STATE_NAMES[self.state]
         # Keep ownership through controlled detach/recovery even if the

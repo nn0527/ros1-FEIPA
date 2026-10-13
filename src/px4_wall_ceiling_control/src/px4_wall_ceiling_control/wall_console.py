@@ -140,6 +140,7 @@ class ConsoleState:
                 ("idle", "待命状态", val("phase") == "IDLE" and val("owner") == 0 and
                  val("operator", {}).get("mode") == 1 and not val("operator", {}).get("enabled", True), "已有动作请求，等待当前流程结束"),
             ]
+            checks.append(("front_mask", "前部雷达控制输入", not runtime.get("front_sensor_masked", False), "前部雷达已屏蔽；重启基础程序后恢复侧吸"))
             pending = self.pending_since is not None and now - self.pending_since < 5
             blockers = [reason for _, _, ok, reason in checks if not ok]
             if pending:
@@ -169,12 +170,12 @@ class ConsoleState:
             if self.launch_error or self.starting:
                 detach_blockers.insert(0, "基础程序未就绪")
             ceiling = val("ceiling_status", {})
-            common = [reason for i, _, ok, reason in checks if i not in ("height", "health") and not ok]
+            common = [reason for i, _, ok, reason in checks if i not in ("height", "health", "front_mask") and not ok]
             ceiling_checks = [
                 (runtime.get("ceiling_enabled"), "吸顶节点未启用；请在落地后重新启动基础程序"),
                 (status["ceiling_status"]["fresh"] and ceiling.get("state_name") == "NORMAL_FLIGHT", "吸顶决策未待命或反馈过期"),
                 (health.get("ceiling_valid") and status["ceiling"]["fresh"], "顶部雷达无效或过期"),
-                (isinstance(val("ceiling", {}).get("range_m"), (int,float)) and 0 < val("ceiling", {}).get("range_m", 99) < runtime.get("ceiling_activation_distance_m", .5), "需手动接近顶部至激活距离内"),
+                ((runtime.get("ceiling_distance_gate_enabled") or (isinstance(val("ceiling", {}).get("range_m"), (int,float)) and 0 < val("ceiling", {}).get("range_m", 99) < runtime.get("ceiling_activation_distance_m", .5))), "需手动接近顶部至激活距离内"),
                 (isinstance(val("odom", {}).get("vertical_speed"), (int,float)) and abs(val("odom", {}).get("vertical_speed", 99)) < runtime.get("ceiling_vertical_speed_gate_mps", .2), "竖直速度未满足吸顶入口条件"),
             ]
             ceiling_blockers = common + [reason for ok, reason in ceiling_checks if not ok]

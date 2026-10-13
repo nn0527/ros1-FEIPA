@@ -39,3 +39,9 @@ bool attitude_setpoint_valid
 geometry_msgs/Quaternion attitude_setpoint
 uint32 fault_count
 string reason
+
+# Console test gates and ENU height-difference feedback.
+bool activation_ready
+float32 detach_start_height_m
+float32 descended_height_m
+bool detach_height_ready

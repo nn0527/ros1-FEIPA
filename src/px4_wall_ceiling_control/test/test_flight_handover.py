@@ -923,7 +923,8 @@ class FlightHandoverTest(unittest.TestCase):
         node.ceiling_detach_pub = mock.Mock()
         node.wall_detach_pub = mock.Mock()
 
-        node._on_command(String(data="ceiling"))
+        with mock.patch.object(rospy, "set_param"):
+            node._on_command(String(data="ceiling"))
         node._on_command(String(data="detach"))
         with mock.patch.object(
             rospy.Time, "now", return_value=rospy.Time.from_sec(10.0)

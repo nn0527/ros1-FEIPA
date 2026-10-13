@@ -52,6 +52,7 @@ class FlightModeManagerNode:
         self.operator_timeout_s = float(rospy.get_param("~operator_timeout_s", 0.5))
         self.sensor_timeout_s = float(rospy.get_param("~sensor_timeout_s", 0.5))
         self.wall_manual_approach = bool(rospy.get_param("~wall_manual_approach", False))
+        self.ceiling_distance_gate_enabled = bool(rospy.get_param("~ceiling_distance_gate_enabled", False))
         self.wall_auto_approach = bool(rospy.get_param("~wall_auto_approach", False))
         if self.wall_manual_approach and self.wall_auto_approach:
             raise ValueError("manual and automatic wall approach cannot both be enabled")
@@ -327,6 +328,12 @@ class FlightModeManagerNode:
         if message.data and self.phase == self.WAITING_WALL:
             self.manual_wait_canceled = True
 
+    def _ceiling_takeover_ready(self, now):
+        if not getattr(self, "ceiling_distance_gate_enabled", False) or self.selected_mode != OperatorCommand.MODE_CEILING:
+            return True
+        status = self.ceiling
+        return bool(status is not None and is_fresh(self.ceiling_at, self.status_timeout_s, now) and status.activation_ready)
+
     def _auto_wall_selected(self):
         return getattr(self, "wall_auto_approach", False) and self.selected_mode == OperatorCommand.MODE_WALL
 
@@ -543,6 +550,7 @@ class FlightModeManagerNode:
                     or not self._preflight_ready(rospy.Time.now(), self.selected_mode)
                     or not self._stream_ready(rospy.Time.now())
                     or (self._gated_wall_selected() and not self._wall_takeover_ready(rospy.Time.now()))
+                    or not self._ceiling_takeover_ready(rospy.Time.now())
                 ):
                     return
             elif mode == "ALTCTL":
@@ -680,8 +688,14 @@ class FlightModeManagerNode:
                 if self.stream_since is None:
                     self.stream_since = monotonic_now
                 elif monotonic_now - self.stream_since >= self.prestream_s:
-                    self._set_phase(self.ENTERING)
-                    self._request_mode("OFFBOARD")
+                    if self._ceiling_takeover_ready(now):
+                        self._set_phase(self.ENTERING)
+                        self._request_mode("OFFBOARD")
+                    elif monotonic_now-self.phase_since >= 60:
+                        self.cancel_pub.publish(String(data="cancel"))
+                        self._reset(lock=True, reason="吸顶距离等待超过60秒；请释放请求后重试")
+                    else:
+                        self.phase_reason = "吸顶等待：有效顶距≤1 m连续0.30秒；仍由飞手在 ALTCTL 控制"
             else:
                 self.stream_since = None
         elif self.phase == self.ENTERING:
@@ -740,6 +754,8 @@ class FlightModeManagerNode:
                 self._reset(lock=True, reason=failure_reason)
             else:
                 self._observe_completion(now)
+                if self.selected_mode == OperatorCommand.MODE_CEILING and getattr(self, "ceiling", None) is not None and is_fresh(self.ceiling_at, self.status_timeout_s, now):
+                    self.phase_reason = self.ceiling.reason
                 if (self._auto_wall_selected() and self.wall is not None
                         and is_fresh(self.wall_at, self.status_timeout_s, now)
                         and self.wall.state == WallPerchStatus.STATE_SLOW_APPROACH):

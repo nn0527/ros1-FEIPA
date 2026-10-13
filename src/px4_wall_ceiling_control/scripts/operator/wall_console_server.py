@@ -192,7 +192,7 @@ class RemoteRuntime:
             value = {"ceiling_valid": msg.ceiling_valid, "front_valid": msg.front_valid,
                      "ceiling_age_s": msg.ceiling_age_s, "front_age_s": msg.front_age_s}
         elif name == "ceiling_status":
-            value = {key: getattr(msg, key) for key in ("state_name", "reason", "fault_detected", "attach_confirmed", "distance_stable", "range_fresh", "odom_fresh", "candidate_valid", "ceiling_distance_filtered_m", "compression_m", "target_distance_m", "detach_failed")}
+            value = {key: getattr(msg, key) for key in ("state_name", "reason", "fault_detected", "attach_confirmed", "distance_stable", "range_fresh", "odom_fresh", "candidate_valid", "ceiling_distance_filtered_m", "compression_m", "target_distance_m", "detach_failed", "activation_ready", "detach_start_height_m", "descended_height_m", "detach_height_ready")}
         elif name == "wall":
             value = {key: getattr(msg, key) for key in ("state_name", "reason", "progress", "fault_detected",
                       "front_distance_filtered_m", "top_distance_filtered_m", "thrust_normalized", "top_contact_ready",
@@ -269,7 +269,7 @@ class RemoteRuntime:
                     self.state.config = validate_config(migrate_legacy_ports(running))
                 except (ValueError, TypeError):
                     enabled = False
-        return {"ceiling_enabled": "/ceiling_attachment_decision_node" in nodes,
+        return {"front_sensor_masked": self.ros.get_param("/attachment/front_sensor_masked", False), "ceiling_distance_gate_enabled": self.ros.get_param("/flight_mode_manager_node/ceiling_distance_gate_enabled", False), "ceiling_enabled": "/ceiling_attachment_decision_node" in nodes,
                 "ceiling_activation_distance_m": self.ros.get_param("/ceiling_attachment_decision_node/activation_distance_m", .5),
                 "ceiling_vertical_speed_gate_mps": self.ros.get_param("/ceiling_attachment_decision_node/vertical_speed_gate_mps", .2),
                 "enabled": bool(enabled), "test_profile": profile, "nodes": sorted(nodes),
@@ -445,8 +445,10 @@ class RemoteRuntime:
         def publish(command):
             if not self.publisher or self.publisher.get_num_connections() == 0:
                 raise ValueError("终端指令节点未订阅，消息未发送")
+            self.ros.set_param("/attachment/front_sensor_masked", True)
             self.publisher.publish(command)
         self.state.send_ceiling(publish)
+        self.state.event("前部雷达已屏蔽；重启基础程序后恢复，屏蔽期间禁止侧吸")
         return {"message": "吸顶请求已提交；等待 OFFBOARD 接管与顶部接触确认"}
 
     def ceiling_detach(self):

@@ -15,6 +15,8 @@ from px4_wall_ceiling_control.adapters.kill_switch import KillSwitchConfig
 
 class TerminalOperatorNode:
     def __init__(self):
+        self.front_sensor_masked = False
+        rospy.set_param("/attachment/front_sensor_masked", False)
         self.mode = OperatorCommand.MODE_STANDBY
         self.detaching = False
         self.detach_pulse = False
@@ -50,6 +52,9 @@ class TerminalOperatorNode:
             if not safety["valid"] or safety["active"]:
                 rospy.logwarn("terminal operator: kill switch active or unavailable; command rejected")
                 return
+        if command == "wall" and getattr(self, "front_sensor_masked", False):
+            rospy.logwarn("front sensor masked after ceiling request; restart base program before wall testing")
+            return
         if command in ("ceiling", "wall"):
             if self.mode != OperatorCommand.MODE_STANDBY or self.detaching:
                 rospy.logwarn("terminal operator: finish current cycle before %s", command)
@@ -63,6 +68,10 @@ class TerminalOperatorNode:
                 else OperatorCommand.MODE_WALL
             )
             self.was_offboard = False
+            if command == "ceiling":
+                self.front_sensor_masked = True
+                rospy.set_param("/attachment/front_sensor_masked", True)
+                rospy.logwarn("ceiling requested: front sensor excluded from control until base program restarts")
             rospy.loginfo("terminal operator: %s requested", command)
         elif command == "detach":
             if self.mode not in (
