@@ -22,7 +22,7 @@ TOPICS = [
     "/ceiling_attachment/status", "/ceiling_attachment/control_candidate", "/ceiling_attachment/detach",
     "/mavros/setpoint_raw/attitude", "/mavros/setpoint_raw/target_attitude",
     "/mavros/state", "/mavros/local_position/odom", "/mavros/local_position/velocity_local",
-    "/mavros/imu/data", "/mavros/estimator_status", "/mavros/rc/in", "/mavros/rc/out",
+    "/mavros/imu/data", "/mavros/imu/static_pressure", "/mavros/estimator_status", "/mavros/rc/in", "/mavros/rc/out",
     "/attachment/kill_switch",
     "/mavros/battery", "/mavros/altitude", "/mavros/global_position/raw/fix",
     "/mavros/global_position/raw/gps_vel", "/mavros/statustext/recv",
@@ -197,7 +197,8 @@ class SignalSummary:
         for key in ("state_name", "reason", "candidate_valid", "fault_count", "range_fresh", "odom_fresh",
                     "ceiling_distance_raw_m", "ceiling_distance_filtered_m", "activation_ready",
                     "attach_confirmed", "detach_start_height_m", "descended_height_m", "detach_height_ready",
-                    "thrust_body_z_normalized", "approach_velocity_z_enu_mps", "detach_failed"):
+                    "thrust_body_z_normalized", "approach_velocity_z_enu_mps", "detach_failed",
+                    "height_source", "baro_fresh", "baro_reference_ready", "baro_pressure_pa", "hold_pressure_pa"):
             row["ceiling_" + key] = getattr(ceiling, key, None)
         odom = sample("/mavros/local_position/odom", "odom")
         for key in ("x", "y", "z"):
@@ -222,6 +223,8 @@ class SignalSummary:
                 valid and target is not None and odom is not None and fresh and row["odom_age_s"] <= .5) else None
         for key in ("x", "y", "z", "w"):
             row["measured_q_" + key] = getattr(odom.pose.pose.orientation, key) if odom else None
+        pressure = sample("/mavros/imu/static_pressure", "pressure")
+        row["pressure_pa"] = getattr(pressure, "fluid_pressure", None)
         state = sample("/mavros/state", "px4")
         for key in ("connected", "armed", "mode"):
             row["px4_" + key] = getattr(state, key, None)

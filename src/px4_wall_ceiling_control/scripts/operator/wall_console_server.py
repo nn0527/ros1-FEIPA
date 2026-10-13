@@ -132,6 +132,11 @@ class RemoteRuntime:
         require_disarmed()
         if not request(message_id=83, message_rate=10.0).success:
             raise ValueError("飞控未确认推力目标遥测频率，无法确认平滑接管所需反馈")
+        require_disarmed()
+        if request(message_id=105, message_rate=10.0).success:
+            self.state.event("已请求 HIGHRES_IMU 10 Hz，获取气压计原始压力；以实际新鲜气压反馈判断离顶")
+        else:
+            self.state.event("气压遥测频率请求未确认；气压缺失时离顶按钮禁用")
         self.state.event("已请求 ESTIMATOR_STATUS 5 Hz；实际频率仍由飞控链路带宽决定")
         self.state.event("已请求 ATTITUDE_TARGET 10 Hz，用于匹配 ALTCTL 接管推力")
 
@@ -198,7 +203,7 @@ class RemoteRuntime:
             value = {"ceiling_valid": msg.ceiling_valid, "front_valid": msg.front_valid,
                      "ceiling_age_s": msg.ceiling_age_s, "front_age_s": msg.front_age_s}
         elif name == "ceiling_status":
-            value = {key: getattr(msg, key) for key in ("state_name", "reason", "fault_detected", "attach_confirmed", "distance_stable", "range_fresh", "odom_fresh", "candidate_valid", "ceiling_distance_filtered_m", "compression_m", "target_distance_m", "detach_failed", "activation_ready", "detach_start_height_m", "descended_height_m", "detach_height_ready")}
+            value = {key: getattr(msg, key) for key in ("state_name", "reason", "fault_detected", "attach_confirmed", "distance_stable", "range_fresh", "odom_fresh", "candidate_valid", "ceiling_distance_filtered_m", "compression_m", "target_distance_m", "detach_failed", "activation_ready", "detach_start_height_m", "descended_height_m", "detach_height_ready", "height_source", "baro_fresh", "baro_reference_ready", "baro_pressure_pa", "hold_pressure_pa")}
         elif name == "wall":
             value = {key: getattr(msg, key) for key in ("state_name", "reason", "progress", "fault_detected",
                       "front_distance_filtered_m", "top_distance_filtered_m", "thrust_normalized", "top_contact_ready",

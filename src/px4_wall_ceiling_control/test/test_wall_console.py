@@ -240,7 +240,7 @@ class ConsoleTests(unittest.TestCase):
         with mock.patch.dict(sys.modules, {"mavros_msgs.srv": SimpleNamespace(MessageInterval=object)}):
             runtime.configure_telemetry()
         self.assertEqual(runtime.ros.ServiceProxy.return_value.call_args_list,
-                         [mock.call(message_id=230, message_rate=5.0), mock.call(message_id=83, message_rate=10.0)])
+                         [mock.call(message_id=230, message_rate=5.0), mock.call(message_id=83, message_rate=10.0), mock.call(message_id=105, message_rate=10.0)])
 
     def test_telemetry_rechecks_disarmed_before_attitude_stream_request(self):
         runtime = self.telemetry_runtime()
@@ -341,6 +341,19 @@ class ConsoleTests(unittest.TestCase):
         self.state.update("owner", 2)
         self.assertFalse(self.state.snapshot()["can_ceiling_detach"])
 
+    def test_baro_detach_requires_fresh_pressure_reference_without_top_range(self):
+        self.ceiling_ready()
+        self.state.update("setpoint", {"thrust": .50})
+        self.state.update("state", {"connected":True,"armed":True,"mode":"OFFBOARD"})
+        self.state.update("phase","ACTIVE");self.state.update("owner",1)
+        self.state.update("operator",{"mode":2,"enabled":True})
+        value={"state_name":"SURFACE_HOLD","reason":"hold","odom_fresh":True,"fault_detected":False,"range_fresh":False,"height_source":"barometer_hold_relative","baro_fresh":False,"baro_reference_ready":True}
+        self.state.update("ceiling_status",value)
+        self.assertFalse(self.state.snapshot()["can_ceiling_detach"])
+        value["baro_fresh"]=True;self.state.update("ceiling_status",value)
+        self.assertTrue(self.state.snapshot()["can_ceiling_detach"])
+        value["baro_reference_ready"]=False;self.state.update("ceiling_status",value)
+        self.assertFalse(self.state.snapshot()["can_ceiling_detach"])
     def test_ready_dispatches_exactly_one_wall(self):
         self.ready()
         self.state.send_wall(self.publisher)

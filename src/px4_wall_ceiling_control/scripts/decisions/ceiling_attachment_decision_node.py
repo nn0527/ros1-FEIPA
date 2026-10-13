@@ -12,7 +12,7 @@ import rospy
 from geometry_msgs.msg import Quaternion
 from mavros_msgs.msg import State
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Range
+from sensor_msgs.msg import Range, FluidPressure
 from std_msgs.msg import Bool
 
 from px4_wall_ceiling_control.adapters.odometry import vertical_speed_enu_mps, odometry_is_finite
@@ -161,6 +161,14 @@ class CeilingAttachmentDecisionNode:
         self.wall_contact_hold_s = float(rospy.get_param("~wall_contact_hold_s", 1.0))
         self.wall_contact_window_samples = max(3, int(rospy.get_param("~wall_contact_window_samples", 3)))
         self.surface_hold_thrust = float(rospy.get_param("~surface_hold_thrust", 0.50))
+        self.detach_baro_height_enabled = bool(rospy.get_param("~detach_baro_height_enabled", False))
+        self.baro_timeout_s = float(rospy.get_param("~baro_timeout_s", 1.0))
+        if not math.isfinite(self.baro_timeout_s) or self.baro_timeout_s <= 0:
+            raise ValueError("baro_timeout_s must be finite and positive")
+        self.baro_pressure_pa = None
+        self.baro_received_at = None
+        self.hold_pressure_pa = None
+        self.baro_handover_reached = False
         self.detach_drop_m = float(rospy.get_param("~detach_drop_m", 0.20))
         self.detach_height_tolerance_m = float(rospy.get_param("~detach_height_tolerance_m", 0.01))
         self.detach_height_hold_s = float(rospy.get_param("~detach_height_hold_s", 0.20))
@@ -239,6 +247,8 @@ class CeilingAttachmentDecisionNode:
             queue_size=10,
         )
         rospy.Subscriber(range_topic, Range, self._on_range, queue_size=10)
+        rospy.Subscriber(rospy.get_param("~baro_topic", "/mavros/imu/static_pressure"),
+                         FluidPressure, self._on_pressure, queue_size=10)
         rospy.Subscriber(odom_topic, Odometry, self._on_odom, queue_size=10)
         rospy.Subscriber(
             rospy.get_param("~state_topic", "/mavros/state"),
@@ -373,6 +383,26 @@ class CeilingAttachmentDecisionNode:
             self.attach_detected_at = self.attach_last_sample_at = None
             self.contact_samples = []; self.contact_near_samples = 0
 
+    def _baro_enabled(self):
+        return getattr(self, "console_contact_profile", False) and getattr(self, "detach_baro_height_enabled", False)
+
+    def _baro_fresh(self, now):
+        return (is_fresh(self.baro_received_at, self.baro_timeout_s, now)
+                and self.baro_pressure_pa is not None)
+
+    def _on_pressure(self, message):
+        p = message.fluid_pressure  # FluidPressure uses Pa, not hPa.
+        if not math.isfinite(p) or not 20000.0 <= p <= 120000.0:
+            self.baro_received_at = None
+            return
+        self.baro_pressure_pa = p
+        self.baro_received_at = rospy.Time.now()
+        if self._baro_enabled() and self.state == CeilingAttachmentStatus.STATE_SURFACE_HOLD and self.hold_pressure_pa is None:
+            # Capture the first fresh sample in HOLD if entry had no pressure.
+            # This reference is frozen through HOLD and DETACH.
+            self.hold_pressure_pa = p
+            rospy.loginfo("Ceiling hold barometer reference captured: %.3f Pa", p)
+
     def _on_odom(self, message):
         self.odom = message
         self.odom_received_at = rospy.Time.now()
@@ -487,11 +517,16 @@ class CeilingAttachmentDecisionNode:
         self.last_reason = reason
         if getattr(self, "console_contact_profile", False):
             self.contact_samples = []; self.contact_near_samples = 0
+            if new_state == CeilingAttachmentStatus.STATE_SURFACE_HOLD and self._baro_enabled():
+                self.hold_pressure_pa = self.baro_pressure_pa if self._baro_fresh(now) else None
+                self.baro_handover_reached = False
             if new_state == CeilingAttachmentStatus.STATE_DETACH:
-                self.detach_start_height_m = self._height_feedback(now)
+                self.detach_start_height_m = (0.0 if self.hold_pressure_pa is not None else None) if self._baro_enabled() else self._height_feedback(now)
                 self.detach_height_since = self.detach_height_last_sample_at = self.detach_height_processed_at = None
             elif new_state == CeilingAttachmentStatus.STATE_NORMAL_FLIGHT:
                 self.detach_start_height_m = None
+                self.hold_pressure_pa = None
+                self.baro_handover_reached = False
         self.attach_detected_at = None
         self.attach_last_sample_at = None
         self.stable_detected_at = None
@@ -551,6 +586,11 @@ class CeilingAttachmentDecisionNode:
                                   self.activation_last_sample_at, self.activation_hold_s)
 
     def _height_feedback(self, now):
+        if self._baro_enabled():
+            if not self._baro_fresh(now) or self.hold_pressure_pa is None:
+                return None
+            # Standard-atmosphere pressure ratio gives height relative to HOLD.
+            return 44330.0 * (1.0 - (self.baro_pressure_pa / self.hold_pressure_pa) ** 0.190294957)
         if not self._odom_fresh(now) or self.odom is None:
             return None
         z = self.odom.pose.pose.position.z
@@ -561,6 +601,10 @@ class CeilingAttachmentDecisionNode:
         if z is None or self.detach_start_height_m is None:
             self.detach_height_since = self.detach_height_last_sample_at = None
             return False
+        if self._baro_enabled():
+            if self.detach_start_height_m-z >= self.detach_drop_m:
+                self.baro_handover_reached = True
+            return self.baro_handover_reached
         if self.detach_height_processed_at != self.odom_received_at:
             self.detach_height_processed_at = self.odom_received_at
             speed = vertical_speed_enu_mps(self.odom, self.odom_twist_in_child_frame)
@@ -619,6 +663,14 @@ class CeilingAttachmentDecisionNode:
             CeilingAttachmentStatus.STATE_ATTACH_CONTROL,
         ):
             self.state_entered_at += rospy.Duration(max(0.0, (now-previous_tick).to_sec()))
+        if (self._baro_enabled() and self.baro_handover_reached
+                and self.state == CeilingAttachmentStatus.STATE_DETACH
+                and is_fresh(self.flight_state_received_at, self.state_timeout_s, now)
+                and self.flight_state is not None and self.flight_state.connected
+                and self.flight_state.mode.upper() == "ALTCTL"):
+            self._enter_state(CeilingAttachmentStatus.STATE_NORMAL_FLIGHT, now,
+                              "barometer descent complete; PX4 ALTCTL handover confirmed")
+            return
         mode_requested = self._mode_requested(now)
         arm_requested = self._arm_requested(now)
         range_fresh = self._range_fresh(now)
@@ -794,6 +846,9 @@ class CeilingAttachmentDecisionNode:
                     "attachment mechanism release timeout",
                 )
             elif self._mechanism_release_confirmed(now) and (self._detach_height_ready(now) if profile else self._detach_clear(now)):
+                if self._baro_enabled():
+                    self.last_reason = "气压相对吸顶保持高度下降0.50m已达到；立即请求ALTCTL，无速度稳定等待"
+                    return  # Keep continuous attitude output until actual ALTCTL confirmation.
                 self._enter_state(
                     CeilingAttachmentStatus.STATE_RECOVERY_HOVER,
                     now,
@@ -831,8 +886,11 @@ class CeilingAttachmentDecisionNode:
             z = self._height_feedback(rospy.Time.now())
             if z is None or self.detach_start_height_m is None:
                 return -self.hover_thrust
+            if self._baro_enabled() and self.baro_handover_reached:
+                return -self.hover_thrust
             target_z = self.detach_start_height_m - self.detach_drop_m
-            target_vz = clamp(self.detach_height_kp*(target_z-z), -self.detach_down_speed_mps, 0.10)
+            target_vz = (-self.detach_down_speed_mps if self._baro_enabled() else
+                         clamp(self.detach_height_kp*(target_z-z), -self.detach_down_speed_mps, 0.10))
             vz = vertical_speed_enu_mps(self.odom, self.odom_twist_in_child_frame)
             if not math.isfinite(vz):
                 return -self.hover_thrust
@@ -884,6 +942,11 @@ class CeilingAttachmentDecisionNode:
     def _build_status(self, now, dt):
         status = CeilingAttachmentStatus()
         status.header.stamp = now
+        status.height_source = "barometer_hold_relative" if self._baro_enabled() else "px4_odom"
+        status.baro_fresh = self._baro_fresh(now)
+        status.baro_reference_ready = self.hold_pressure_pa is not None
+        status.baro_pressure_pa = self.baro_pressure_pa if self.baro_pressure_pa is not None else math.nan
+        status.hold_pressure_pa = self.hold_pressure_pa if self.hold_pressure_pa is not None else math.nan
         status.activation_ready = self._activation_ready(now) if getattr(self, "console_contact_profile", False) else False
         z = self._height_feedback(now) if getattr(self, "console_contact_profile", False) else None
         status.detach_start_height_m = self.detach_start_height_m if getattr(self, "detach_start_height_m", None) is not None else math.nan
@@ -1012,10 +1075,14 @@ class CeilingAttachmentDecisionNode:
         status.fault_count = self.fault_count
         status.reason = self.last_reason
         if getattr(self, "console_contact_profile", False) and not status.range_fresh:
-            action = ("按PX4高度下降20cm并交回ALTCTL" if self.state == CeilingAttachmentStatus.STATE_DETACH
+            action = (("按气压高度下降0.50m并交回ALTCTL" if self._baro_enabled() else "按PX4高度下降20cm并交回ALTCTL") if self.state == CeilingAttachmentStatus.STATE_DETACH
                       else "保持推力0.50" if self.state == CeilingAttachmentStatus.STATE_SURFACE_HOLD
                       else "暂停接近，等待有效数据")
             status.reason += "; 顶部雷达无效或过期：" + action
+        if self._baro_enabled() and not status.baro_fresh:
+            status.reason += "; 气压数据缺失、无效或过期，禁止据此确认离顶完成"
+        elif self._baro_enabled() and self.state == CeilingAttachmentStatus.STATE_SURFACE_HOLD and not status.baro_reference_ready:
+            status.reason += "; 等待气压数据建立吸顶保持高度基准"
         return status
 
     @staticmethod

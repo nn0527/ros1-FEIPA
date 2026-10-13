@@ -33,6 +33,8 @@
     <arg name="wall_require_min_altitude" value="$(eval not arg('restrained_bench'))" />
     <arg name="wall_bench_wait_for_ranges" value="$(arg restrained_bench)" />
   </include>
+  <param name="/ceiling_attachment_decision_node/detach_baro_height_enabled" value="true" />
+  <param name="/flight_mode_manager_node/ceiling_baro_handover_enabled" value="true" />
   <param name="/attachment/front_sensor_masked" value="false" />
   <param name="/flight_mode_manager_node/ceiling_distance_gate_enabled" value="true" />
   <param name="/ceiling_attachment_decision_node/console_contact_profile" value="true" />
@@ -45,9 +47,9 @@
   <param name="/ceiling_attachment_decision_node/approach_settle_time_s" value="0.0" />
   <param name="/ceiling_attachment_decision_node/contact_distance_m" value="0.056" />
   <param name="/ceiling_attachment_decision_node/target_compression_m" value="0.006" />
-  <param name="/ceiling_attachment_decision_node/detach_drop_m" value="0.20" />
+  <param name="/ceiling_attachment_decision_node/detach_drop_m" value="0.50" />
   <param name="/ceiling_attachment_decision_node/detach_safe_distance_m" value="0.10" />
-  <param name="/ceiling_attachment_decision_node/detach_timeout_s" value="10.0" />
+  <param name="/ceiling_attachment_decision_node/detach_timeout_s" value="20.0" />
   <param name="/ceiling_attachment_decision_node/recovery_hover_time_s" value="0.20" />
   <!-- Passive independent ceiling capture, identical format to wall records. -->
   <node pkg="px4_wall_ceiling_control" type="attachment_flight_logger.py"

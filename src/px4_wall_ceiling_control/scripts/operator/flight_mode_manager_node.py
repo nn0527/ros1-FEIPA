@@ -52,6 +52,7 @@ class FlightModeManagerNode:
         self.operator_timeout_s = float(rospy.get_param("~operator_timeout_s", 0.5))
         self.sensor_timeout_s = float(rospy.get_param("~sensor_timeout_s", 0.5))
         self.wall_manual_approach = bool(rospy.get_param("~wall_manual_approach", False))
+        self.ceiling_baro_handover_enabled = bool(rospy.get_param("~ceiling_baro_handover_enabled", False))
         self.ceiling_distance_gate_enabled = bool(rospy.get_param("~ceiling_distance_gate_enabled", False))
         self.wall_auto_approach = bool(rospy.get_param("~wall_auto_approach", False))
         if self.wall_manual_approach and self.wall_auto_approach:
@@ -396,6 +397,16 @@ class FlightModeManagerNode:
             and all(800 <= channels[index] <= 2200 for index in indices)
         )
 
+    def _ceiling_baro_handover_ready(self, now):
+        status = getattr(self, "ceiling", None)
+        return bool(getattr(self, "ceiling_baro_handover_enabled", False)
+                    and self.selected_mode == OperatorCommand.MODE_CEILING
+                    and status is not None and is_fresh(self.ceiling_at, self.status_timeout_s, now)
+                    and status.state == CeilingAttachmentStatus.STATE_DETACH
+                    and status.detach_height_ready and status.baro_fresh
+                    and status.baro_reference_ready and not status.detach_failed
+                    and not status.fault_detected)
+
     def _handover_ready(self, now):
         if self.output_mode != 2 or not is_fresh(
             self.output_at, self.output_timeout_s, now
@@ -412,6 +423,8 @@ class FlightModeManagerNode:
             self.odom_at, self.odom_timeout_s, now
         ) or not odometry_is_finite(self.odom):
             return False
+        if getattr(self, "ceiling_baro_handover_enabled", False) and self.selected_mode == OperatorCommand.MODE_CEILING:
+            return self._ceiling_baro_handover_ready(now)  # No legacy speed/settle fallback.
         orientation = self.odom.pose.pose.orientation
         roll, pitch, _yaw = euler_from_quaternion(
             (orientation.x, orientation.y, orientation.z, orientation.w)
@@ -460,6 +473,8 @@ class FlightModeManagerNode:
                 self.fault_seen = True
             if status.state == CeilingAttachmentStatus.STATE_DETACH:
                 self.detach_seen = True
+                if self._ceiling_baro_handover_ready(now):
+                    self.completed = True
             elif self.detach_seen and status.state == CeilingAttachmentStatus.STATE_RECOVERY_HOVER:
                 self.recovery_seen = True
             elif (
@@ -759,7 +774,11 @@ class FlightModeManagerNode:
                         and is_fresh(self.wall_at, self.status_timeout_s, now)
                         and self.wall.state == WallPerchStatus.STATE_SLOW_APPROACH):
                     self.phase_reason = self.wall.reason
-                if (self.completed and self.owner_seen
+                if self._ceiling_baro_handover_ready(now):
+                    self._set_phase(self.RETURNING, reason=self.ceiling.reason)
+                    if self._handover_ready(now):
+                        self._request_mode("ALTCTL")
+                elif (self.completed and self.owner_seen
                     and (self.owner == 0 or (self.selected_mode == OperatorCommand.MODE_WALL and self.owner == 2))
                     and is_fresh(self.owner_at, self.output_timeout_s, now)):
                     self._set_phase(self.RETURNING)

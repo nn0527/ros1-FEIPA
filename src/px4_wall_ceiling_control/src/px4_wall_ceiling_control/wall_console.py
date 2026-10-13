@@ -188,6 +188,7 @@ class ConsoleState:
                 and flight.get("connected") and flight.get("armed") and flight.get("mode") == "OFFBOARD"
                 and ceiling.get("state_name") == "SURFACE_HOLD" and not ceiling.get("fault_detected")
                 and ceiling.get("odom_fresh")
+                and (ceiling.get("height_source") != "barometer_hold_relative" or (ceiling.get("baro_fresh") and ceiling.get("baro_reference_ready")))
                 and val("phase") == "ACTIVE" and val("owner") == 1
                 and val("operator", {}).get("mode") == 2 and val("operator", {}).get("enabled")
                 and status["setpoint"]["fresh"]
@@ -222,7 +223,7 @@ class ConsoleState:
             if not self.snapshot()["can_ceiling_detach"]:
                 raise ValueError("离顶要求当前吸顶保持、OFFBOARD及新鲜有效反馈")
             publish("detach")
-            self.event("已发送离顶请求；按PX4高度下降20cm后交回ALTCTL")
+            self.event("已发送离顶请求；按气压计相对吸顶保持高度下降0.50m后直接交回ALTCTL")
 
     def send_wall(self, publish):
         # Serialize the preflight check and dispatch across tabs and double clicks.

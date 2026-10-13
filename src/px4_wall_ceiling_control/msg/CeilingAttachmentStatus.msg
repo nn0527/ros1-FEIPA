@@ -45,3 +45,10 @@ bool activation_ready
 float32 detach_start_height_m
 float32 descended_height_m
 bool detach_height_ready
+
+# Barometer source and frozen ceiling-HOLD pressure baseline (Pa).
+string height_source
+bool baro_fresh
+bool baro_reference_ready
+float32 baro_pressure_pa
+float32 hold_pressure_pa

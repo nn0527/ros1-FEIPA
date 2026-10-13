@@ -2,7 +2,7 @@
 import unittest
 from unittest import mock
 import rospy
-from sensor_msgs.msg import Range
+from sensor_msgs.msg import Range, FluidPressure
 from nav_msgs.msg import Odometry
 from px4_wall_ceiling_control.msg import CeilingAttachmentStatus as S, OperatorCommand, SensorHealth
 from test_attachment_safety import CeilingDecision
@@ -55,6 +55,80 @@ class CeilingConsoleFlowTests(unittest.TestCase):
         self.n._enter_state(S.STATE_APPROACH,rospy.Time.now(),"test")
         self.sample(12,255);self.n._update_state_machine(rospy.Time.now())
         self.assertEqual(self.n.state,S.STATE_FAULT)
+    def baro_hold(self):
+        self.n.detach_baro_height_enabled=True;self.n.detach_drop_m=.5
+        self.n._on_pressure(FluidPressure(fluid_pressure=101325.))
+        self.n._enter_state(S.STATE_SURFACE_HOLD,rospy.Time.now(),"hold")
+    def pressure_drop(self,drop):
+        p=self.n.hold_pressure_pa*(1.+drop/44330.)**(1./.190294957)
+        self.n._on_pressure(FluidPressure(fluid_pressure=p))
+    def test_baro_reference_is_hold_not_detach_click_or_odometry(self):
+        self.baro_hold();reference=self.n.hold_pressure_pa
+        self.pressure_drop(.12);self.odom(80.)
+        self.n._enter_state(S.STATE_DETACH,rospy.Time.now(),"detach")
+        self.assertEqual(self.n.hold_pressure_pa,reference)
+        self.assertEqual(self.n.detach_start_height_m,0.)
+        self.assertAlmostEqual(self.n._height_feedback(rospy.Time.now()),-.12,places=6)
+    def test_baro_threshold_accepts_fast_descent_without_settle_wait(self):
+        self.baro_hold();self.n._enter_state(S.STATE_DETACH,rospy.Time.now(),"detach")
+        self.odom(1.,-2.)
+        self.pressure_drop(.49);self.assertFalse(self.n._detach_height_ready(rospy.Time.now()))
+        self.pressure_drop(.501);self.assertTrue(self.n._detach_height_ready(rospy.Time.now()))
+        self.n._update_state_machine(rospy.Time.now())
+        self.assertEqual(self.n.state,S.STATE_DETACH)
+        self.assertTrue(self.n._build_status(rospy.Time.now(),.02).detach_height_ready)
+        self.assertAlmostEqual(-self.n._detach_thrust(.02),self.n.hover_thrust)
+    def test_baro_stale_invalid_and_missing_reference_cannot_complete(self):
+        self.baro_hold();self.n._enter_state(S.STATE_DETACH,rospy.Time.now(),"detach")
+        self.pressure_drop(.6);self.clock=12.;self.assertFalse(self.n._detach_height_ready(rospy.Time.now()))
+        for value in [0.,float('nan'),255.]:
+            self.n._on_pressure(FluidPressure(fluid_pressure=value))
+            self.assertFalse(self.n._detach_height_ready(rospy.Time.now()))
+        self.n.hold_pressure_pa=None;self.n._on_pressure(FluidPressure(fluid_pressure=101330.))
+        self.assertIsNone(self.n._height_feedback(rospy.Time.now()))
+    def test_new_hold_uses_new_reference_and_altctl_confirmation_clears_it(self):
+        self.baro_hold();self.n._enter_state(S.STATE_DETACH,rospy.Time.now(),"detach")
+        self.pressure_drop(.6);self.n._detach_height_ready(rospy.Time.now())
+        self.n._on_state(State(connected=True,armed=True,mode='ALTCTL'))
+        self.n._update_state_machine(rospy.Time.now())
+        self.assertEqual(self.n.state,S.STATE_NORMAL_FLIGHT)
+        self.assertIsNone(self.n.hold_pressure_pa)
+        self.n._on_pressure(FluidPressure(fluid_pressure=100100.))
+        self.n._enter_state(S.STATE_SURFACE_HOLD,rospy.Time.now(),"second hold")
+        self.assertEqual(self.n.hold_pressure_pa,100100.)
+    def test_baro_manager_bypasses_speed_gate_but_never_stale_pressure(self):
+        m=Manager.__new__(Manager);m.ceiling_baro_handover_enabled=True
+        m.selected_mode=OperatorCommand.MODE_CEILING;m.status_timeout_s=.5
+        m.ceiling_at=m.output_at=m.estimator_at=m.odom_at=rospy.Time.now()
+        m.output_mode=2;m.output_timeout_s=.3;m.estimator_timeout_s=1.5;m.odom_timeout_s=.5
+        m.estimator=type('Estimate',(),{'attitude_status_flag':True,'velocity_vert_status_flag':True})()
+        m.odom=self.n.odom;m.odom.twist.twist.linear.z=-2.;m.odom.twist.twist.angular.y=2.
+        m.ceiling=S(state=S.STATE_DETACH,detach_height_ready=True,baro_fresh=True,baro_reference_ready=True)
+        self.assertTrue(m._handover_ready(rospy.Time.now()))
+        m.ceiling.baro_fresh=False;self.assertFalse(m._handover_ready(rospy.Time.now()))
+        m.ceiling.baro_fresh=True;self.clock=11.;self.assertFalse(m._handover_ready(rospy.Time.now()))
+    def test_baro_descent_remains_commanded_just_before_half_metre(self):
+        self.baro_hold();self.n._enter_state(S.STATE_DETACH,rospy.Time.now(),"detach")
+        self.pressure_drop(.499);self.odom(10.,0.)
+        self.assertLess(-self.n._detach_thrust(.02),self.n.hover_thrust)
+    def test_baro_timer_requests_altctl_without_owner_release_or_recovery(self):
+        with mock.patch.object(rospy,"get_param",side_effect=lambda k,d=None:d), mock.patch.object(rospy,"Publisher"), mock.patch.object(rospy,"Subscriber"), mock.patch.object(rospy,"ServiceProxy"), mock.patch.object(rospy,"Timer"):
+            m=Manager()
+        m.ceiling_baro_handover_enabled=True;m.phase=Manager.ACTIVE
+        m.selected_mode=OperatorCommand.MODE_CEILING
+        m.flight=State(connected=True,armed=True,mode='OFFBOARD');m.flight_at=rospy.Time.now()
+        m.owner=1;m.output_mode=2;m.owner_at=m.output_at=rospy.Time.now()
+        m.estimator=type('Estimate',(),{'attitude_status_flag':True,'velocity_vert_status_flag':True})()
+        m.estimator_at=m.odom_at=m.ceiling_at=rospy.Time.now()
+        m.odom=self.n.odom;m.odom.twist.twist.linear.z=-2.
+        m.ceiling=S(state=S.STATE_DETACH,detach_height_ready=True,baro_fresh=True,baro_reference_ready=True,reason='reached')
+        m._requested_mode=lambda now:OperatorCommand.MODE_CEILING
+        m._request_mode=mock.Mock()
+        with mock.patch.dict(Manager._on_timer.__globals__,kill_clear=lambda *a:True):
+            m._on_timer(None)
+        self.assertEqual(m.phase,Manager.RETURNING)
+        m._request_mode.assert_called_once_with('ALTCTL')
+        self.assertEqual(m.owner,1)
     def test_one_metre_requires_continuous_samples_for_point_three_seconds(self):
         for t in [10,10.1,10.2]:self.sample(t,1.)
         self.assertFalse(self.n._activation_ready(rospy.Time.now()))
