@@ -224,6 +224,32 @@ class SignalSummary:
             fresh = row[name + "_age_s"] is not None and row[name + "_age_s"] <= .25
             row[name + "_error_deg"] = attitude_error_deg(odom.pose.pose.orientation, target) if (
                 valid and target is not None and odom is not None and fresh and row["odom_age_s"] <= .5) else None
+        # Keep legacy candidate_* above bound to wall attitude candidates.
+        # Independent fields retain raw validity for BOTH candidate kinds.
+        for topic, name in (("/wall_perch/control_candidate", "wall_candidate"),
+                            ("/ceiling_attachment/control_candidate", "ceiling_candidate")):
+            message = sample(topic, name)
+            for key in ("source", "kind", "acquire_request", "keep_ownership", "reason"):
+                row[name + "_" + key] = getattr(message, key, None)
+            row[name + "_thrust"] = getattr(message, "thrust_normalized", None)
+            # *_candidate_valid already belongs to the behavior status summary.
+            row[name + "_raw_valid"] = getattr(message, "valid", None)
+            row[name + "_velocity_z_enu_mps"] = getattr(message, "velocity_z_enu_mps", None)
+            target = getattr(message, "attitude_setpoint", None)
+            for key in ("x", "y", "z", "w"):
+                row[name + "_q_" + key] = getattr(target, key, None)
+            fresh = row[name + "_age_s"] is not None and row[name + "_age_s"] <= .25
+            attitude_valid = bool(message is not None and message.valid and message.kind == 2)
+            row[name + "_fresh"] = fresh
+            row[name + "_attitude_valid"] = attitude_valid
+            row[name + "_error_deg"] = attitude_error_deg(odom.pose.pose.orientation, target) if (
+                attitude_valid and target is not None and odom is not None and fresh
+                and row["odom_age_s"] <= .5) else None
+        # Ownership is sampled independently; it does not prove a candidate was sent.
+        for topic, name in (("/attachment/output_owner", "output_owner"),
+                            ("/attachment/output_mode", "output_mode")):
+            message = sample(topic, name)
+            row[name] = getattr(message, "data", None)
         for key in ("x", "y", "z", "w"):
             row["measured_q_" + key] = getattr(odom.pose.pose.orientation, key) if odom else None
         pressure = sample("/mavros/imu/static_pressure", "pressure")

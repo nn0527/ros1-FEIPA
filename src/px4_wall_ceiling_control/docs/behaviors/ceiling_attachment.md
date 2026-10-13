@@ -1,5 +1,19 @@
 # 吸顶决策与控制逻辑
 
+## 当前控制台接近流程（2026-10-13）
+
+`wall_console_flight.launch` 的接近入口独立使用 `approach_contact_distance_m=0.07`：
+顶部最近 3 个有效样本的中位数 ≤7 cm 时进入 `ATTACH_CONTROL`。
+后续贴顶确认仍使用 `wall_contact_distance_m=0.056` 连续 1 秒。
+
+有效接近时间超过 `approach_timeout_s=12.0` 后进入锁存 `FAULT`，状态消息的
+`approach_timed_out=true` 明确请求模式管理器交回 ALTCTL。同一请求不自动重入接近。
+FAULT 保持姿态/悬停推力候选和输出归属，模式管理器在飞控、里程计、姿态/竖直速度估计、
+连续输出及遥控输入有效时请求 ALTCTL。该退出不需要保持气压基准，也不等待下降速度稳定。
+MAVROS 服务返回成功只代表请求已发送；确认新鲜、已连接的飞控实际反馈 ALTCTL 后，
+终端请求回到待机，决策释放归属。提前取消请求也不会在 ALTCTL 确认前释放本次超时 FAULT。
+实际遥控响应仍需真机验证；程序不把服务成功当作遥控器实际接管证据。
+
 ## 参考程序的状态链
 
 原始外部参考程序 `ceiling_controller.cpp` 实现的是接触式吸顶，不是简单定距悬停：

@@ -115,6 +115,7 @@ class FlightModeManagerNode:
         self.recovery_seen = False
         self.completed = False
         self.fault_seen = False
+        self.ceiling_approach_timeout_returning = False
         self.flight = None
         self.flight_at = None
         self.odom = None
@@ -419,6 +420,16 @@ class FlightModeManagerNode:
                     and status.baro_reference_ready and not status.detach_failed
                     and not status.fault_detected)
 
+    def _ceiling_approach_timeout_requested(self, now):
+        status = getattr(self, "ceiling", None)
+        return bool(
+            self.selected_mode == OperatorCommand.MODE_CEILING
+            and status is not None
+            and is_fresh(self.ceiling_at, self.status_timeout_s, now)
+            and status.state == CeilingAttachmentStatus.STATE_FAULT
+            and getattr(status, "approach_timed_out", False)
+        )
+
     def _handover_ready(self, now):
         if self.output_mode != 2 or not is_fresh(
             self.output_at, self.output_timeout_s, now
@@ -435,6 +446,20 @@ class FlightModeManagerNode:
             self.odom_at, self.odom_timeout_s, now
         ) or not odometry_is_finite(self.odom):
             return False
+        if getattr(self, "ceiling_approach_timeout_returning", False):
+            # This is an aborted approach, so there is no HOLD pressure baseline.
+            # Keep the FAULT stream until a live ALTCTL response. Valid RC input
+            # is required, but descent speed/centering must not prevent return.
+            return bool(
+                self._ceiling_approach_timeout_requested(now)
+                and self.flight is not None
+                and is_fresh(self.flight_at, self.state_timeout_s, now)
+                and self.flight.connected and self.flight.armed
+                and self.flight.mode.upper() == "OFFBOARD"
+                and self.owner == 1
+                and is_fresh(self.owner_at, self.output_timeout_s, now)
+                and self._rc_fresh(now)
+            )
         if getattr(self, "ceiling_baro_handover_enabled", False) and self.selected_mode == OperatorCommand.MODE_CEILING:
             return self._ceiling_baro_handover_ready(now)  # No legacy speed/settle fallback.
         orientation = self.odom.pose.pose.orientation
@@ -615,6 +640,7 @@ class FlightModeManagerNode:
         self.completed = False
         self.fault_seen = False
         self.lock_until_neutral = lock
+        self.ceiling_approach_timeout_returning = False
         self._set_phase(self.LOCKED if lock else self.IDLE, reason=reason)
 
     def _on_timer(self, _event):
@@ -786,7 +812,12 @@ class FlightModeManagerNode:
                         and is_fresh(self.wall_at, self.status_timeout_s, now)
                         and self.wall.state == WallPerchStatus.STATE_SLOW_APPROACH):
                     self.phase_reason = self.wall.reason
-                if self._ceiling_baro_handover_ready(now):
+                if self._ceiling_approach_timeout_requested(now):
+                    self.ceiling_approach_timeout_returning = True
+                    self._set_phase(self.RETURNING, reason="吸顶接近超时：FAULT锁存，等待ALTCTL确认后交回遥控器")
+                    if self._handover_ready(now):
+                        self._request_mode("ALTCTL")
+                elif self._ceiling_baro_handover_ready(now):
                     self._set_phase(self.RETURNING, reason=self.ceiling.reason)
                     if self._handover_ready(now):
                         self._request_mode("ALTCTL")
@@ -805,7 +836,10 @@ class FlightModeManagerNode:
                     rospy.logerr("%s; returning to ALTCTL", failure_reason)
                     self._set_phase(self.RETURNING, reason=failure_reason)
         elif self.phase == self.RETURNING:
-            if flight_fresh and flight_mode == "ALTCTL":
+            if (getattr(self, "ceiling_approach_timeout_returning", False)
+                    and (not flight_fresh or self.flight is None or not self.flight.connected)):
+                self.phase_reason = "waiting for fresh connected PX4 mode confirmation"
+            elif flight_fresh and flight_mode == "ALTCTL":
                 self._reset(
                     lock=True,
                     reason="returned to ALTCTL; release command before retry",
@@ -813,7 +847,10 @@ class FlightModeManagerNode:
             elif flight_fresh and flight_mode == "OFFBOARD" and self._handover_ready(now):
                 self._request_mode("ALTCTL")
             elif flight_fresh and flight_mode == "OFFBOARD":
-                self.phase_reason = "waiting for stable attitude and continuous output before ALTCTL"
+                if getattr(self, "ceiling_approach_timeout_returning", False):
+                    self.phase_reason = "吸顶接近超时：保持FAULT，等待有效遥控输入、飞控估计和连续输出后请求ALTCTL"
+                else:
+                    self.phase_reason = "waiting for stable attitude and continuous output before ALTCTL"
             elif flight_fresh:
                 failure_reason = "unexpected flight mode during return: {}".format(
                     flight_mode or "unknown"

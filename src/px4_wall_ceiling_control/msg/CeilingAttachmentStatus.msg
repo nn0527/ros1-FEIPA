@@ -22,6 +22,8 @@ bool attach_confirmed
 bool distance_stable
 bool fault_detected
 bool detach_failed
+# Latched APPROACH timeout: keep FAULT output until actual ALTCTL handover.
+bool approach_timed_out
 bool integral_reset_request
 bool wheel_stop_request
 bool mechanism_release_requested
