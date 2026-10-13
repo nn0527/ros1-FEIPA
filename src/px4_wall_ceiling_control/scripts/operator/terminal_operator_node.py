@@ -29,6 +29,9 @@ class TerminalOperatorNode:
         self.kill_config_attempt_at = -float("inf")
         self.rc_channels, self.rc_at = (), None
         self.flight_at = None
+        self.flight_connected = self.flight_armed = False
+        self.request_acks = {}
+        self.command_ack_pub = rospy.Publisher("/attachment/terminal_ack", String, queue_size=10)
         self.kill_pub = rospy.Publisher("/attachment/kill_switch", String, queue_size=1)
         rospy.Subscriber("/mavros/rc/in", RCIn, self._on_rc, queue_size=1)
         self.command_pub = rospy.Publisher(
@@ -47,6 +50,43 @@ class TerminalOperatorNode:
         self.timer = rospy.Timer(rospy.Duration(0.1), self._on_timer)
 
     def _on_command(self, message):
+        if not message.data.lstrip().startswith("{"):
+            return self._apply_command(message)  # Preserve existing terminal commands.
+        request_id = ""
+        try:
+            request = json.loads(message.data)
+            request_id = request.get("id", "")
+            command = request.get("command", "")
+            if not isinstance(request_id, str) or not 1 <= len(request_id) <= 64 or command != "ceiling":
+                raise ValueError("请求格式无效")
+            if request_id in self.request_acks:
+                self.command_ack_pub.publish(String(data=json.dumps(self.request_acks[request_id],ensure_ascii=False)))
+                return
+            age = (rospy.Time.now()-self.flight_at).to_sec() if self.flight_at is not None else float('inf')
+            safety = self._kill_report() if self.kill_guard_enabled else {"valid":True,"active":False}
+            reason = ("急停开关已生效或反馈无效" if not safety['valid'] or safety['active'] else
+                      "飞控未连接、心跳过期或尚未解锁" if not (self.flight_connected and self.flight_armed and 0 <= age <= 1.5) else
+                      "吸顶请求需从ALTCTL发起" if self.flight_mode != "ALTCTL" else
+                      "已有动作请求，不能重复启动" if self.mode != OperatorCommand.MODE_STANDBY or self.detaching else "")
+            if reason:
+                accepted = False
+            else:
+                self._apply_command(String(data="ceiling"))
+                accepted = self.mode == OperatorCommand.MODE_CEILING
+                reason = "吸顶节点已接收：等待顶距≤1m连续0.30秒及接管条件" if accepted else "节点安全条件变化，请检查急停和飞控反馈"
+                if accepted:
+                    self._publish_intent()  # Confirmed intent is sent immediately, not on the next timer tick.
+            reply = {"id":request_id,"command":"ceiling","accepted":accepted,"reason":reason,
+                     "mode":self.mode,"enable_control":self.mode==OperatorCommand.MODE_CEILING,
+                     "ros_time":rospy.Time.now().to_sec()}
+            if len(self.request_acks) >= 32:self.request_acks.pop(next(iter(self.request_acks)))
+            self.request_acks[request_id] = reply
+        except Exception as error:
+            reply = {"id":request_id,"command":"ceiling","accepted":False,"reason":str(error)}
+        self.command_ack_pub.publish(String(data=json.dumps(reply,ensure_ascii=False)))
+        rospy.logwarn("ceiling request acknowledgement: %s",json.dumps(reply,ensure_ascii=False))
+
+    def _apply_command(self, message):
         command = message.data.strip().lower()
         if command in ("ceiling", "wall", "detach") and getattr(self, "kill_guard_enabled", False):
             safety = self._kill_report()
@@ -97,6 +137,7 @@ class TerminalOperatorNode:
 
     def _on_state(self, message):
         self.flight_at = rospy.Time.now()
+        self.flight_connected, self.flight_armed = message.connected, message.armed
         if getattr(self, "kill_guard_enabled", False) and message.connected and not message.armed and not self.kill_config_loading and time.monotonic() - self.kill_config_attempt_at >= 10:
             self.kill_config_loading = True
             self.kill_config_attempt_at = time.monotonic()
@@ -161,6 +202,15 @@ class TerminalOperatorNode:
             if not safety["valid"] or safety["active"]:
                 self._release_intent()
             self.kill_pub.publish(String(data=json.dumps(safety)))
+        self._publish_intent()
+        if self.detach_pulse:
+            if self.mode == OperatorCommand.MODE_CEILING:
+                self.ceiling_detach_pub.publish(Bool(data=True))
+            elif self.mode == OperatorCommand.MODE_WALL:
+                self.wall_detach_pub.publish(Bool(data=True))
+            self.detach_pulse = False
+
+    def _publish_intent(self):
         command = OperatorCommand()
         command.header.stamp = rospy.Time.now()
         command.mode = self.mode
@@ -171,12 +221,6 @@ class TerminalOperatorNode:
         command.source = "terminal"
         command.reason = "detach pending" if self.detaching else "terminal request"
         self.command_pub.publish(command)
-        if self.detach_pulse:
-            if self.mode == OperatorCommand.MODE_CEILING:
-                self.ceiling_detach_pub.publish(Bool(data=True))
-            elif self.mode == OperatorCommand.MODE_WALL:
-                self.wall_detach_pub.publish(Bool(data=True))
-            self.detach_pulse = False
 
 
 if __name__ == "__main__":

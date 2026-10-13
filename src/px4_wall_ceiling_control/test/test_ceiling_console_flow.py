@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import unittest
+import json
 from unittest import mock
 import rospy
 from sensor_msgs.msg import Range, FluidPressure
@@ -140,6 +141,44 @@ class CeilingConsoleFlowTests(unittest.TestCase):
             self.n._on_pressure(FluidPressure(fluid_pressure=value))
             self.assertAlmostEqual(self.n._height_feedback(rospy.Time.now()),-.501,places=6)
             self.assertTrue(self.n._detach_height_ready(rospy.Time.now()))
+    def ack_operator(self):
+        with mock.patch.object(rospy,"get_param",side_effect=lambda k,d=None:d),mock.patch.object(rospy,"Publisher"),mock.patch.object(rospy,"Subscriber"),mock.patch.object(rospy,"Timer"),mock.patch.object(rospy,"set_param"):
+            n=Terminal()
+        n._on_state(State(connected=True,armed=True,mode='ALTCTL'))
+        n.command_pub=mock.Mock();n.command_ack_pub=mock.Mock()
+        return n
+    def test_ceiling_json_request_is_acknowledged_and_published_immediately(self):
+        n=self.ack_operator()
+        with mock.patch.object(rospy,"set_param"):
+            n._on_command(String(data=json.dumps({'id':'r1','command':'ceiling'})))
+        reply=json.loads(n.command_ack_pub.publish.call_args.args[0].data)
+        self.assertTrue(reply['accepted']);self.assertEqual(reply['id'],'r1')
+        intent=n.command_pub.publish.call_args.args[0]
+        self.assertEqual(intent.mode,OperatorCommand.MODE_CEILING);self.assertTrue(intent.enable_control)
+    def test_duplicate_request_id_does_not_restart_intent(self):
+        n=self.ack_operator();request=String(data=json.dumps({'id':'r1','command':'ceiling'}))
+        with mock.patch.object(rospy,"set_param"):
+            n._on_command(request);n._on_command(request)
+        self.assertEqual(n.command_pub.publish.call_count,1)
+        self.assertEqual(n.command_ack_pub.publish.call_count,2)
+    def test_ack_rejects_active_kill_disarmed_wrong_mode_and_stale_flight(self):
+        for fault in ['kill','disarmed','mode','stale']:
+            n=self.ack_operator()
+            if fault=='kill':n.kill_guard_enabled=True;n._kill_report=lambda:{'valid':True,'active':True}
+            if fault=='disarmed':n.flight_armed=False
+            if fault=='mode':n.flight_mode='AUTO.LOITER'
+            if fault=='stale':n.flight_at=rospy.Time.from_sec(5.)
+            n._on_command(String(data=json.dumps({'id':'r1','command':'ceiling'})))
+            self.assertFalse(json.loads(n.command_ack_pub.publish.call_args.args[0].data)['accepted'])
+            n.command_pub.publish.assert_not_called();self.assertEqual(n.mode,OperatorCommand.MODE_STANDBY)
+    def test_speed_gate_waits_before_requesting_offboard(self):
+        m=Manager.__new__(Manager);m.ceiling_distance_gate_enabled=True;m.selected_mode=OperatorCommand.MODE_CEILING
+        m.ceiling=S(activation_ready=True);m.ceiling_at=rospy.Time.now();m.status_timeout_s=.5
+        m.odom=self.n.odom;m.odom_at=rospy.Time.now();m.odom_timeout_s=.5;m.odom_twist_in_child_frame=True;m.ceiling_vertical_speed_gate_mps=.2
+        m.odom.twist.twist.linear.z=.6
+        self.assertFalse(m._ceiling_takeover_ready(rospy.Time.now()))
+        self.assertIn('0.60',m._ceiling_wait_reason(rospy.Time.now()))
+        m.odom.twist.twist.linear.z=.1;self.assertTrue(m._ceiling_takeover_ready(rospy.Time.now()))
     def test_one_metre_requires_continuous_samples_for_point_three_seconds(self):
         for t in [10,10.1,10.2]:self.sample(t,1.)
         self.assertFalse(self.n._activation_ready(rospy.Time.now()))
@@ -249,6 +288,7 @@ class CeilingConsoleFlowTests(unittest.TestCase):
     def test_manager_requires_fresh_activation_confirmation(self):
         m=Manager.__new__(Manager);m.ceiling_distance_gate_enabled=True;m.selected_mode=OperatorCommand.MODE_CEILING
         m.status_timeout_s=.5;m.ceiling_at=rospy.Time.now();m.ceiling=S(activation_ready=False)
+        m.odom=self.n.odom;m.odom_at=rospy.Time.now();m.odom_timeout_s=.5;m.odom_twist_in_child_frame=True;m.ceiling_vertical_speed_gate_mps=.2
         self.assertFalse(m._ceiling_takeover_ready(rospy.Time.now()))
         m.ceiling.activation_ready=True;self.assertTrue(m._ceiling_takeover_ready(rospy.Time.now()))
         self.clock=11.;self.assertFalse(m._ceiling_takeover_ready(rospy.Time.now()))

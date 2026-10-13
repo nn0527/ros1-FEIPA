@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Action admission and live-state regression tests without hardware or ROS."""
 import pathlib
+import json
 import sys
 import unittest
 from unittest import mock
@@ -354,6 +355,43 @@ class ConsoleTests(unittest.TestCase):
         self.assertTrue(self.state.snapshot()["can_ceiling_detach"])
         value["baro_reference_ready"]=False;self.state.update("ceiling_status",value)
         self.assertFalse(self.state.snapshot()["can_ceiling_detach"])
+    def test_ceiling_gated_request_queues_during_motion_and_invalid_range(self):
+        self.ceiling_ready()
+        self.state.update('runtime',{'enabled':True,'ceiling_enabled':True,'ceiling_distance_gate_enabled':True})
+        self.state.update('odom',{'finite':True,'vertical_speed':.6})
+        self.state.update('health',{'ceiling_valid':False,'front_valid':False})
+        self.assertTrue(self.state.snapshot()['can_ceiling'])
+        self.state.send_ceiling(lambda command:{'id':'r1','accepted':True,'reason':'received'})
+        self.assertEqual(self.state.snapshot()['ceiling_request']['state'],'ACCEPTED')
+    def ack_runtime(self):
+        runtime=server.RemoteRuntime.__new__(server.RemoteRuntime)
+        runtime.state=self.state;runtime.command_ack_lock=threading.Lock();runtime.command_acks={}
+        runtime.publisher=mock.Mock();runtime.publisher.get_num_connections.return_value=1
+        return runtime
+    def test_backend_waits_for_matching_node_ack(self):
+        runtime=self.ack_runtime()
+        def receive(payload):
+            request=json.loads(payload)
+            runtime._on_terminal_ack(SimpleNamespace(data=json.dumps({'id':'wrong','accepted':True})))
+            runtime._on_terminal_ack(SimpleNamespace(data=json.dumps({'id':request['id'],'accepted':True,'mode':2,'enable_control':True,'reason':'accepted'})))
+        runtime.publisher.publish.side_effect=receive
+        reply=runtime._publish_ceiling_request('ceiling')
+        self.assertTrue(reply['accepted']);runtime.publisher.publish.assert_called_once()
+        self.assertEqual(runtime.command_acks,{})
+    def test_backend_unacknowledged_ceiling_has_no_success_or_automatic_retry(self):
+        runtime=self.ack_runtime()
+        with mock.patch.object(server.threading,'Event') as event:
+            event.return_value.wait.return_value=False
+            with self.assertRaisesRegex(ValueError,'未收到吸顶节点回执'):
+                runtime._publish_ceiling_request('ceiling')
+        runtime.publisher.publish.assert_called_once();self.assertEqual(runtime.command_acks,{})
+    def test_backend_returns_node_rejection_reason(self):
+        runtime=self.ack_runtime()
+        def receive(payload):
+            request=json.loads(payload)
+            runtime._on_terminal_ack(SimpleNamespace(data=json.dumps({'id':request['id'],'accepted':False,'reason':'急停生效'})))
+        runtime.publisher.publish.side_effect=receive
+        with self.assertRaisesRegex(ValueError,'急停生效'):runtime._publish_ceiling_request('ceiling')
     def test_ready_dispatches_exactly_one_wall(self):
         self.ready()
         self.state.send_wall(self.publisher)

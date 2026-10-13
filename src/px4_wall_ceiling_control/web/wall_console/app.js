@@ -41,6 +41,8 @@ function pair(label, value, className=""){
 function paint(s){
   latest=s; token=s.token;
   const ceilingStatus=fresh(s,"ceiling_status");
+  const request=s.ceiling_request;
+  text("ceilingRequestState", "吸顶请求："+(request?.reason || "尚未发送"));
   $("ceilingAction").disabled=requestBusy || !s.session?.feedback_live || !s.session?.control || !s.can_ceiling;
   $("ceilingDetach").disabled=requestBusy || !s.session?.feedback_live || !s.session?.control || !s.can_ceiling_detach;
   text("ceilingBlockReason",s.can_ceiling?"吸顶入口条件已满足":(s.ceiling_blockers || ["等待吸顶服务升级"]).join("；"));
@@ -127,7 +129,7 @@ $("control").addEventListener("click",()=>action(latest?.session?.control?"/api/
 $("push").addEventListener("click",()=>action("/api/push",{enabled:!latest?.session?.push}));
 async function action(path, data){
   if(requestBusy)return;requestBusy=true;$("ceilingAction").disabled=true;$("ceilingDetach").disabled=true;$("stop").disabled=true;$("start").disabled=true;$("wall").disabled=true;$("detach").disabled=true;
-  message(path==="/api/stop"?"正在终止现有进程…":path==="/api/wall"?"正在发送 wall…":path==="/api/detach"?"正在发送 detach…":path==="/api/start"?"正在请求启动…":"正在更新连接设置…");
+  message(path==="/api/stop"?"正在终止现有进程…":path==="/api/wall"?"正在发送 wall…":path==="/api/detach"?"正在发送 detach…":path==="/api/start"?"正在请求启动…":path==="/api/ceiling"?"正在发送吸顶请求并等待节点回执…":path==="/api/ceiling-detach"?"正在发送离顶请求…":"正在更新连接设置…");
   try{
     const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Console-Token":token},body:JSON.stringify(data),signal:AbortSignal.timeout(9000)});
     const result=await response.json();if(!response.ok)throw new Error(result.error || "操作失败");message(result.message);

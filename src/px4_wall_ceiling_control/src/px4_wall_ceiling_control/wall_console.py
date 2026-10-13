@@ -74,6 +74,8 @@ class ConsoleState:
         self.pending_since = None
         self.detach_pending_since = None
         self.sequence = 0
+        self.ceiling_request = {"state":"NOT_SENT","reason":"尚未发送吸顶请求"}
+        self.ceiling_request_seen = False
 
     def event(self, text, kind="info"):
         with self.lock:
@@ -84,6 +86,8 @@ class ConsoleState:
         with self.lock:
             previous = self.samples.get(name)
             self.samples[name] = {"at": self.clock(), "value": value}
+            if name=="operator" and value.get("mode")==2 and value.get("enabled"):
+                self.ceiling_request_seen = True
             if name in ("phase", "reason", "owner") and (not previous or previous["value"] != value):
                 self.event({"phase": "控制阶段", "reason": "阶段反馈", "owner": "输出归属"}[name] + ": " + str(value))
             if name in ("wall", "ceiling_status") and (not previous or previous["value"]["state_name"] != value["state_name"]
@@ -174,9 +178,9 @@ class ConsoleState:
             ceiling_checks = [
                 (runtime.get("ceiling_enabled"), "吸顶节点未启用；请在落地后重新启动基础程序"),
                 (status["ceiling_status"]["fresh"] and ceiling.get("state_name") == "NORMAL_FLIGHT", "吸顶决策未待命或反馈过期"),
-                (health.get("ceiling_valid") and status["ceiling"]["fresh"], "顶部雷达无效或过期"),
+                (runtime.get("ceiling_distance_gate_enabled") or (health.get("ceiling_valid") and status["ceiling"]["fresh"]), "顶部雷达无效或过期"),
                 ((runtime.get("ceiling_distance_gate_enabled") or (isinstance(val("ceiling", {}).get("range_m"), (int,float)) and 0 < val("ceiling", {}).get("range_m", 99) < runtime.get("ceiling_activation_distance_m", .5))), "需手动接近顶部至激活距离内"),
-                (isinstance(val("odom", {}).get("vertical_speed"), (int,float)) and abs(val("odom", {}).get("vertical_speed", 99)) < runtime.get("ceiling_vertical_speed_gate_mps", .2), "竖直速度未满足吸顶入口条件"),
+                (runtime.get("ceiling_distance_gate_enabled") or (isinstance(val("odom", {}).get("vertical_speed"), (int,float)) and abs(val("odom", {}).get("vertical_speed", 99)) < runtime.get("ceiling_vertical_speed_gate_mps", .2)), "竖直速度未满足吸顶入口条件"),
             ]
             ceiling_blockers = common + [reason for ok, reason in ceiling_checks if not ok]
             ceiling_pending = getattr(self, "ceiling_pending_since", None)
@@ -193,7 +197,15 @@ class ConsoleState:
                 and val("operator", {}).get("mode") == 2 and val("operator", {}).get("enabled")
                 and status["setpoint"]["fresh"]
                 and val("odom", {}).get("finite") and estimator.get("attitude") and estimator.get("vertical_velocity"))
-            return {"can_ceiling": not ceiling_blockers, "ceiling_blockers": ceiling_blockers,
+            request = dict(self.ceiling_request)
+            if request.get("state") == "ACCEPTED":
+                if val("phase") in ("PRESTREAM","ENTERING"):
+                    request.update(state="WAITING",reason=val("reason") or "吸顶请求已接收，等待接管条件")
+                elif flight.get("mode")=="OFFBOARD" and val("operator",{}).get("mode")==2:
+                    request.update(state="ACTIVE",reason="PX4已确认OFFBOARD，吸顶流程执行中")
+                elif self.ceiling_request_seen and val("operator",{}).get("mode")==1 and val("phase") in ("IDLE","LOCKED"):
+                    request.update(state="RELEASED",reason=val("reason") or "吸顶请求已释放，请核对急停和飞控状态")
+            return {"ceiling_request":request,"can_ceiling": not ceiling_blockers, "ceiling_blockers": ceiling_blockers,
                     "can_ceiling_detach": ceiling_detach_ok, "status": status, "checks": [{"id": i, "label": label, "ok": ok, "reason": reason}
                     for i, label, ok, reason in checks], "blockers": blockers, "can_wall": not blockers and not self.starting,
                     "success": bool(success), "starting": self.starting, "pending": pending,
@@ -207,16 +219,25 @@ class ConsoleState:
 
     def send_ceiling(self, publish):
         with self.lock:
-            current = self.snapshot()
+            current=self.snapshot()
             if not current["can_ceiling"]:
+                self.ceiling_request={"state":"REJECTED","reason":current["ceiling_blockers"][0]}
+                self.event("吸顶请求未发送："+self.ceiling_request["reason"],"warning")
                 raise ValueError(current["ceiling_blockers"][0])
-            self.ceiling_pending_since = self.clock()
+            self.ceiling_pending_since=self.clock()
+            self.ceiling_request_seen=False
+            self.ceiling_request={"state":"SENDING","reason":"正在等待吸顶控制节点回执"}
             try:
-                publish("ceiling")
-            except Exception:
-                self.ceiling_pending_since = None
+                reply=publish("ceiling")
+            except Exception as error:
+                self.ceiling_pending_since=None
+                self.ceiling_request={"state":"REJECTED" if getattr(error,"command_rejected",False) else "UNCONFIRMED","reason":str(error)}
+                self.event("吸顶请求未确认："+str(error),"warning")
                 raise
-            self.event("已发送 ceiling；等待吸顶控制节点确认")
+            self.ceiling_request={"state":"ACCEPTED" if isinstance(reply,dict) and reply.get("accepted") else "SENT",
+                                  "id":reply.get("id") if isinstance(reply,dict) else None,
+                                  "reason":reply.get("reason","等待节点反馈") if isinstance(reply,dict) else "消息已发送，等待节点反馈"}
+            self.event("吸顶请求："+self.ceiling_request["reason"])
 
     def send_ceiling_detach(self, publish):
         with self.lock:

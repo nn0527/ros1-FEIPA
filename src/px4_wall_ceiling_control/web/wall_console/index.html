@@ -12,8 +12,9 @@
 <button id="wall" class="wall" disabled><span>02</span><strong>一键贴墙</strong></button>
 <button id="detach" class="wall" disabled><span>03</span><strong>一键离墙</strong></button></div>
 <div class="actions"><button id="ceilingAction" class="wall" disabled><strong>一键贴顶</strong></button><button id="ceilingDetach" class="wall" disabled><strong>一键离顶</strong></button></div>
+<p id="ceilingRequestState" role="status">吸顶请求：尚未发送</p>
 <p id="ceilingBlockReason" class="errorText" role="status"></p><p id="ceilingStage" role="status">吸顶：等待反馈</p>
-<p class="configHelp">飞手先在 ALTCTL 下达到测试高度，再点击吸顶。有效顶距≤1 m连续0.30秒后接管并向上接近；顶距≤5.6 cm连续1秒、至少3个近距样本后进入保持，推力目标0.50。离顶以吸顶保持时记录的气压高度为基准，气压换算下降≥0.50 m后立即请求交回ALTCTL，不要求速度稳定、恢复悬停或顶部雷达确认。气压数据缺失或过期时无法确认离顶完成。顶部雷达异常仅报错：接近时暂停上升，保持时维持0.50推力，有效数据恢复后继续。从点击贴顶起，前部雷达控制输入屏蔽，飞控确认交回ALTCTL后自动恢复；屏蔽期间禁止侧吸。吸顶与贴墙互斥。</p>
+<p class="configHelp">飞手先在 ALTCTL 下达到测试高度，再点击吸顶。按钮先提交等待请求，节点回执会显示在上方；有效顶距≤1 m连续0.30秒且竖直速度绝对值<0.20 m/s后申请OFFBOARD并向上接近。测距或速度尚未满足时保留请求，继续由飞手控制ALTCTL；顶距≤5.6 cm连续1秒、至少3个近距样本后进入保持，推力目标0.50。离顶以吸顶保持时记录的气压高度为基准，气压换算下降≥0.50 m后立即请求交回ALTCTL，不要求速度稳定、恢复悬停或顶部雷达确认。气压数据缺失或过期时无法确认离顶完成。顶部雷达异常仅报错：接近时暂停上升，保持时维持0.50推力，有效数据恢复后继续。从点击贴顶起，前部雷达控制输入屏蔽，飞控确认交回ALTCTL后自动恢复；屏蔽期间禁止侧吸。吸顶与贴墙互斥。</p>
 <button id="stop" class="stopProcess" disabled>终止现有进程</button><p class="configHelp">停止试验控制、MAVROS、雷达与日志记录后可重新启动。请先落地并停止电机；此按钮不代替遥控器急停。</p>
 <p class="helper">飞行稳定后贴墙；当前贴墙保持且离墙条件满足后，可请求离墙</p><p id="wallBlockReason" class="errorText" role="status"></p><p id="detachBlockReason" class="errorText" role="status"></p><p id="actionMessage" role="status" aria-live="polite"></p></section>
 <section class="panel stage"><h2>当前阶段</h2><div class="stageContent"><h3 id="stageTitle">等待连接</h3>

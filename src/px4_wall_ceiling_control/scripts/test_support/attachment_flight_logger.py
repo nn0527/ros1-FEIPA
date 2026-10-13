@@ -27,6 +27,7 @@ TOPICS = [
     "/mavros/battery", "/mavros/altitude", "/mavros/global_position/raw/fix",
     "/mavros/global_position/raw/gps_vel", "/mavros/statustext/recv",
     "/sensor/front/raw", "/sensor/front/range", "/sensor/ceiling/raw", "/sensor/ceiling/range",
+    "/attachment/terminal_command", "/attachment/terminal_ack",
     "/sensor/health", "/operator/command", "/attachment/output_owner", "/attachment/output_mode",
     "/attachment/flight_phase", "/attachment/flight_phase_reason", "/attachment/prestream",
     "/attachment/rc_preview_deg",
@@ -157,10 +158,12 @@ class SignalSummary:
         elif topic == "/ceiling_attachment/status":
             event = "ceiling state={} reason={} faults={} candidate_valid={}".format(
                 message.state_name, message.reason, message.fault_count, message.candidate_valid)
+        elif topic == "/operator/command":
+            event="operator mode={} enabled={} reason={}".format(message.mode,message.enable_control,message.reason)
         elif topic == "/mavros/state":
             event = "PX4 connected={} armed={} mode={}".format(message.connected, message.armed, message.mode)
         elif topic in ("/attachment/flight_phase", "/attachment/flight_phase_reason",
-                       "/attachment/output_owner", "/attachment/output_mode", "/wall_perch/detach", "/wall_perch/cancel", "/ceiling_attachment/detach"):
+                       "/attachment/output_owner", "/attachment/output_mode", "/wall_perch/detach", "/wall_perch/cancel", "/ceiling_attachment/detach", "/attachment/terminal_command", "/attachment/terminal_ack"):
             event = "{} {}".format(topic, message.data)
         elif topic in ("/rosout", "/rosout_agg") and message.level >= 4:
             event = "ROS level={} node={} {}".format(message.level, message.name, message.msg)

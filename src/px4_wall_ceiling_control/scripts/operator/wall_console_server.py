@@ -25,6 +25,8 @@ class RemoteRuntime:
     """ROS actions remain on the Pi. Starting never arms or requests a mode."""
     def __init__(self):
         self.state = ConsoleState()
+        self.command_ack_lock = threading.Lock()
+        self.command_acks = {}
         self.children = {}
         self.stop_requested = False
         self.stopping = False
@@ -173,6 +175,7 @@ class RemoteRuntime:
             from px4_wall_ceiling_control.msg import SensorHealth, WallPerchStatus, CeilingAttachmentStatus, OperatorCommand
             rospy.init_node("wall_console_bridge", anonymous=True, disable_signals=True)
             self.publisher = rospy.Publisher("/attachment/terminal_command", String, queue_size=1)
+            self.subscriptions_ack = rospy.Subscriber("/attachment/terminal_ack", String, self._on_terminal_ack, queue_size=10)
             self.wait_cancel_publisher = rospy.Publisher("/wall_perch/cancel_wait", Bool, queue_size=1)
             topics = {"state": ("/mavros/state", State), "rc": ("/mavros/rc/in", RCIn),
                       "estimator": ("/mavros/estimator_status", EstimatorStatus),
@@ -457,15 +460,38 @@ class RemoteRuntime:
         except (ValueError, TypeError):
             return False
 
+    def _on_terminal_ack(self, message):
+        try:reply=json.loads(message.data)
+        except (ValueError,TypeError):return
+        if not isinstance(reply,dict):return
+        with self.command_ack_lock:
+            slot=self.command_acks.get(reply.get("id"))
+            if slot is not None:
+                slot["reply"]=reply
+                slot["event"].set()  # Do not acquire ConsoleState.lock: the request holds it while awaiting this ACK.
+
+    def _publish_ceiling_request(self, command):
+        if not self.publisher or self.publisher.get_num_connections()==0:
+            raise ValueError("终端指令节点未订阅，吸顶消息未发送")
+        request_id=secrets.token_hex(12)
+        slot={"event":threading.Event(),"reply":None}
+        with self.command_ack_lock:self.command_acks[request_id]=slot
+        try:
+            self.publisher.publish(json.dumps({"id":request_id,"command":command}))
+            if not slot["event"].wait(2.5):
+                raise ValueError("未收到吸顶节点回执，执行情况未确认；请检查实时阶段，勿重复点击。若为旧节点，请在落地上锁后重启基础程序")
+            reply=slot["reply"]
+            if reply.get("accepted") is not True or reply.get("mode") != 2 or reply.get("enable_control") is not True:
+                error=ValueError("吸顶节点拒绝："+str(reply.get("reason","未提供原因")))
+                error.command_rejected=True
+                raise error
+            return reply
+        finally:
+            with self.command_ack_lock:self.command_acks.pop(request_id,None)
+
     def ceiling(self):
-        def publish(command):
-            if not self.publisher or self.publisher.get_num_connections() == 0:
-                raise ValueError("终端指令节点未订阅，消息未发送")
-            self.ros.set_param("/attachment/front_sensor_masked", True)
-            self.publisher.publish(command)
-        self.state.send_ceiling(publish)
-        self.state.event("前部雷达已屏蔽；确认交回 ALTCTL 后恢复，屏蔽期间禁止侧吸")
-        return {"message": "吸顶请求已提交；等待 OFFBOARD 接管与顶部接触确认"}
+        self.state.send_ceiling(self._publish_ceiling_request)
+        return {"message":"吸顶节点已确认接收；正在ALTCTL下等待距离和接管条件", "request":self.state.ceiling_request}
 
     def ceiling_detach(self):
         def publish(command):
@@ -699,7 +725,9 @@ class SSHTransport:
                 if not connected or result["can_detach"]:
                     result["detach_blockers"] = ["离墙所需实时反馈中断或过期"]
                 result["can_detach"] = False
-            ceiling_sources = ("runtime", "state", "odom", "estimator", "operator", "phase", "owner", "health", "kill", "ceiling_status", "ceiling")
+            ceiling_sources = ("runtime", "state", "odom", "estimator", "operator", "phase", "owner", "kill", "ceiling_status")
+            if not (result["status"]["runtime"]["value"] or {}).get("ceiling_distance_gate_enabled"):
+                ceiling_sources += ("health","ceiling")
             if not connected or not self.session.get("control") or any(not result["status"][n]["fresh"] for n in ceiling_sources):
                 result["can_ceiling"] = False
                 result["ceiling_blockers"] = list(dict.fromkeys(result.get("ceiling_blockers", []) + ["吸顶所需实时反馈或控制权缺失"]))
