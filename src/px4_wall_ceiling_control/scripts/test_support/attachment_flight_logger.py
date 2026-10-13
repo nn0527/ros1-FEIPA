@@ -224,7 +224,9 @@ class SignalSummary:
         for key in ("x", "y", "z", "w"):
             row["measured_q_" + key] = getattr(odom.pose.pose.orientation, key) if odom else None
         pressure = sample("/mavros/imu/static_pressure", "pressure")
-        row["pressure_pa"] = getattr(pressure, "fluid_pressure", None)
+        raw_pressure = getattr(pressure, "fluid_pressure", None)
+        row["pressure_reported"] = raw_pressure
+        row["pressure_pa"] = (raw_pressure*100.0 if 600.0 <= raw_pressure <= 1200.0 else raw_pressure) if raw_pressure is not None else None
         state = sample("/mavros/state", "px4")
         for key in ("connected", "armed", "mode"):
             row["px4_" + key] = getattr(state, key, None)

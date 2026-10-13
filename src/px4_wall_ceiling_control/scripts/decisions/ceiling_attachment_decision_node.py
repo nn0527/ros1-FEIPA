@@ -391,8 +391,12 @@ class CeilingAttachmentDecisionNode:
                 and self.baro_pressure_pa is not None)
 
     def _on_pressure(self, message):
-        p = message.fluid_pressure  # FluidPressure uses Pa, not hPa.
-        if not math.isfinite(p) or not 20000.0 <= p <= 120000.0:
+        p = message.fluid_pressure
+        # ROS1 MAVROS HIGHRES_IMU can publish hPa despite FluidPressure's Pa contract.
+        # Disjoint atmospheric bands normalize either representation before ratio calculations.
+        if math.isfinite(p) and 600.0 <= p <= 1200.0:
+            p *= 100.0
+        if not math.isfinite(p) or not 60000.0 <= p <= 120000.0:
             self.baro_received_at = None
             return
         self.baro_pressure_pa = p

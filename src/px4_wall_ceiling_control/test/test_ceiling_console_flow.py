@@ -129,6 +129,17 @@ class CeilingConsoleFlowTests(unittest.TestCase):
         self.assertEqual(m.phase,Manager.RETURNING)
         m._request_mode.assert_called_once_with('ALTCTL')
         self.assertEqual(m.owner,1)
+    def test_ros1_hpa_and_si_pa_normalize_to_same_height(self):
+        self.n.detach_baro_height_enabled=True;self.n.detach_drop_m=.5
+        self.n._on_pressure(FluidPressure(fluid_pressure=975.659))
+        self.n._enter_state(S.STATE_SURFACE_HOLD,rospy.Time.now(),"hold")
+        self.assertAlmostEqual(self.n.hold_pressure_pa,97565.9)
+        self.n._enter_state(S.STATE_DETACH,rospy.Time.now(),"detach")
+        pressure_pa=self.n.hold_pressure_pa*(1.+.501/44330.)**(1./.190294957)
+        for value in [pressure_pa/100.,pressure_pa]:
+            self.n._on_pressure(FluidPressure(fluid_pressure=value))
+            self.assertAlmostEqual(self.n._height_feedback(rospy.Time.now()),-.501,places=6)
+            self.assertTrue(self.n._detach_height_ready(rospy.Time.now()))
     def test_one_metre_requires_continuous_samples_for_point_three_seconds(self):
         for t in [10,10.1,10.2]:self.sample(t,1.)
         self.assertFalse(self.n._activation_ready(rospy.Time.now()))
