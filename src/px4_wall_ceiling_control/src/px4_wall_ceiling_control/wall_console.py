@@ -140,7 +140,7 @@ class ConsoleState:
                 ("idle", "待命状态", val("phase") == "IDLE" and val("owner") == 0 and
                  val("operator", {}).get("mode") == 1 and not val("operator", {}).get("enabled", True), "已有动作请求，等待当前流程结束"),
             ]
-            checks.append(("front_mask", "前部雷达控制输入", not runtime.get("front_sensor_masked", False), "前部雷达已屏蔽；重启基础程序后恢复侧吸"))
+            checks.append(("front_mask", "前部雷达控制输入", not runtime.get("front_sensor_masked", False), "前部雷达已屏蔽；确认交回 ALTCTL 后恢复侧吸"))
             pending = self.pending_since is not None and now - self.pending_since < 5
             blockers = [reason for _, _, ok, reason in checks if not ok]
             if pending:

@@ -16,6 +16,7 @@ from px4_wall_ceiling_control.adapters.kill_switch import KillSwitchConfig
 class TerminalOperatorNode:
     def __init__(self):
         self.front_sensor_masked = False
+        self.front_mask_seen_offboard = False
         rospy.set_param("/attachment/front_sensor_masked", False)
         self.mode = OperatorCommand.MODE_STANDBY
         self.detaching = False
@@ -53,7 +54,7 @@ class TerminalOperatorNode:
                 rospy.logwarn("terminal operator: kill switch active or unavailable; command rejected")
                 return
         if command == "wall" and getattr(self, "front_sensor_masked", False):
-            rospy.logwarn("front sensor masked after ceiling request; restart base program before wall testing")
+            rospy.logwarn("front sensor masked during ceiling cycle; wait for confirmed ALTCTL handover before wall testing")
             return
         if command in ("ceiling", "wall"):
             if self.mode != OperatorCommand.MODE_STANDBY or self.detaching:
@@ -70,8 +71,9 @@ class TerminalOperatorNode:
             self.was_offboard = False
             if command == "ceiling":
                 self.front_sensor_masked = True
+                self.front_mask_seen_offboard = False
                 rospy.set_param("/attachment/front_sensor_masked", True)
-                rospy.logwarn("ceiling requested: front sensor excluded from control until base program restarts")
+                rospy.logwarn("ceiling requested: front sensor excluded from control until confirmed ALTCTL handover")
             rospy.loginfo("terminal operator: %s requested", command)
         elif command == "detach":
             if self.mode not in (
@@ -104,6 +106,14 @@ class TerminalOperatorNode:
         if getattr(self, "kill_guard_enabled", False) and not message.armed:
             self._release_intent()
         self.flight_mode = message.mode.upper()
+        if message.connected and getattr(self, "front_sensor_masked", False):
+            if self.flight_mode == "OFFBOARD":
+                self.front_mask_seen_offboard = True
+            elif self.flight_mode == "ALTCTL" and (getattr(self, "front_mask_seen_offboard", False) or self.mode == OperatorCommand.MODE_STANDBY):
+                self.front_sensor_masked = False
+                self.front_mask_seen_offboard = False
+                rospy.set_param("/attachment/front_sensor_masked", False)
+                rospy.loginfo("confirmed ALTCTL handover: front sensor control input restored")
         if self.flight_mode == "OFFBOARD":
             self.was_offboard = True
         elif self.was_offboard and self.flight_mode == "ALTCTL":

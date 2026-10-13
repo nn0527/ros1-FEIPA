@@ -652,6 +652,22 @@ class ConsoleTests(unittest.TestCase):
                 runtime.prepare_lidars()
             factory.assert_not_called()
 
+    def test_front_usb_failure_is_reported_without_blocking_ceiling_startup(self):
+        self.ready();self.state.update("state", {"connected": True, "armed": False, "mode": "ALTCTL"})
+        runtime=object.__new__(server.RemoteRuntime);runtime.state=self.state
+        device=mock.MagicMock();factory=mock.Mock(side_effect=[device,OSError("front USB I/O")])
+        yaml=SimpleNamespace(safe_load=lambda text:{name:{"input_format":"l1_ascii"} for name in ("ceiling_lidar_node","front_lidar_node")})
+        with mock.patch.object(runtime,"port_owners",return_value=[]),mock.patch.dict(sys.modules,{"serial":SimpleNamespace(Serial=factory),"yaml":yaml}),mock.patch.object(server.time,"sleep"):
+            runtime.prepare_lidars()
+        self.assertTrue(any("front USB I/O" in e["text"] for e in self.state.events))
+    def test_top_usb_failure_still_blocks_startup(self):
+        self.ready();self.state.update("state", {"connected": True, "armed": False, "mode": "ALTCTL"})
+        runtime=object.__new__(server.RemoteRuntime);runtime.state=self.state
+        factory=mock.Mock(side_effect=OSError("top USB I/O"))
+        yaml=SimpleNamespace(safe_load=lambda text:{name:{"input_format":"l1_ascii"} for name in ("ceiling_lidar_node","front_lidar_node")})
+        with mock.patch.object(runtime,"port_owners",return_value=[]),mock.patch.dict(sys.modules,{"serial":SimpleNamespace(Serial=factory),"yaml":yaml}),self.assertRaisesRegex(OSError,"top USB"):
+            runtime.prepare_lidars()
+
     def test_orphan_serial_reader_blocks_startup_reset(self):
         runtime = object.__new__(server.RemoteRuntime)
         runtime.state = self.state

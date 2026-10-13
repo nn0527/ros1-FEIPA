@@ -8,6 +8,7 @@ from px4_wall_ceiling_control.msg import CeilingAttachmentStatus as S, OperatorC
 from test_attachment_safety import CeilingDecision
 from test_flight_handover import Manager, Terminal
 from std_msgs.msg import String
+from mavros_msgs.msg import State
 
 class CeilingConsoleFlowTests(unittest.TestCase):
     def setUp(self):
@@ -115,6 +116,16 @@ class CeilingConsoleFlowTests(unittest.TestCase):
         self.assertTrue(n.front_sensor_masked)
         n._release_intent();n._on_command(String(data="wall"))
         self.assertTrue(n.front_sensor_masked);self.assertEqual(n.mode,OperatorCommand.MODE_STANDBY)
+    def test_front_mask_only_restores_on_confirmed_handover(self):
+        n=Terminal.__new__(Terminal);n.mode=OperatorCommand.MODE_CEILING;n.detaching=False;n.was_offboard=False;n.front_sensor_masked=True;n.front_mask_seen_offboard=False
+        with mock.patch.object(rospy,"set_param") as write:
+            n._on_state(State(connected=True,armed=True,mode="ALTCTL"))
+            self.assertTrue(n.front_sensor_masked);write.assert_not_called()
+            n._on_state(State(connected=True,armed=True,mode="OFFBOARD"))
+            n._on_state(State(connected=False,armed=True,mode="ALTCTL"))
+            self.assertTrue(n.front_sensor_masked);write.assert_not_called()
+            n._on_state(State(connected=True,armed=True,mode="ALTCTL"))
+            self.assertFalse(n.front_sensor_masked);write.assert_called_with("/attachment/front_sensor_masked",False)
     def test_operator_restart_clears_front_mask(self):
         with mock.patch.object(rospy,"get_param",side_effect=lambda k,d=None:d),mock.patch.object(rospy,"set_param") as write,mock.patch.object(rospy,"Publisher"),mock.patch.object(rospy,"Subscriber"),mock.patch.object(rospy,"Timer"):
             n=Terminal()

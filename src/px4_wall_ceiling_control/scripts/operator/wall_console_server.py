@@ -85,12 +85,18 @@ class RemoteRuntime:
             settings = sensors[node]
             if settings.get("input_format", "l1_ascii") != "l1_ascii":
                 continue
-            with serial.Serial(self.state.config[key], int(settings.get("baudrate", 38400)),
-                               timeout=0.2, exclusive=True) as device:
-                device.write(b"iHALT")
-                device.flush()
-                time.sleep(0.2)
-                device.reset_input_buffer()
+            try:
+                with serial.Serial(self.state.config[key], int(settings.get("baudrate", 38400)),
+                                   timeout=0.2, exclusive=True) as device:
+                    device.write(b"iHALT")
+                    device.flush()
+                    time.sleep(0.2)
+                    device.reset_input_buffer()
+            except OSError as error:
+                if key != "front_port":
+                    raise
+                self.state.event("前部雷达启动故障：" + str(error) + "；贴顶可继续，侧吸需等待前距恢复", "warning")
+                continue
             self.state.event("已复位雷达测量: " + self.state.config[key] + "；新节点将重新启动测距")
 
     def observe_existing(self):
@@ -238,6 +244,8 @@ class RemoteRuntime:
                     "/attachment_output_mux_node", "/wall_perch_decision_node", "/sensor_range_manager_node",
                     "/ceiling_lidar_node", "/front_lidar_node"}
         nodes = self.nodes()
+        if "/ceiling_attachment_decision_node" in nodes:
+            required.discard("/front_lidar_node")
         wall_bench = bool(self.ros.get_param("/wall_perch_decision_node/bench_wait_for_ranges", False))
         manager_bench = bool(self.ros.get_param("/flight_mode_manager_node/wall_bench_wait_for_ranges", False))
         enabled = (required <= nodes and self.ros.get_param("/flight_mode_manager_node/enabled", False)
@@ -359,6 +367,9 @@ class RemoteRuntime:
             if conflicting:
                 raise ValueError("已有控制节点在运行，请先结束原启动入口: " + ", ".join(sorted(conflicting)))
             for key in ("fcu_port", "ceiling_port", "front_port"):
+                if key == "front_port" and not Path(self.state.config[key]).is_char_device():
+                    self.state.event("前雷达设备缺失；启动贴顶链路，侧吸等待前距恢复", "warning")
+                    continue
                 if not Path(self.state.config[key]).is_char_device():
                     raise ValueError("找不到串口设备: " + self.state.config[key])
             if not nodes:
@@ -448,7 +459,7 @@ class RemoteRuntime:
             self.ros.set_param("/attachment/front_sensor_masked", True)
             self.publisher.publish(command)
         self.state.send_ceiling(publish)
-        self.state.event("前部雷达已屏蔽；重启基础程序后恢复，屏蔽期间禁止侧吸")
+        self.state.event("前部雷达已屏蔽；确认交回 ALTCTL 后恢复，屏蔽期间禁止侧吸")
         return {"message": "吸顶请求已提交；等待 OFFBOARD 接管与顶部接触确认"}
 
     def ceiling_detach(self):
