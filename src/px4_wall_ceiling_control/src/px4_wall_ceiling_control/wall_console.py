@@ -23,7 +23,7 @@ def migrate_legacy_ports(values):
 
 DEFAULT_CONFIG = {
     **STABLE_PORTS, "baud": 230400,
-    "hover_thrust": 0.45,
+    "hover_thrust": 0.49,
     "test_profile": "flight",
 }
 LIMITS = {"state": 1.5, "odom": 0.5, "estimator": 1.5, "rc": 0.2,
@@ -136,7 +136,7 @@ class ConsoleState:
                 ("connected", "飞控连接", bool(flight.get("connected")), "飞控未连接或心跳已过期"),
                 ("kill", "急停开关", kill_ok, "急停开关已生效，动作已禁用" if kill.get("active") else "急停配置或通道反馈缺失／过期"),
                 ("armed", "已解锁", bool(flight.get("armed")), "等待飞手用遥控器解锁、起飞"),
-                ("mode", "ALTCTL 模式", flight.get("mode") == "ALTCTL", "贴墙请求需从 ALTCTL 模式发起"),
+                ("mode", runtime.get("wall_pilot_mode","ALTCTL") + " 模式", flight.get("mode") == runtime.get("wall_pilot_mode","ALTCTL"), "贴墙请求需从 " + runtime.get("wall_pilot_mode","ALTCTL") + " 模式发起"),
                 ("odom", "里程计", bool(val("odom", {}).get("finite")), "里程计缺失、过期或数值无效"),
                 ("height", "高度门槛（台架关闭）" if bench else "相对起飞高度", bench or bool(wall.get("entry_height_ready")), height_reason),
                 ("estimator", "估计器", bool(estimator.get("attitude") and estimator.get("vertical_velocity")), "估计器状态缺失、过期或竖直速度无效"),
@@ -147,6 +147,8 @@ class ConsoleState:
             checks.append(("front_mask", "前部雷达控制输入", not runtime.get("front_sensor_masked", False), "前部雷达已屏蔽；确认交回 ALTCTL 后恢复侧吸"))
             pending = self.pending_since is not None and now - self.pending_since < 5
             blockers = [reason for _, _, ok, reason in checks if not ok]
+            if wall.get("horizontal_velocity_enabled") and not (wall.get("horizontal_velocity_ready") and estimator.get("horizontal_velocity")):
+                blockers.append("水平速度接管条件未就绪：" + wall.get("horizontal_velocity_reason","等待反馈"))
             if pending:
                 blockers.insert(0, "贴墙请求已发送，等待节点反馈")
             if self.launch_error:
@@ -174,8 +176,9 @@ class ConsoleState:
             if self.launch_error or self.starting:
                 detach_blockers.insert(0, "基础程序未就绪")
             ceiling = val("ceiling_status", {})
-            common = [reason for i, _, ok, reason in checks if i not in ("height", "health", "front_mask") and not ok]
+            common = [reason for i, _, ok, reason in checks if i not in ("height", "health", "front_mask", "mode") and not ok]
             ceiling_checks = [
+                (flight.get("mode") == "ALTCTL", "吸顶请求需从 ALTCTL 模式发起"),
                 (runtime.get("ceiling_enabled"), "吸顶节点未启用；请在落地后重新启动基础程序"),
                 (status["ceiling_status"]["fresh"] and ceiling.get("state_name") == "NORMAL_FLIGHT", "吸顶决策未待命或反馈过期"),
                 (runtime.get("ceiling_distance_gate_enabled") or (health.get("ceiling_valid") and status["ceiling"]["fresh"]), "顶部雷达无效或过期"),
@@ -211,7 +214,7 @@ class ConsoleState:
                     "can_detach": not detach_blockers, "detach_blockers": detach_blockers,
                     "detach_pending": detach_pending,
                     "can_cancel_wait": bool(val("phase") == "WAITING_WALL" and val("owner") == 0
-                        and flight.get("connected") and flight.get("mode") == "ALTCTL"
+                        and flight.get("connected") and flight.get("mode") == runtime.get("wall_pilot_mode","ALTCTL")
                         and val("operator", {}).get("enabled") and val("operator", {}).get("mode") == 3),
                     "sensor_warnings": sensor_reasons,
                     "launch_error": self.launch_error, "config": dict(self.config), "events": list(self.events)}

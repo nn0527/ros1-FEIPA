@@ -21,7 +21,7 @@ class CeilingApproachTimeoutTests(unittest.TestCase):
         self.addCleanup(self.clock_patch.stop)
         params = {'~console_contact_profile': True, '~activation_distance_m': 1.0,
                   '~approach_contact_distance_m': .07, '~approach_settle_time_s': 0.,
-                  '~approach_timeout_s': 12., '~wall_contact_distance_m': .056,
+                  '~approach_timeout_s': 12.,
                   '~require_mechanism_ack': False, '~detach_baro_height_enabled': True}
         with mock.patch.object(rospy, 'get_param', side_effect=lambda k,d=None:params.get(k,d)), \
              mock.patch.object(rospy, 'Publisher'), mock.patch.object(rospy, 'Subscriber'), mock.patch.object(rospy, 'Timer'):
@@ -87,7 +87,35 @@ class CeilingApproachTimeoutTests(unittest.TestCase):
         self.decision._update_state_machine(rospy.Time.now())
         self.assertEqual(self.decision.state, S.STATE_ATTACH_CONTROL)
         self.assertFalse(self.decision._attach_confirmed(rospy.Time.now()))
-        self.assertAlmostEqual(self.decision.wall_contact_distance_m, .056)
+        self.assertAlmostEqual(self.decision.wall_contact_distance_m, .067)
+
+    def test_contact_at_67_mm_enters_hold_after_one_second(self):
+        self.decision._enter_state(S.STATE_ATTACH_CONTROL, rospy.Time.now(), 'test')
+        for index in range(10):
+            self.clock = 10. + index * .1
+            self.refresh(.067)
+            self.decision._update_state_machine(rospy.Time.now())
+            self.assertEqual(self.decision.state, S.STATE_ATTACH_CONTROL)
+        self.clock = 11.
+        self.refresh(.067)
+        self.assertTrue(self.decision._attach_confirmed(rospy.Time.now()))
+        self.decision._update_state_machine(rospy.Time.now())
+        self.assertEqual(self.decision.state, S.STATE_SURFACE_HOLD)
+
+    def test_raw_distance_above_67_mm_restarts_contact_confirmation(self):
+        self.decision._enter_state(S.STATE_ATTACH_CONTROL, rospy.Time.now(), 'test')
+        for index in range(10):
+            self.clock = 10. + index * .1
+            self.refresh(.066)
+        self.clock = 11.
+        self.refresh(.0671)
+        self.assertLess(self.decision.distance_filtered_m, .067)
+        self.assertFalse(self.decision._attach_confirmed(rospy.Time.now()))
+        self.decision._update_state_machine(rospy.Time.now())
+        self.assertEqual(self.decision.state, S.STATE_ATTACH_CONTROL)
+        self.clock = 11.1
+        self.refresh(.067)
+        self.assertFalse(self.decision._attach_confirmed(rospy.Time.now()))
 
     def test_entry_waits_for_three_new_samples(self):
         for index in range(3):

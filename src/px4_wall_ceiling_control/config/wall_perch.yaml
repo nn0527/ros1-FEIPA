@@ -79,13 +79,25 @@ wall_perch_decision_node:
   wall_angle_deg: 90.0
   # 慢速接近一开始就向墙倾斜3°，不再先做翻转前悬停稳定阶段。
   approach_pitch_deg: 3.0
+  # Optional fused-velocity feedback: console launch enables it, legacy launches keep it off.
+  horizontal_velocity_enabled: false
+  horizontal_approach_speed_mps: 0.05
+  horizontal_velocity_kp: 1.5
+  horizontal_max_acceleration_mps2: 0.30
+  horizontal_target_acceleration_mps2: 0.10
+  horizontal_flow_timeout_s: 0.60
+  horizontal_flow_quality_min: 1
+  horizontal_reacquire_time_s: 0.30
+  horizontal_resume_tilt_deg: 10.0
+  horizontal_stable_speed_mps: 0.10
+  horizontal_stable_time_s: 1.0
   # 2026-09-22 ULog：翻转前约0.47，翻转实际四电机均值约0.616。
-  hover_thrust: 0.45
+  hover_thrust: 0.49
   approach_thrust: 0.47
   flip_thrust_multiplier: 1.35
   hold_thrust_multiplier: 1.50
   # 贴墙距离仍偏大时，以0.03/s从翻转/保持值增加，最高0.75；恢复接触后
-  # 以0.05/s回到名义保持值0.675。不要复制ACRO日志中饱和的0.89指令。
+  # 以0.05/s回到名义保持值0.735（0.49 × 1.5）。不要复制ACRO日志中饱和的0.89指令。
   wall_pressure_ramp_up_per_s: 0.03
   wall_pressure_ramp_down_per_s: 0.05
   wall_pressure_max_thrust: 0.75

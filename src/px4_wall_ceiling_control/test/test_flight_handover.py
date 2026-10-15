@@ -385,7 +385,12 @@ class FlightHandoverTest(unittest.TestCase):
         node.flight = State(mode="OFFBOARD")
         node.flight_at = now
         node.state_timeout_s = 0.5
+        node.cancel_pub = mock.Mock()
         node.wall = None
+        node.enter_timeout_s = 6.
+        node._preflight_ready = mock.Mock(return_value=True)
+        node._stream_ready = mock.Mock(return_value=True)
+        node._current_offboard_request = mock.Mock(return_value=True)
         node.ignore_range_loss_during_attachment = True
         node._requested_mode = lambda _: OperatorCommand.MODE_WALL
         node._manual_wall_selected = lambda: True
@@ -405,7 +410,7 @@ class FlightHandoverTest(unittest.TestCase):
         node._manual_wall_ready = lambda _: False
         with mock.patch.object(rospy.Time, "now", return_value=now):
             node._on_timer(None)
-        self.assertEqual(node.phase, Manager.RETURNING)
+        self.assertEqual(node.phase, Manager.CANCELING_ENTRY)
 
     def _waiting_offboard_fixture(self):
         node = Manager.__new__(Manager)
@@ -464,7 +469,7 @@ class FlightHandoverTest(unittest.TestCase):
             else: node._stream_ready = lambda _: False
             with mock.patch.object(rospy.Time, "now", return_value=now):
                 node._on_timer(None)
-            self.assertEqual(node.phase, Manager.LOCKED, case)
+            self.assertEqual(node.phase, Manager.LOCKED if case == "flight_stale" else Manager.CANCELING_ENTRY, case)
             node.cancel_pub.publish.assert_called_once()
             self.assertIsNone(node.offboard_request)
 
@@ -495,8 +500,8 @@ class FlightHandoverTest(unittest.TestCase):
     def test_approach_limit_abort_stops_waiting_and_returns_offboard(self):
         for phase, flight_mode, expected in (
             (Manager.WAITING_WALL, "ALTCTL", Manager.LOCKED),
-            (Manager.ENTERING, "ALTCTL", Manager.LOCKED),
-            (Manager.ENTERING, "OFFBOARD", Manager.RETURNING),
+            (Manager.ENTERING, "ALTCTL", Manager.CANCELING_ENTRY),
+            (Manager.ENTERING, "OFFBOARD", Manager.CANCELING_ENTRY),
         ):
             node, now = self._waiting_offboard_fixture()
             node.phase = phase
@@ -565,7 +570,7 @@ class FlightHandoverTest(unittest.TestCase):
                    else 2000 if param_id.endswith("MAX") else 1)
             return mock.Mock(success=True,value=mock.Mock(integer=value,real=value))
         with mock.patch.object(rospy,"wait_for_service"),mock.patch.object(rospy,"ServiceProxy",return_value=get),mock.patch.object(rospy,"sleep") as sleep,mock.patch.object(rospy,"logwarn_throttle"):
-            node._load_rc_roll_yaw_calibration()
+            node._load_rc_calibration()
         sleep.assert_called_once_with(.25)
         self.assertEqual(calls[:2],["RC_MAP_ROLL","RC_MAP_ROLL"])
 
@@ -607,14 +612,14 @@ class FlightHandoverTest(unittest.TestCase):
             return mock.Mock(success=param_id in values,
                              value=mock.Mock(integer=values.get(param_id,0),real=values.get(param_id,0)))
         with mock.patch.object(rospy,"wait_for_service"),mock.patch.object(rospy,"ServiceProxy",return_value=get):
-            node._load_rc_roll_yaw_calibration()
+            node._load_rc_calibration()
         self.assertEqual(node.rc_calibration["roll"],(1,1100,1510,1900,True))
         node.rc_channels=(1500,1900,1500,1900)
-        self.assertEqual(node._roll_yaw_fraction("roll"),-1)
-        self.assertEqual(node._roll_yaw_fraction("yaw"),1)
+        self.assertEqual(node._calibrated_rc_fraction("roll"),-1)
+        self.assertEqual(node._calibrated_rc_fraction("yaw"),1)
         values["RC_MAP_YAW"]=0
         with mock.patch.object(rospy,"wait_for_service"),mock.patch.object(rospy,"ServiceProxy",return_value=get):
-            with self.assertRaises(ValueError):node._load_rc_roll_yaw_calibration()
+            with self.assertRaises(ValueError):node._load_rc_calibration()
 
     def test_prestream_requires_attitude_output(self):
         node = Manager.__new__(Manager)
@@ -945,8 +950,9 @@ class FlightHandoverTest(unittest.TestCase):
             node._on_timer(None)
         self.assertEqual(node.ceiling_detach_pub.publish.call_count, 2)
         with mock.patch.object(rospy.Time, "now", return_value=rospy.Time.from_sec(10.3)):
-            node._on_state(State(mode="OFFBOARD"))
-            node._on_state(State(mode="ALTCTL"))
+            node._on_state(State(connected=True, mode="OFFBOARD"))
+            with mock.patch.object(rospy, "set_param"):
+                node._on_state(State(connected=True, mode="ALTCTL"))
         self.assertEqual(node.mode, OperatorCommand.MODE_STANDBY)
 
 

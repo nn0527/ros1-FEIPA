@@ -67,9 +67,12 @@ ceiling_attachment_decision_node:
 
   # ===========================================================================
   # 6. 接触确认与稳定判定
-  # 压缩量 >= attach_confirm_compression_m，并持续 attach_confirm_time_s，
-  # 才从 ATTACH_CONTROL 进入 SURFACE_HOLD。
+  # 控制台分支：原始顶距和最近3点中位数均 <= 0.067m，连续1秒，
+  # 从 ATTACH_CONTROL 进入 SURFACE_HOLD。
+  # 普通分支：压缩量 >= attach_confirm_compression_m，并持续 attach_confirm_time_s。
   # ===========================================================================
+  wall_contact_distance_m: 0.067
+  wall_contact_hold_s: 1.0
   attach_control_time_s: 0.50
   # 接触后若距离仍未进入稳定区间，最多尝试该时长，然后受控脱离。
   attach_control_timeout_s: 5.00
@@ -87,8 +90,8 @@ ceiling_attachment_decision_node:
   # 保持推力=hover_thrust*surface_thrust_multiplier
   # 所有推力最终仍受 max_thrust 限制。
   # ===========================================================================
-  # 2026-09-22 ULog 标定：悬停约0.45、稳定贴顶约0.48、接触约0.50。
-  hover_thrust: 0.45
+  # 2026-10-13 根据机载日志复核，用户指定悬停基值 0.49；仍需悬停验证。
+  hover_thrust: 0.49
   attach_thrust_multiplier: 1.11
   surface_thrust_multiplier: 1.07
   attach_thrust_ramp_per_s: 0.02

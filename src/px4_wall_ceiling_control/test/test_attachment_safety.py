@@ -721,6 +721,7 @@ class AttachmentSafetyTest(unittest.TestCase):
         node._wall_pressure_nominal_thrust = lambda: 0.6
         node.max_thrust = 0.85
         node.q_contact = (0.0, 0.0, 0.0, 1.0)
+        node._odom_fresh = lambda _now: False
         now = rospy.Time.from_sec(10)
         node._enter_state(WallPerchStatus.STATE_FRONT_WALL_DETECT, now, "acquire")
         node._enter_state(WallPerchStatus.STATE_WALL_HOLD, now, "contact")
@@ -885,11 +886,12 @@ class AttachmentSafetyTest(unittest.TestCase):
         self.assertEqual(node.state, WallPerchStatus.STATE_ABORT)
         self.assertEqual(node.fault_count, 1)
 
-    def test_wall_recovery_waits_for_departure_height(self):
+    def test_wall_recovery_waits_for_first_level_height(self):
         node = WallDecision.__new__(WallDecision)
         node.state = WallPerchStatus.STATE_RECOVER
         node.state_entered_at = rospy.Time.from_sec(1.0)
-        node.detach_altitude_m = 1.0
+        node.detach_altitude_m = 2.0
+        node.recovery_altitude_m = 1.0
         node.detach_altitude_tolerance_m = 0.10
         node.detach_vertical_speed_tolerance_mps = 0.20
         node.recover_time_s = 1.0
@@ -987,6 +989,8 @@ class AttachmentSafetyTest(unittest.TestCase):
         node.q_hover = (0.0, 0.0, 0.0, 1.0)
         node.hover_thrust = 0.45
         node.max_thrust = 0.85
+        node.recovery_max_thrust = 0.6
+        node._recovery_height_thrust = mock.Mock(return_value=0.45)
         self.assertEqual(node._candidate(now)[1:3], (node.q_hover, 0.45))
         node._flight_ready = lambda _now: False
         node.flight_state_received_at = now

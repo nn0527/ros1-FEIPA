@@ -46,7 +46,7 @@ class AutoManagerTests(unittest.TestCase):
         self.n.phase = Manager.ENTERING; self.n.flight.mode = 'OFFBOARD'
         self.n.offboard_request = None
         self.tick()
-        self.assertEqual(self.n.phase, Manager.RETURNING)
+        self.assertEqual(self.n.phase, Manager.CANCELING_ENTRY)
         self.n.cancel_pub.publish.assert_called()
     def test_rpc_rechecks_front_gate(self):
         self.n.selected_mode = OperatorCommand.MODE_WALL; self.n.phase = Manager.ENTERING
@@ -67,6 +67,7 @@ class AutoDecisionTests(unittest.TestCase):
         n._odom_fresh=lambda *a:False;n.recover_time_s=1
         n._auto_approach_ranges_ready=lambda *a:True;n._flip_ready=lambda *a:False
         n.flip_ready_since=rospy.Time.from_sec(9);n.flip_ready_last_sample_at=rospy.Time.from_sec(10)
+        n._vertical_height_thrust=mock.Mock(return_value=.47);n.recovery_max_thrust=.6
         n.q_hover=(0,0,0,1);n.approach_pitch_rad=math.radians(3);n.approach_thrust=.47;n.max_thrust=.85
         def enter(state,now,reason):n.state=state;n.state_entered_at=now;n.last_reason=reason
         n._enter_state=mock.Mock(side_effect=enter)

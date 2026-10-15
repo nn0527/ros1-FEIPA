@@ -46,9 +46,13 @@ class SharedBridge:
             return False
         if not value:
             return not (snapshot["status"]["runtime"].get("value") or {}).get("enabled")
+        pilot_modes = {"ALTCTL"}
+        runtime = snapshot["status"]["runtime"]
+        if runtime["fresh"] and (runtime.get("value") or {}).get("wall_pilot_mode") == "POSCTL":
+            pilot_modes.add("POSCTL")
         return bool(state["fresh"] and value.get("connected") and
                     (not value.get("armed") or
-                     (value.get("mode") == "ALTCTL" and
+                     (value.get("mode") in pilot_modes and
                       snapshot["status"]["phase"]["fresh"] and
                       snapshot["status"]["phase"]["value"] in ("IDLE", "LOCKED") and
                       snapshot["status"]["owner"]["fresh"] and
@@ -64,7 +68,7 @@ class SharedBridge:
                 if self.owner and self.owner != identifier:
                     raise ValueError("已有控制端：" + self.owner_label + "；请由原控制端释放控制权")
                 if self.owner != identifier and not self.safe_transfer():
-                    raise ValueError("当前状态不允许交接控制权；需有效的未解锁状态或已交还 ALTCTL")
+                    raise ValueError("当前状态不允许交接控制权；需有效未解锁状态或已确认交回遥控模式")
                 self.owner, self.owner_label = identifier, self.clients[identifier]["label"]
                 return {"message": "已取得控制权"}
             if action == "release":

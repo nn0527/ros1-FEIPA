@@ -59,3 +59,25 @@ string detach_block_reason
 # Automatic pre-flip approach mode and live sensor pause state.
 bool auto_approach_enabled
 bool approach_paused
+
+# Optional optical-flow-aided horizontal speed loop, using PX4 fused ENU velocity.
+bool horizontal_velocity_enabled
+bool horizontal_velocity_ready
+bool horizontal_velocity_active
+bool horizontal_velocity_stable
+string horizontal_velocity_reason
+float32 horizontal_velocity_x_enu_mps
+float32 horizontal_velocity_y_enu_mps
+float32 horizontal_target_x_enu_mps
+float32 horizontal_target_y_enu_mps
+float32 horizontal_accel_x_enu_mps2
+float32 horizontal_accel_y_enu_mps2
+uint8 optical_flow_quality
+
+# Vertical recovery/approach loop diagnostics; local ENU height, not AGL.
+bool vertical_control_active
+bool vertical_reference_valid
+float32 vertical_reference_m
+string vertical_reference_source
+float32 vertical_target_enu_mps
+float32 vertical_thrust_correction

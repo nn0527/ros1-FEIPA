@@ -2,6 +2,7 @@
 """Single MAVROS attitude publisher with bounded, direct RC stick trim."""
 
 import math
+import json
 import time
 
 import rospy
@@ -32,7 +33,7 @@ from px4_wall_ceiling_control.domain.rc_attitude_assist import (
 )
 from px4_wall_ceiling_control.domain.recovery_attitude_limits import limit_recovery_attitude, axis_yaw
 from px4_wall_ceiling_control.domain.safety import flight_state_ready
-from px4_wall_ceiling_control.freshness import is_fresh
+from px4_wall_ceiling_control.freshness import is_fresh_receipt as is_fresh
 from px4_wall_ceiling_control.msg import (
     AttachmentControlCandidate,
     CeilingAttachmentStatus,
@@ -86,7 +87,7 @@ class AttachmentOutputMuxNode:
         self.min_thrust = float(rospy.get_param("~min_thrust", 0.10))
         self.max_thrust = float(rospy.get_param("~max_thrust", 0.85))
         self.local_frame_id = rospy.get_param("~local_frame_id", "map")
-        self.hover_thrust = float(rospy.get_param("~hover_thrust", 0.50))
+        self.hover_thrust = float(rospy.get_param("~hover_thrust", 0.49))
         self.vertical_speed_kp = float(rospy.get_param("~vertical_speed_kp", 0.15))
         self.odom_twist_in_child_frame = bool(
             rospy.get_param("~odom_twist_in_child_frame", True)
@@ -115,6 +116,9 @@ class AttachmentOutputMuxNode:
             rospy.get_param("~rc_wall_detach_pitch_deg", 0.0)
         )
         self.rc_roll_yaw_enabled = bool(rospy.get_param("~rc_roll_yaw_enabled", False))
+        self.rc_ceiling_roll_pitch_enabled = bool(
+            rospy.get_param("~rc_ceiling_roll_pitch_enabled", False)
+        )
         self.rc_yaw_max_deg = float(rospy.get_param("~rc_yaw_max_deg", 15.0))
         self.rc_yaw_contact_deg = float(rospy.get_param("~rc_yaw_contact_deg", 3.0))
         self.rc_yaw_detach_deg = float(rospy.get_param("~rc_yaw_detach_deg", 5.0))
@@ -150,13 +154,13 @@ class AttachmentOutputMuxNode:
         self.preflip_bias_publisher = rospy.Publisher("/attachment/preflip_roll_bias_deg", Float32, queue_size=10)
         self.rc_yaw_rad = 0.0
         self.rc_calibration = {}
-        if self.rc_roll_yaw_enabled:
+        if self.rc_roll_yaw_enabled or self.rc_ceiling_roll_pitch_enabled:
             if not self.rc_assist_enabled:
-                raise ValueError("Roll/yaw correction requires rc_assist_enabled")
+                raise ValueError("Calibrated RC correction requires rc_assist_enabled")
             if not (0 <= self.rc_yaw_contact_deg <= self.rc_yaw_detach_deg <= self.rc_yaw_max_deg <= 30
                     and 0 < self.rc_yaw_slew_deg_s <= 45):
                 raise ValueError("RC yaw correction limits are invalid")
-            self._load_rc_roll_yaw_calibration()
+            self._load_rc_calibration()
         self.status_timeout_s = float(rospy.get_param("~status_timeout_s", 0.30))
         self.match_fcu_thrust_on_handover = bool(
             rospy.get_param("~match_fcu_thrust_on_handover", False)
@@ -325,6 +329,9 @@ class AttachmentOutputMuxNode:
             queue_size=10,
         )
         publish_rate_hz = float(rospy.get_param("~publish_rate_hz", 50.0))
+        self.output_health_publisher = rospy.Publisher("/attachment/output_health", String, queue_size=10)
+        self.output_health_last_key = None
+        self.output_health_last_at = None
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / max(publish_rate_hz, 2.0)), self._on_timer
         )
@@ -352,6 +359,10 @@ class AttachmentOutputMuxNode:
             self.flight_state.mode.upper() if self.flight_state is not None else ""
         )
         next_mode = message.mode.upper()
+        if previous_mode != next_mode and "OFFBOARD" in (previous_mode, next_mode):
+            self.rc_roll_rad = self.rc_pitch_rad = self.rc_yaw_rad = 0.0
+            self.rc_trim_at = now
+            self.rc_trim_axes = ()
         if getattr(self, "match_fcu_thrust_on_handover", False):
             if previous_mode != "OFFBOARD" and next_mode == "OFFBOARD":
                 if self._handover_source_ready(now):
@@ -389,7 +400,7 @@ class AttachmentOutputMuxNode:
         self.odom = message
         self.odom_at = rospy.Time.now()
 
-    def _load_rc_roll_yaw_calibration(self):
+    def _load_rc_calibration(self):
         # Fail startup rather than guess stick channels or direction.
         rospy.wait_for_service("/mavros/param/get", timeout=5.0)
         get = rospy.ServiceProxy("/mavros/param/get", ParamGet)
@@ -404,7 +415,12 @@ class AttachmentOutputMuxNode:
                 rospy.logwarn_throttle(2.0, "Waiting for MAVROS RC parameter cache: %s", name)
                 rospy.sleep(.25)
             raise ValueError("RC calibration canceled during shutdown")
-        for axis in ("roll", "yaw"):
+        axes = ["roll"]
+        if getattr(self, "rc_roll_yaw_enabled", False):
+            axes.append("yaw")
+        if getattr(self, "rc_ceiling_roll_pitch_enabled", False):
+            axes.append("pitch")
+        for axis in axes:
             channel = int(read("RC_MAP_" + axis.upper(), True))
             if channel <= 0:
                 raise ValueError("RC " + axis + " channel is not mapped")
@@ -414,18 +430,32 @@ class AttachmentOutputMuxNode:
                     and low < center < high and reverse in (-1, 1)):
                 raise ValueError("Invalid RC " + axis + " calibration")
             self.rc_calibration[axis] = (channel - 1, low, center, high, reverse < 0)
-        if self.rc_calibration["roll"][0] == self.rc_calibration["yaw"][0]:
-            raise ValueError("Roll and yaw require distinct RC channels")
+        if len({self.rc_calibration[axis][0] for axis in axes}) != len(axes):
+            raise ValueError("Calibrated RC axes require distinct channels")
         self.rc_roll_channel_index = self.rc_calibration["roll"][0]
-        # Legacy roll/pitch assist is disabled by this path; satisfy its validation.
-        self.rc_pitch_channel_index = self.rc_calibration["yaw"][0]
-        rospy.loginfo("RC roll/yaw correction: calibrated channels %d/%d; pitch and thrust unchanged",
-                      self.rc_roll_channel_index + 1, self.rc_pitch_channel_index + 1)
+        # Keep legacy validation valid, even when only roll/yaw assist is used.
+        second = "pitch" if "pitch" in axes else "yaw"
+        self.rc_pitch_channel_index = self.rc_calibration[second][0]
+        rospy.loginfo("Calibrated RC correction channels: %s", ", ".join(
+            "%s=%d" % (axis, self.rc_calibration[axis][0] + 1) for axis in axes
+        ))
 
-    def _roll_yaw_fraction(self, axis):
+    def _calibrated_rc_axes(self, now, source):
+        ceiling = source == AttachmentControlCandidate.SOURCE_CEILING
+        if source == AttachmentControlCandidate.SOURCE_NONE:
+            ceiling = self._operator_mode(now) == OperatorCommand.MODE_CEILING
+        if ceiling and getattr(self, "rc_ceiling_roll_pitch_enabled", False):
+            return ("roll", "pitch")
+        if getattr(self, "rc_roll_yaw_enabled", False):
+            return ("roll", "yaw")
+        return ()
+
+    def _calibrated_rc_fraction(self, axis):
         index, low, center, high, reverse = self.rc_calibration[axis]
         value = stick_fraction(self.rc_channels, index, low, center, high, self.rc_deadzone, reverse)
         # PX4 yaw is clockwise in NED; ROS heading is counterclockwise in ENU.
+        # Calibrated positive pitch stick means forward/nose-down: positive
+        # body-FLU pitch, so pitch needs no additional inversion after RCn_REV.
         return -value if axis == "yaw" and value is not None else value
 
     def _roll_yaw_limits(self, now, source):
@@ -442,42 +472,60 @@ class AttachmentOutputMuxNode:
                 return 0.0, 0.0
         return roll, yaw
 
-    def _roll_yaw_attitude(self, now, quaternion, source):
+    def _calibrated_rc_attitude(self, now, quaternion, source):
+        axes = self._calibrated_rc_axes(now, source)
         # Do not change ALTCTL prestream targets or retain a trim across handovers.
         flight = getattr(self, "flight_state", None)
         if (flight is None or not is_fresh(self.flight_state_at, self.state_timeout_s, now)
                 or flight.mode.upper() != "OFFBOARD"):
-            self.rc_roll_rad = self.rc_yaw_rad = 0.0
+            self.rc_roll_rad = self.rc_pitch_rad = self.rc_yaw_rad = 0.0
             self.rc_trim_at = now
+            self.rc_trim_axes = axes
             return quaternion
-        roll_limit, yaw_limit = self._roll_yaw_limits(now, source)
-        ready = self._rc_ready(now)
-        desired_roll = self._roll_yaw_fraction("roll") * roll_limit if ready else 0.0
-        desired_yaw = self._roll_yaw_fraction("yaw") * yaw_limit if ready else 0.0
+        if getattr(self, "rc_trim_axes", axes) != axes:
+            # Never carry a wall yaw trim into ceiling flight (or pitch back to wall).
+            self.rc_roll_rad = self.rc_pitch_rad = self.rc_yaw_rad = 0.0
+            self.rc_trim_at = now
+        self.rc_trim_axes = axes
+        if axes == ("roll", "pitch"):
+            limits = self._rc_limits(now, AttachmentControlCandidate.SOURCE_CEILING)
+        else:
+            limits = self._roll_yaw_limits(now, source)
+        ready = self._rc_ready(now, source)
         if not ready:
-            rospy.logwarn_throttle(1.0, "RC roll/yaw unavailable; correction returning to zero")
+            rospy.logwarn_throttle(1.0, "Calibrated RC unavailable; correction returning to zero")
         self.rc_age_publisher.publish(Float32(data=(now-self.rc_at).to_sec()*1000 if ready else -1.0))
         elapsed = max(0.0, min((now-self.rc_trim_at).to_sec() if self.rc_trim_at is not None else .02, .1))
-        self.rc_roll_rad = slew(max(-roll_limit, min(self.rc_roll_rad, roll_limit)), desired_roll,
-                                math.radians(self.rc_slew_deg_s)*elapsed)
-        self.rc_yaw_rad = slew(max(-yaw_limit, min(self.rc_yaw_rad, yaw_limit)), desired_yaw,
-                               math.radians(self.rc_yaw_slew_deg_s)*elapsed)
-        self.rc_pitch_rad = 0.0
+        applied = {"roll": 0.0, "pitch": 0.0, "yaw": 0.0}
+        for axis, limit in zip(axes, limits):
+            desired = self._calibrated_rc_fraction(axis) * limit if ready else 0.0
+            previous = getattr(self, "rc_" + axis + "_rad")
+            rate = self.rc_yaw_slew_deg_s if axis == "yaw" else self.rc_slew_deg_s
+            applied[axis] = slew(max(-limit, min(previous, limit)), desired,
+                                 math.radians(rate) * elapsed)
+        self.rc_roll_rad, self.rc_pitch_rad, self.rc_yaw_rad = (
+            applied["roll"], applied["pitch"], applied["yaw"]
+        )
         self.rc_trim_at = now
-        # World-up yaw before body-axis roll avoids Euler singularities at the wall.
+        # Reuse the body-axis trim; world-up yaw is used only for wall assistance.
         yaw_q = (0, 0, math.sin(self.rc_yaw_rad/2), math.cos(self.rc_yaw_rad/2))
         values = (quaternion.x, quaternion.y, quaternion.z, quaternion.w)
-        values = quaternion_normalize(quaternion_multiply(yaw_q, trim_attitude(values, self.rc_roll_rad, 0)))
-        preview = Vector3Stamped();preview.header.stamp = now
+        values = quaternion_normalize(quaternion_multiply(
+            yaw_q, trim_attitude(values, self.rc_roll_rad, self.rc_pitch_rad)
+        ))
+        preview = Vector3Stamped()
+        preview.header.stamp = now
         preview.vector.x = math.degrees(self.rc_roll_rad)
-        preview.vector.y = 0.0;preview.vector.z = math.degrees(self.rc_yaw_rad)
+        preview.vector.y = math.degrees(self.rc_pitch_rad)
+        preview.vector.z = math.degrees(self.rc_yaw_rad)
         self.rc_preview_publisher.publish(preview)
         return Quaternion(x=values[0], y=values[1], z=values[2], w=values[3])
 
     def _on_rc(self, message):
         self.rc_channels = tuple(message.channels)
         self.rc_at = rospy.Time.now()
-        if getattr(self, "rc_roll_yaw_enabled", False):
+        if (getattr(self, "rc_roll_yaw_enabled", False)
+                or getattr(self, "rc_ceiling_roll_pitch_enabled", False)):
             return  # Publish applied correction from the output path, not raw sticks.
         roll = stick_fraction(
             self.rc_channels, self.rc_roll_channel_index, self.rc_pwm_low,
@@ -652,13 +700,14 @@ class AttachmentOutputMuxNode:
             self.setpoint_builder = builder
         return builder
 
-    def _rc_ready(self, now):
+    def _rc_ready(self, now, source=AttachmentControlCandidate.SOURCE_NONE):
         if not getattr(self, "rc_assist_enabled", False):
             return True
         if not is_fresh(self.rc_at, self.rc_timeout_s, now) or self.rc_channels is None:
             return False
-        if getattr(self, "rc_roll_yaw_enabled", False):
-            return all(self._roll_yaw_fraction(axis) is not None for axis in ("roll", "yaw"))
+        axes = self._calibrated_rc_axes(now, source)
+        if axes:
+            return all(self._calibrated_rc_fraction(axis) is not None for axis in axes)
         return all(
             stick_fraction(
                 self.rc_channels, index, self.rc_pwm_low, self.rc_pwm_center,
@@ -711,8 +760,10 @@ class AttachmentOutputMuxNode:
     def _assisted_attitude(self, now, quaternion, source):
         if not getattr(self, "rc_assist_enabled", False):
             return self._preflip_bias_attitude(now, quaternion, source)
-        if getattr(self, "rc_roll_yaw_enabled", False):
-            return self._preflip_bias_attitude(now, self._roll_yaw_attitude(now, quaternion, source), source)
+        if self._calibrated_rc_axes(now, source):
+            return self._preflip_bias_attitude(
+                now, self._calibrated_rc_attitude(now, quaternion, source), source
+            )
         limits = self._rc_limits(now, source)
         if not self._rc_ready(now):
             rospy.logwarn_throttle(1.0, "RC attitude assist unavailable; trim returning to zero")
@@ -761,6 +812,8 @@ class AttachmentOutputMuxNode:
             and status is not None and is_fresh(self.wall_status_at, self.status_timeout_s, now)
             and status.state in (WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_FRONT_WALL_DETECT,
                                  WallPerchStatus.STATE_STABILIZE_HOVER, WallPerchStatus.STATE_SLOW_APPROACH))
+        if status is not None and getattr(status,"horizontal_velocity_enabled",False):
+            allowed = False  # Closed-loop lateral control replaces the fixed roll bias.
         if getattr(self, "approach_attitude_limits_enabled", False):
             # Automatic bias belongs only to confirmed approach, never to takeover fallback.
             allowed = allowed and status.state == WallPerchStatus.STATE_SLOW_APPROACH and not status.approach_paused
@@ -945,7 +998,9 @@ class AttachmentOutputMuxNode:
         active = (getattr(self, "recovery_attitude_limits_enabled", False)
                   and source == AttachmentControlCandidate.SOURCE_WALL
                   and status is not None
-                  and status.state in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT)
+                  and (status.state in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT)
+                       or (getattr(status,"horizontal_velocity_enabled",False)
+                           and (status.state == WallPerchStatus.STATE_EXIT or (status.state == WallPerchStatus.STATE_DETACH_ROTATE and status.horizontal_velocity_active))))
                   and is_fresh(self.wall_status_at, self.status_timeout_s, now)
                   and flight is not None and flight.mode.upper() == "OFFBOARD"
                   and is_fresh(self.flight_state_at, self.state_timeout_s, now))
@@ -993,6 +1048,26 @@ class AttachmentOutputMuxNode:
                 return self.OUTPUT_ATTITUDE_THRUST
         return self.OUTPUT_NONE
 
+    def _publish_output_health(self, now, output_mode, reason, checks):
+        publisher = getattr(self, "output_health_publisher", None)
+        if publisher is None:
+            return
+        key = (self.owner, output_mode, reason)
+        previous = getattr(self, "output_health_last_at", None)
+        if key == getattr(self, "output_health_last_key", None) and previous is not None and (now-previous).to_sec() < .1:
+            return
+        # Report the exact evaluated gates plus a separate post-decision snapshot.
+        sampled_at = rospy.Time.now()
+        ages = {}
+        for name in ("prestream_at", "odom_at", "flight_state_at", "rc_at", "fcu_attitude_target_at", "kill_status_at"):
+            stamp = getattr(self, name, None)
+            ages[name] = (sampled_at-stamp).to_sec() if stamp is not None else None
+        data = {"decision_at_s": now.to_sec(), "sampled_at_s": sampled_at.to_sec(),
+                "owner": self.owner, "output_mode": output_mode, "pause_reason": reason,
+                "gates": checks, "receipt_ages_s": ages}
+        publisher.publish(String(data=json.dumps(data, ensure_ascii=False, allow_nan=False)))
+        self.output_health_last_key, self.output_health_last_at = key, now
+
     def _on_timer(self, _event):
         now = rospy.Time.now()
         previous_owner = self.owner
@@ -1002,48 +1077,52 @@ class AttachmentOutputMuxNode:
             rospy.loginfo("attachment output owner=%d", self.owner)
 
         output_mode = self.OUTPUT_NONE
-        if self.output_enabled and kill_clear(self, now) and self.owner == self.OWNER_NONE:
-            # The mode manager requests this stream before asking PX4 for
-            # OFFBOARD, and keeps it alive through the return to ALTCTL.
-            if (
-                self.prestream_requested
-                and is_fresh(self.prestream_at, self.prestream_timeout_s, now)
-                and self._odom_fresh(now)
-                and self.flight_state is not None
-                and is_fresh(self.flight_state_at, self.state_timeout_s, now)
-                and self.flight_state.connected
-                and self.flight_state.armed
-            ):
-                if self._rc_ready(now):
+        clear = kill_clear(self, now)
+        checks = {"enabled": self.output_enabled, "kill_clear": clear}
+        reason = "output_disabled" if not self.output_enabled else "kill_active_or_stale" if not clear else "idle"
+        if self.output_enabled and clear and self.owner == self.OWNER_NONE:
+            checks.update({
+                "prestream_requested": self.prestream_requested,
+                "prestream_fresh": is_fresh(self.prestream_at, self.prestream_timeout_s, now),
+                "odom_fresh": self._odom_fresh(now),
+                "flight_fresh": is_fresh(self.flight_state_at, self.state_timeout_s, now),
+                "flight_connected": self.flight_state is not None and self.flight_state.connected,
+                "flight_armed": self.flight_state is not None and self.flight_state.armed,
+            })
+            reason = next((key for key, value in checks.items() if not value), "")
+            if not reason:
+                checks["rc_ready"] = self._rc_ready(now)
+                if not checks["rc_ready"]:
+                    reason = "rc_not_ready"
+                else:
                     target = self._prestream_attitude_target(now)
                     if target is not None:
                         target = self._limit_final_approach_target(now, target, AttachmentControlCandidate.SOURCE_NONE)
                         self.attitude_publisher.publish(target)
                         output_mode = self.OUTPUT_ATTITUDE_THRUST
+                    else:
+                        reason = "handover_thrust_target_missing_stale_or_invalid"
         elif self.output_enabled and self.owner != self.OWNER_NONE:
-            if not self._flight_ready(now):
+            # _flight_ready includes the independent emergency stop guard.
+            checks.update({"flight_ready": self._flight_ready(now), "odom_fresh": self._odom_fresh(now)})
+            if not checks["flight_ready"]:
+                reason = "owned_flight_not_ready"
                 rospy.logwarn_throttle(1.0, "attachment output inhibited: flight not ready")
-            elif not self._odom_fresh(now):
+            elif not checks["odom_fresh"]:
+                reason = "owned_odometry_stale"
                 rospy.logwarn_throttle(1.0, "attachment output inhibited: odometry stale")
-            elif self.owner == self.OWNER_CEILING:
-                if self.ceiling_candidate.valid:
-                    output_mode = self._publish_candidate(
-                        now, self.ceiling_candidate
-                    )
+            elif self.owner in (self.OWNER_CEILING, self.OWNER_WALL):
+                candidate = self.ceiling_candidate if self.owner == self.OWNER_CEILING else self.wall_candidate
+                if candidate.valid:
+                    output_mode = self._publish_candidate(now, candidate)
+                    reason = "" if output_mode else "candidate_kind_or_payload_invalid"
                 else:
-                    rospy.logerr_throttle(
-                        1.0,
-                        "ceiling candidate invalid; output stopped and owner retained",
-                    )
-            elif self.owner == self.OWNER_WALL:
-                if self.wall_candidate.valid:
-                    output_mode = self._publish_candidate(now, self.wall_candidate)
-                else:
-                    rospy.logerr_throttle(
-                        1.0,
-                        "wall candidate invalid; output stopped and owner retained",
-                    )
+                    reason = "ceiling_candidate_invalid" if self.owner == self.OWNER_CEILING else "wall_candidate_invalid"
+                    rospy.logerr_throttle(1.0, "%s; output stopped and owner retained", reason)
+        if output_mode != self.OUTPUT_NONE:
+            reason = ""
         self.mode_publisher.publish(UInt8(data=output_mode))
+        self._publish_output_health(now, output_mode, reason, checks)
 
 
 if __name__ == "__main__":

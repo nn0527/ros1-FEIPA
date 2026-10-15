@@ -23,12 +23,14 @@ TOPICS = [
     "/mavros/setpoint_raw/attitude", "/mavros/setpoint_raw/target_attitude",
     "/mavros/state", "/mavros/local_position/odom", "/mavros/local_position/velocity_local",
     "/mavros/imu/data", "/mavros/imu/static_pressure", "/mavros/estimator_status", "/mavros/rc/in", "/mavros/rc/out",
+    "/mavros/px4flow/raw/optical_flow_rad",
     "/attachment/kill_switch",
     "/mavros/battery", "/mavros/altitude", "/mavros/global_position/raw/fix",
     "/mavros/global_position/raw/gps_vel", "/mavros/statustext/recv",
     "/sensor/front/raw", "/sensor/front/range", "/sensor/ceiling/raw", "/sensor/ceiling/range",
     "/attachment/terminal_command", "/attachment/terminal_ack",
     "/sensor/health", "/operator/command", "/attachment/output_owner", "/attachment/output_mode",
+    "/attachment/output_health",
     "/attachment/flight_phase", "/attachment/flight_phase_reason", "/attachment/prestream",
     "/attachment/rc_preview_deg",
     "/attachment/recovery_target_deg",
@@ -167,6 +169,10 @@ class SignalSummary:
             event = "{} {}".format(topic, message.data)
         elif topic in ("/rosout", "/rosout_agg") and message.level >= 4:
             event = "ROS level={} node={} {}".format(message.level, message.name, message.msg)
+        elif topic == "/attachment/output_health":
+            health = json.loads(message.data)
+            event = "output health mode={} owner={} pause={}".format(
+                health.get("output_mode"), health.get("owner"), health.get("pause_reason"))
         elif topic == "/mavros/statustext/recv":
             event = "PX4 text severity={} {}".format(message.severity, message.text)
         with self.lock:
@@ -191,10 +197,12 @@ class SignalSummary:
             stamp = getattr(getattr(message, "header", None), "stamp", None)
             row[name + "_header_s"] = stamp.to_sec() if stamp else None
             return message
+        health = sample("/attachment/output_health", "output_health")
+        row["output_health_json"] = health.data if health is not None else None
         wall = sample("/wall_perch/status", "wall")
         for key in ("state_name", "reason", "progress", "candidate_valid", "fault_count", "thrust_normalized",
                     "front_distance_raw_m", "front_distance_filtered_m", "top_distance_raw_m",
-                    "top_distance_filtered_m", "top_range_fresh", "top_preflight_ready", "odom_fresh"):
+                    "top_distance_filtered_m", "top_range_fresh", "top_preflight_ready", "odom_fresh", "horizontal_velocity_enabled", "horizontal_velocity_ready", "horizontal_velocity_active", "horizontal_velocity_stable", "horizontal_velocity_reason", "horizontal_velocity_x_enu_mps", "horizontal_velocity_y_enu_mps", "horizontal_target_x_enu_mps", "horizontal_target_y_enu_mps", "horizontal_accel_x_enu_mps2", "horizontal_accel_y_enu_mps2", "optical_flow_quality", "vertical_control_active", "vertical_reference_valid", "vertical_reference_m", "vertical_reference_source", "vertical_target_enu_mps", "vertical_thrust_correction"):
             row["wall_" + key] = getattr(wall, key, None)
         ceiling = sample("/ceiling_attachment/status", "ceiling")
         for key in ("state_name", "reason", "candidate_valid", "fault_count", "range_fresh", "odom_fresh",

@@ -74,6 +74,19 @@ class SharedTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.bridge.request("b", "acquire")
         self.assertIsNone(self.bridge.owner)
 
+    def test_configured_posctl_transfer_requires_idle_owner_and_fresh_runtime(self):
+        snapshot=self.runtime.state.snapshot()
+        snapshot["status"]["state"].update(fresh=True,value={"connected":True,"armed":True,"mode":"POSCTL"})
+        snapshot["status"]["runtime"].update(fresh=True,value={"wall_pilot_mode":"POSCTL"})
+        snapshot["status"]["phase"].update(fresh=True,value="IDLE")
+        snapshot["status"]["owner"].update(fresh=True,value=0)
+        self.runtime.state=Mock(snapshot=lambda:snapshot)
+        self.assertTrue(self.bridge.safe_transfer())
+        snapshot["status"]["runtime"]["fresh"]=False
+        self.assertFalse(self.bridge.safe_transfer())
+        snapshot["status"]["runtime"]["fresh"]=True;snapshot["status"]["phase"]["value"]="ACTIVE"
+        self.assertFalse(self.bridge.safe_transfer())
+
     def test_explicit_release_allows_new_controller(self):
         self.bridge.request("a", "acquire")
         self.bridge.request("a", "release")

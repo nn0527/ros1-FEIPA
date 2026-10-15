@@ -26,7 +26,7 @@ from px4_wall_ceiling_control.domain.geometry import (
     smoothstep5,
 )
 from px4_wall_ceiling_control.domain.sample_hold import held_samples, record_hold_sample
-from px4_wall_ceiling_control.freshness import clamp, is_fresh, is_valid_range
+from px4_wall_ceiling_control.freshness import clamp, is_valid_range, is_fresh_receipt as is_fresh
 from px4_wall_ceiling_control.msg import (
     AttachmentControlCandidate,
     OperatorCommand,
@@ -35,7 +35,10 @@ from px4_wall_ceiling_control.msg import (
 )
 
 
-class WallPerchDecisionNode:
+from px4_wall_ceiling_control.adapters.wall_horizontal_velocity import WallHorizontalVelocityMixin
+
+
+class WallPerchDecisionNode(WallHorizontalVelocityMixin):
     STATE_NAMES = {
         WallPerchStatus.STATE_IDLE: "IDLE",
         WallPerchStatus.STATE_FRONT_WALL_DETECT: "FRONT_WALL_DETECT",
@@ -128,7 +131,7 @@ class WallPerchDecisionNode:
             0.01, float(rospy.get_param("~detach_time_s", 1.0))
         )
         self.recover_time_s = float(rospy.get_param("~recover_time_s", 0.50))
-        # Recovery-only vertical velocity loop; all thrust values are normalized.
+        # Approach/recovery vertical velocity loop; all thrust values are normalized.
         self.recovery_max_up_speed_mps = float(rospy.get_param("~recovery_max_up_speed_mps", 0.10))
         self.recovery_max_down_speed_mps = float(rospy.get_param("~recovery_max_down_speed_mps", 0.15))
         self.recovery_height_to_speed_kp = float(rospy.get_param("~recovery_height_to_speed_kp", 0.50))
@@ -150,7 +153,7 @@ class WallPerchDecisionNode:
             float(rospy.get_param("~approach_pitch_deg", 3.0))
         )
         self.hover_thrust = clamp(
-            float(rospy.get_param("~hover_thrust", 0.45)), 0.1, 0.9
+            float(rospy.get_param("~hover_thrust", 0.49)), 0.1, 0.9
         )
         self.approach_thrust = float(rospy.get_param("~approach_thrust", 0.47))
         self.flip_thrust_multiplier = float(
@@ -329,7 +332,13 @@ class WallPerchDecisionNode:
         self.q_contact = (0.0, 0.0, 0.0, 1.0)
         self.q_hold_reference = self.q_contact
         self.q_detach_start = self.q_contact
-        self.detach_altitude_m = None
+        self.detach_altitude_m = None  # Rotation-only legacy reference.
+        self.approach_altitude_m = None
+        self.recovery_altitude_m = None
+        self.recovery_wait_for_level = False
+        self.vertical_reference_source = "none"
+        self.vertical_target_speed = math.nan
+        self.vertical_correction = math.nan
         self.hold_achieved = False
         self.reached_state = WallPerchStatus.STATE_IDLE
         self.detach_completed = False
@@ -402,6 +411,7 @@ class WallPerchDecisionNode:
             self._on_cancel,
             queue_size=10,
         )
+        self._init_horizontal_velocity()
         publish_rate_hz = float(rospy.get_param("~publish_rate_hz", 50.0))
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / max(publish_rate_hz, 2.0)), self._on_timer
@@ -604,8 +614,15 @@ class WallPerchDecisionNode:
                 self.detach_stable_samples = 0
 
     def _on_state(self, message):
+        previous_mode = getattr(getattr(self, "flight_state", None), "mode", "")
         self.flight_state = message
         self.flight_state_received_at = rospy.Time.now()
+        if message.connected and message.armed and message.mode == "OFFBOARD" and previous_mode != "OFFBOARD":
+            if self._odom_fresh(self.flight_state_received_at):
+                feedback = self._height_feedback()
+                if feedback is not None:
+                    self.approach_altitude_m = feedback[0]
+                    rospy.loginfo("wall vertical: takeover height %.3f m", feedback[0])
         if hasattr(self, "takeoff_height"):
             self.takeoff_height.observe_state(message.connected, message.armed,
                                               self.flight_state_received_at.to_sec())
@@ -971,32 +988,51 @@ class WallPerchDecisionNode:
             return 0.1
         return clamp(vertical_demand / max(vertical_fraction, 1.0e-3), 0.1, self.max_thrust)
 
-    def _recovery_height_thrust(self):
-        """RECOVER/ABORT: bounded ENU speed target and total positive correction."""
+    def _prepare_vertical_reference(self, now):
+        """Latch exactly once from fresh measured attitude/height, never from a target."""
+        if not getattr(self, "recovery_wait_for_level", False) or not self._odom_fresh(now):
+            return
+        feedback, attitude = self._height_feedback(), self._current_quaternion()
+        if feedback is None or attitude is None:
+            return
+        tilt = math.acos(clamp(rotate_vector(attitude, (0., 0., 1.))[2], -1., 1.))
+        if tilt <= math.radians(5.):
+            self.recovery_altitude_m = feedback[0]
+            self.recovery_wait_for_level = False
+            self.vertical_reference_source = "first_level_5deg"
+            rospy.loginfo("wall vertical: first actual level height %.3f m", feedback[0])
+
+    def _vertical_height_thrust(self, reference):
+        """Height -> bounded ENU vz -> collective, including descent braking."""
         feedback = self._height_feedback()
         attitude = self._current_quaternion()
-        cap = min(self.max_thrust, self.recovery_max_thrust)
-        if self.detach_altitude_m is None or feedback is None or attitude is None:
-            return clamp(self.hover_thrust * self.recover_thrust_multiplier, 0.1, cap)
+        self.vertical_target_speed = self.vertical_correction = math.nan
+        if feedback is None or attitude is None:
+            return math.nan  # No fabricated feedback or fixed boosted fallback.
         altitude, speed = feedback
-        target_speed = clamp(
-            self.recovery_height_to_speed_kp * (self.detach_altitude_m - altitude),
-            -self.recovery_max_down_speed_mps, self.recovery_max_up_speed_mps)
-        # This includes braking a descent, not just the height-error contribution.
+        # While returning level, brake vz without pulling back to the wall height.
+        target_speed = (0.0 if reference is None else clamp(
+            self.recovery_height_to_speed_kp * (reference - altitude),
+            -self.recovery_max_down_speed_mps, self.recovery_max_up_speed_mps))
         correction = min(self.recovery_positive_compensation_max,
                          self.recovery_velocity_kp * (target_speed - speed))
+        self.vertical_target_speed, self.vertical_correction = target_speed, correction
         vertical_demand = max(0.0, self.hover_thrust + correction)
-        vertical_fraction = max(0.0, rotate_vector(attitude, (0.0, 0.0, 1.0))[2])
-        return clamp(vertical_demand / max(vertical_fraction, 1.0e-3), 0.1, cap)
+        vertical_fraction = max(0.0, rotate_vector(attitude, (0., 0., 1.))[2])
+        return clamp(vertical_demand / max(vertical_fraction, 1.e-3),
+                     0.1, min(self.max_thrust, self.recovery_max_thrust))
+
+    def _recovery_height_thrust(self):
+        return self._vertical_height_thrust(getattr(self, "recovery_altitude_m", None))
 
     def _detach_height_settled(self):
         if getattr(self, "bench_wait_for_ranges", False):
             return self._height_feedback() is not None
         feedback = self._height_feedback()
         return bool(
-            self.detach_altitude_m is not None
+            getattr(self, "recovery_altitude_m", None) is not None
             and feedback is not None
-            and abs(self.detach_altitude_m - feedback[0]) <= self.detach_altitude_tolerance_m
+            and abs(self.recovery_altitude_m - feedback[0]) <= self.detach_altitude_tolerance_m
             and abs(feedback[1]) <= self.detach_vertical_speed_tolerance_mps
         )
 
@@ -1155,7 +1191,10 @@ class WallPerchDecisionNode:
             WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT,
         ):
             self.recovery_completed = True
+        old_state = self.state
         self.state = new_state
+        if getattr(self,"horizontal_velocity_enabled",False) and new_state in (WallPerchStatus.STATE_IDLE,WallPerchStatus.STATE_FRONT_WALL_DETECT,WallPerchStatus.STATE_FLIP_TO_WALL):
+            self._reset_horizontal_gate("阶段切换：重置水平控制历史")
         self.state_entered_at = now
         self.last_reason = reason
         if new_state in (WallPerchStatus.STATE_FLIP_TO_WALL,
@@ -1173,6 +1212,12 @@ class WallPerchDecisionNode:
         if new_state == WallPerchStatus.STATE_FRONT_WALL_DETECT:
             self.recovery_completed = False
             self.detach_altitude_m = None
+            self.recovery_altitude_m = None
+            self.recovery_wait_for_level = False
+            if getattr(self, "approach_altitude_m", None) is None and self._odom_fresh(now):
+                feedback = self._height_feedback()
+                self.approach_altitude_m = feedback[0] if feedback is not None else None
+            self.vertical_reference_source = "offboard_takeover"
             self.front_ready_since = None
             self.front_ready_last_sample_at = None
             self._capture_attitude_references()
@@ -1209,6 +1254,9 @@ class WallPerchDecisionNode:
             self.top_clear_since = None
             self.top_clear_last_sample_at = None
         elif new_state == WallPerchStatus.STATE_DETACH_ROTATE:
+            self.recovery_altitude_m = None
+            self.recovery_wait_for_level = True
+            self.vertical_reference_source = "waiting_first_level_5deg"
             self.q_detach_start = self._current_quaternion() or self.q_contact
             feedback = self._height_feedback()
             self.detach_altitude_m = feedback[0] if feedback is not None else None
@@ -1217,6 +1265,18 @@ class WallPerchDecisionNode:
                 self.bench_detach_thrust_value = self._wall_pressure_thrust()
                 self.bench_detach_thrust_at = now
         elif new_state == WallPerchStatus.STATE_ABORT:
+            if old_state in (WallPerchStatus.STATE_FRONT_WALL_DETECT,
+                             WallPerchStatus.STATE_STABILIZE_HOVER,
+                             WallPerchStatus.STATE_SLOW_APPROACH):
+                self.recovery_altitude_m = getattr(self, "approach_altitude_m", None)
+                self.recovery_wait_for_level = self.recovery_altitude_m is None
+                self.vertical_reference_source = ("offboard_takeover" if self.recovery_altitude_m is not None
+                                                  else "waiting_first_level_5deg")
+            elif old_state not in (WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER):
+                self.recovery_altitude_m = None
+                self.recovery_wait_for_level = True
+                self.vertical_reference_source = "waiting_first_level_5deg"
+            self._prepare_vertical_reference(now)
             self.cancel_requested = False
             self.detach_requested = False
         elif new_state == WallPerchStatus.STATE_EXIT:
@@ -1232,7 +1292,9 @@ class WallPerchDecisionNode:
             self.top_clear_since = None
             self.top_clear_last_sample_at = None
         elif new_state == WallPerchStatus.STATE_IDLE:
-            self.detach_altitude_m = None
+            self.detach_altitude_m = self.approach_altitude_m = self.recovery_altitude_m = None
+            self.recovery_wait_for_level = False
+            self.vertical_reference_source = "none"
 
     def _pin_triggered(self):
         if not self.pin_enabled:
@@ -1285,7 +1347,7 @@ class WallPerchDecisionNode:
             if (getattr(self, "auto_approach", False) and mode_requested and not self.rearm_required
                     and altitude_ok and safety_ok):
                 self._enter_state(WallPerchStatus.STATE_FRONT_WALL_DETECT, now, "automatic wall takeover confirmed")
-                self._enter_state(WallPerchStatus.STATE_SLOW_APPROACH, now, "自动接近：前倾3°；总时限20秒")
+                self._enter_state(WallPerchStatus.STATE_SLOW_APPROACH, now, "自动接近开始；总时限20秒")
             elif (mode_requested and not self.rearm_required and altitude_ok and safety_ok
                     and self._ignore_attachment_range_loss()
                     and (not self._bench_ranges_ready(now)
@@ -1347,10 +1409,14 @@ class WallPerchDecisionNode:
                 elif not self._auto_approach_ranges_ready(now):
                     self.flip_ready_since = self.flip_ready_last_sample_at = None
                     self.last_reason = "自动接近暂停：雷达无效或过期，自主目标返回水平；总时限20秒"
+                elif getattr(self,"horizontal_velocity_enabled",False) and not self.horizontal_velocity_ready:
+                    self.flip_ready_since = self.flip_ready_last_sample_at = None
+                    self.last_reason = "自动接近暂停：" + self.horizontal_velocity_reason
                 elif self._flip_ready(now):
                     self._enter_state(WallPerchStatus.STATE_FLIP_TO_WALL, now, "flip distance reached")
                 else:
-                    self.last_reason = "自动接近：前倾3°；等待前距≤0.20 m连续0.30 s"
+                    self.last_reason = ("自动接近：目标前向%.2f m/s、横向0；等待前距≤0.20 m连续0.30 s" % self.horizontal_approach_speed
+                        if getattr(self,"horizontal_velocity_enabled",False) else "自动接近：前倾3°；等待前距≤0.20 m连续0.30 s")
             elif not self._safety_ok(now):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "approach safety failure")
@@ -1457,6 +1523,7 @@ class WallPerchDecisionNode:
                 and stable
                 and (getattr(self, "bench_wait_for_ranges", False) or self._top_clear_ready(now))
                 and self._detach_height_settled()
+                and self._horizontal_recovery_ready(now)
             ):
                 self._enter_state(WallPerchStatus.STATE_EXIT, now, "recovery complete")
 
@@ -1464,7 +1531,7 @@ class WallPerchDecisionNode:
             # Keep a bounded level target until fresh FCU feedback confirms
             # OFFBOARD has ended. Owner release alone is not RC handover.
             if self._flight_ready(now):
-                self.last_reason = "recovery complete; waiting for ALTCTL handover"
+                self.last_reason = "recovery complete; waiting for pilot mode handover"
             elif is_fresh(self.flight_state_received_at, self.state_timeout_s, now):
                 self._enter_state(WallPerchStatus.STATE_IDLE, now, "control released")
 
@@ -1474,8 +1541,9 @@ class WallPerchDecisionNode:
                 and self._attitude_recovered()
                 and self._rates_safe()
                 and self._vertical_speed_safe()
+                and self._detach_height_settled()
             )
-            if self._state_age(now) >= self.recover_time_s and stable:
+            if self._state_age(now) >= self.recover_time_s and stable and self._horizontal_recovery_ready(now):
                 self._enter_state(WallPerchStatus.STATE_EXIT, now, "abort recovery complete")
 
     def _flip_thrust(self):
@@ -1506,12 +1574,12 @@ class WallPerchDecisionNode:
         progress = 0.0
 
         if self.state == WallPerchStatus.STATE_SLOW_APPROACH:
-            angle = self.approach_pitch_rad
+            angle = 0.0 if getattr(self,"horizontal_velocity_enabled",False) else self.approach_pitch_rad
             if getattr(self, "auto_approach", False) and not self._auto_approach_ranges_ready(now):
                 angle = 0.0
             pitch = (0.0, math.sin(angle * 0.5), 0.0, math.cos(angle * 0.5))
             quaternion = self._quat_normalize(self._quat_multiply(self.q_hover, pitch))
-            thrust = self.approach_thrust
+            thrust = self._vertical_height_thrust(getattr(self, "approach_altitude_m", None))
         elif self.state == WallPerchStatus.STATE_FLIP_TO_WALL:
             progress = clamp(self._state_age(now) / self.flip_time_s, 0.0, 1.0)
             quaternion = self._quat_slerp(
@@ -1564,26 +1632,27 @@ class WallPerchDecisionNode:
             full = min(1.0, max(start + 0.01, self.hover_thrust / self.max_thrust))
             blend = self._smoothstep5((vertical_fraction - start) / (full - start))
             thrust = hold_thrust + blend * (self._height_hold_thrust() - hold_thrust)
+            if getattr(self, "recovery_altitude_m", None) is not None:
+                thrust = self._recovery_height_thrust()
         elif self.state == WallPerchStatus.STATE_RECOVER:
             quaternion = self.q_hover
             thrust = self._recovery_height_thrust()
         elif self.state == WallPerchStatus.STATE_EXIT:
             quaternion = self.q_hover
-            thrust = (self._height_hold_thrust()
-                      if getattr(self, "bench_wait_for_ranges", False) and getattr(self, "detach_altitude_m", None) is not None
-                      else self.hover_thrust)
+            thrust = self._recovery_height_thrust()
         elif self.state == WallPerchStatus.STATE_ABORT:
             quaternion = self.q_hover
             thrust = self._recovery_height_thrust()
 
-        if quaternion is not None:
+        quaternion = self._horizontal_attitude(now, quaternion)
+        if quaternion is not None and math.isfinite(thrust):
             if (getattr(self, "bench_wait_for_ranges", False) and getattr(self, "detach_altitude_m", None) is not None
                     and hasattr(self, "bench_detach_thrust_at") and math.isfinite(thrust)):
                 delta = max(0.0, (now - self.bench_detach_thrust_at).to_sec()) * self.bench_detach_thrust_slew_per_s
                 thrust = clamp(thrust, self.bench_detach_thrust_value - delta, self.bench_detach_thrust_value + delta)
                 self.bench_detach_thrust_value, self.bench_detach_thrust_at = thrust, now
             thrust = clamp(thrust, 0.1, self.max_thrust)
-            if self.state in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT):
+            if self.state in (WallPerchStatus.STATE_SLOW_APPROACH, WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT) or (self.state == WallPerchStatus.STATE_DETACH_ROTATE and getattr(self, "recovery_altitude_m", None) is not None):
                 thrust = min(thrust, self.recovery_max_thrust)
         return neutral, quaternion, thrust, progress
 
@@ -1685,7 +1754,23 @@ class WallPerchDecisionNode:
         )
         status.progress = progress
         status.fault_count = self.fault_count
+        self._fill_horizontal_status(status)
+        reference = (getattr(self, "approach_altitude_m", None) if self.state == WallPerchStatus.STATE_SLOW_APPROACH
+                     else getattr(self, "recovery_altitude_m", None))
+        status.vertical_control_active = self.state in (WallPerchStatus.STATE_SLOW_APPROACH,
+            WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT) or (
+            self.state == WallPerchStatus.STATE_DETACH_ROTATE and reference is not None)
+        status.vertical_reference_valid = reference is not None
+        status.vertical_reference_m = reference if reference is not None else math.nan
+        status.vertical_reference_source = getattr(self, "vertical_reference_source", "none")
+        status.vertical_target_enu_mps = getattr(self, "vertical_target_speed", math.nan) if status.vertical_control_active else math.nan
+        status.vertical_thrust_correction = getattr(self, "vertical_correction", math.nan) if status.vertical_control_active else math.nan
         status.reason = self.last_reason
+        if status.vertical_control_active:
+            status.reason += ("; 高度闭环基准 %.3f m（%s）" % (reference, status.vertical_reference_source)
+                              if reference is not None else "; 竖直速度制动：等待实际回平至5°锁定高度")
+        if status.horizontal_velocity_enabled and self.state in (WallPerchStatus.STATE_RECOVER,WallPerchStatus.STATE_ABORT,WallPerchStatus.STATE_EXIT):
+            status.reason += "; " + status.horizontal_velocity_reason
         return status
 
     @staticmethod
@@ -1726,6 +1811,8 @@ class WallPerchDecisionNode:
                 (now - self.previous_update_at).to_sec(), 0.001, 0.05
             )
         self.previous_update_at = now
+        self._prepare_vertical_reference(now)
+        self._prepare_horizontal_velocity(now)
         self._update_state_machine(now)
         status = self._build_status(now)
         self.status_publisher.publish(status)

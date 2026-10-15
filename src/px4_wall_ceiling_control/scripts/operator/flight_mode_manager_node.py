@@ -21,7 +21,7 @@ from px4_wall_ceiling_control.adapters.odometry import (
     vertical_speed_enu_mps,
 )
 from px4_wall_ceiling_control.domain.geometry import euler_from_quaternion
-from px4_wall_ceiling_control.freshness import is_fresh
+from px4_wall_ceiling_control.freshness import is_fresh_receipt as is_fresh
 from px4_wall_ceiling_control.msg import (
     CeilingAttachmentStatus,
     OperatorCommand,
@@ -35,6 +35,7 @@ class FlightModeManagerNode:
     WAITING_WALL = "WAITING_WALL"
     PRESTREAM = "PRESTREAM"
     ENTERING = "ENTERING"
+    CANCELING_ENTRY = "CANCELING_ENTRY"
     ACTIVE = "ACTIVE"
     RETURNING = "RETURNING"
     LOCKED = "LOCKED"
@@ -45,6 +46,15 @@ class FlightModeManagerNode:
         self.prestream_s = max(1.2, float(rospy.get_param("~prestream_s", 1.5)))
         self.retry_s = max(1.0, float(rospy.get_param("~retry_s", 2.0)))
         self.enter_timeout_s = max(2.0, float(rospy.get_param("~enter_timeout_s", 6.0)))
+        self.entry_stream_dropout_grace_s = float(rospy.get_param("~entry_stream_dropout_grace_s", 0.12))
+        if not 0.0 <= self.entry_stream_dropout_grace_s <= 0.15:
+            raise ValueError("entry dropout grace must be between 0 and 0.15 seconds")
+        self.entry_stream_loss_since = None
+        self.canceled_entry_mode = None
+        self.cancel_entry_started = None
+        self.cancel_entry_pilot_samples = 0
+        self.cancel_entry_stable_since = None
+        self.last_offboard_finished_at = None
         self.acquire_timeout_s = max(2.0, float(rospy.get_param("~acquire_timeout_s", 6.0)))
         self.state_timeout_s = float(rospy.get_param("~state_timeout_s", 1.5))
         self.odom_timeout_s = float(rospy.get_param("~odom_timeout_s", 0.5))
@@ -54,6 +64,9 @@ class FlightModeManagerNode:
         self.wall_manual_approach = bool(rospy.get_param("~wall_manual_approach", False))
         self.ceiling_baro_handover_enabled = bool(rospy.get_param("~ceiling_baro_handover_enabled", False))
         self.ceiling_distance_gate_enabled = bool(rospy.get_param("~ceiling_distance_gate_enabled", False))
+        self.wall_pilot_mode = str(rospy.get_param("~wall_pilot_mode", "ALTCTL")).upper()
+        self.wall_horizontal_velocity_enabled = bool(rospy.get_param("/wall_perch_decision_node/horizontal_velocity_enabled",False))
+        if self.wall_pilot_mode not in ("ALTCTL","POSCTL"):raise ValueError("unsupported wall pilot mode")
         self.wall_auto_approach = bool(rospy.get_param("~wall_auto_approach", False))
         if self.wall_manual_approach and self.wall_auto_approach:
             raise ValueError("manual and automatic wall approach cannot both be enabled")
@@ -220,6 +233,11 @@ class FlightModeManagerNode:
 
     def _on_flight(self, message):
         self.flight, self.flight_at = message, rospy.Time.now()
+        if self.phase == self.CANCELING_ENTRY:
+            if message.connected and message.mode.upper() == self._pilot_mode():
+                self.cancel_entry_pilot_samples = getattr(self, "cancel_entry_pilot_samples", 0) + 1
+            else:
+                self.cancel_entry_pilot_samples = 0
 
     def _on_odom(self, message):
         self.odom, self.odom_at = message, rospy.Time.now()
@@ -238,6 +256,8 @@ class FlightModeManagerNode:
 
     def _on_output(self, message):
         self.output_mode, self.output_at = int(message.data), rospy.Time.now()
+        if self.output_mode == 2:
+            self.entry_stream_loss_since = None
 
     def _on_owner(self, message):
         self.owner, self.owner_at = int(message.data), rospy.Time.now()
@@ -304,6 +324,8 @@ class FlightModeManagerNode:
             return "attitude or vertical velocity estimate invalid"
         if getattr(self, "require_rc_center", False) and not self._rc_fresh(now):
             return "RC input unavailable or invalid"
+        if selected == OperatorCommand.MODE_WALL and not self._wall_horizontal_ready(now):
+            return "水平速度接管条件未就绪：" + (getattr(self.wall,"horizontal_velocity_reason","") if self.wall else "等待贴墙状态")
         if selected == OperatorCommand.MODE_WALL and (
             getattr(self, "wall_bench_wait_for_ranges", False)
             or getattr(self, "ignore_range_loss_during_attachment", False)
@@ -324,6 +346,20 @@ class FlightModeManagerNode:
                 return "front sensor invalid"
             return None
         return "unsupported attachment mode"
+
+    def _pilot_mode(self, selected=None):
+        selected = getattr(self,"selected_mode",None) if selected is None else selected
+        return getattr(self,"wall_pilot_mode","ALTCTL") if selected == OperatorCommand.MODE_WALL else "ALTCTL"
+
+    def _wall_horizontal_ready(self, now, stable=False):
+        if not getattr(self,"wall_horizontal_velocity_enabled",False):return True
+        wall=getattr(self,"wall",None)
+        return bool(wall is not None and is_fresh(self.wall_at,self.status_timeout_s,now)
+            and getattr(wall,"horizontal_velocity_enabled",False) and wall.horizontal_velocity_ready
+            and (not stable or wall.horizontal_velocity_stable)
+            and self.estimator is not None and is_fresh(self.estimator_at,self.estimator_timeout_s,now)
+            and self.estimator.velocity_horiz_status_flag and not self.estimator.const_pos_mode_status_flag
+            and (self._pilot_mode() != "POSCTL" or self.estimator.pos_horiz_rel_status_flag or self.estimator.pos_horiz_abs_status_flag))
 
     def _preflight_ready(self, now, selected):
         return self._preflight_failure_reason(now, selected) is None
@@ -385,8 +421,8 @@ class FlightModeManagerNode:
     def _manual_wait_reason(self, now, monotonic_now):
         remaining = max(0.0, self.manual_wall_wait_timeout_s - self._manual_wait_elapsed(monotonic_now))
         if self._auto_wall_selected():
-            return "等待自动接近接管：保持 ALTCTL；前距≤0.50 m连续0.40 s且两路雷达有效，等待窗口剩余 {:.0f} 秒".format(remaining)
-        return "等待飞手手动接近：保持 ALTCTL；需有效距离连续满足翻转阈值，等待窗口剩余 {:.0f} 秒".format(remaining)
+            return "等待自动接近接管：保持 {}；前距≤0.50 m连续0.40 s且两路雷达有效，等待窗口剩余 {:.0f} 秒".format(self._pilot_mode(),remaining)
+        return "等待飞手手动接近：保持 {}；需有效距离连续满足翻转阈值，等待窗口剩余 {:.0f} 秒".format(self._pilot_mode(),remaining)
 
     def _stream_ready(self, now):
         return bool(
@@ -395,6 +431,91 @@ class FlightModeManagerNode:
             and self.owner == 0
             and is_fresh(self.owner_at, self.output_timeout_s, now)
         )
+
+    def _entry_stream_failed(self, now, monotonic_now):
+        if self._stream_ready(now):
+            self.entry_stream_loss_since = None
+            return False
+        # No grace for missing feedback, owner changes or a stale publisher.
+        if (not is_fresh(self.output_at, self.output_timeout_s, now)
+                or not is_fresh(self.owner_at, self.output_timeout_s, now) or self.owner != 0):
+            return True
+        if getattr(self, "entry_stream_loss_since", None) is None:
+            self.entry_stream_loss_since = monotonic_now
+        return monotonic_now - self.entry_stream_loss_since >= getattr(self, "entry_stream_dropout_grace_s", .12)
+
+    def _begin_entry_cancel(self, reason, monotonic_now):
+        if self.phase != self.CANCELING_ENTRY:
+            self.canceled_entry_mode = self.selected_mode
+            self.cancel_entry_started = monotonic_now
+            self.cancel_entry_pilot_samples = 0
+            self.cancel_entry_stable_since = None
+            # Invalidate workers which have not submitted yet; retain selected mode
+            # and a tombstone for commands already submitted to the FCU.
+            self.takeover_attempt = getattr(self, "takeover_attempt", 0) + 1
+            self.offboard_request = None
+            self._set_phase(self.CANCELING_ENTRY, reason="取消接管处理中：" + reason)
+            self.cancel_pub.publish(String(data="cancel"))
+        else:
+            self.phase_reason = "取消接管处理中：" + reason
+
+    def _entry_cancel_handover_ready(self, now):
+        # If a behavior acquired ownership meanwhile, retain its full recovery gates.
+        if self.owner != 0:
+            return self._handover_ready(now)
+        if (self.output_mode != 2 or not is_fresh(self.output_at, self.output_timeout_s, now)
+                or not is_fresh(self.owner_at, self.output_timeout_s, now)
+                or self.flight is None or not self.flight.connected or not self.flight.armed
+                or not is_fresh(self.flight_at, self.state_timeout_s, now)
+                or self.flight.mode.upper() != "OFFBOARD" or not self._rc_fresh(now)):
+            return False
+        e, odom = self.estimator, self.odom
+        if (e is None or not is_fresh(self.estimator_at, self.estimator_timeout_s, now)
+                or not e.attitude_status_flag or not e.velocity_vert_status_flag
+                or odom is None or not is_fresh(self.odom_at, self.odom_timeout_s, now)
+                or not odometry_is_finite(odom)):
+            return False
+        if self._pilot_mode() == "POSCTL" and not (e.velocity_horiz_status_flag
+                and (e.pos_horiz_rel_status_flag or e.pos_horiz_abs_status_flag)
+                and not e.const_pos_mode_status_flag):
+            return False
+        q = odom.pose.pose.orientation
+        roll, pitch, _ = euler_from_quaternion((q.x, q.y, q.z, q.w))
+        angular = odom.twist.twist.angular
+        return bool(math.cos(roll)*math.cos(pitch) >= math.cos(math.radians(5.))
+            and abs(vertical_speed_enu_mps(odom, self.odom_twist_in_child_frame)) <= self.handover_max_vertical_speed_mps
+            and all(abs(v) <= .3 for v in (angular.x, angular.y, angular.z)))
+
+    def _tick_entry_cancel(self, now, monotonic_now, flight_fresh, flight_mode):
+        if not flight_fresh or self.flight is None or not self.flight.connected:
+            self.phase_reason = "取消接管处理中：等待新鲜飞控模式反馈；禁止新动作"
+            return
+        if flight_mode == "OFFBOARD":
+            self.cancel_entry_pilot_samples = 0
+            if self._entry_cancel_handover_ready(now):
+                if getattr(self, "cancel_entry_stable_since", None) is None:
+                    self.cancel_entry_stable_since = monotonic_now
+                if monotonic_now - self.cancel_entry_stable_since >= .3:
+                    self._request_mode(self._pilot_mode())
+            else:
+                self.cancel_entry_stable_since = None
+            self.phase_reason = "取消接管处理中：已检测到OFFBOARD，保持受限输出并等待安全交回" + self._pilot_mode()
+        elif flight_mode == self._pilot_mode():
+            self.cancel_entry_stable_since = None
+            # Two new FCU heartbeats, quiescent service worker and a full entry
+            # timeout window prevent a stale pilot-mode sample ending cleanup.
+            finished = getattr(self, "last_offboard_finished_at", None)
+            anchor = max(self.cancel_entry_started, finished or self.cancel_entry_started)
+            if (not getattr(self, "request_in_flight", False)
+                    and getattr(self, "cancel_entry_pilot_samples", 0) >= 2
+                    and monotonic_now - anchor >= getattr(self, "enter_timeout_s", 6.)):
+                self._reset(lock=True, reason="取消接管已完成；飞控确认" + self._pilot_mode() + "，释放旧请求后可重试")
+            else:
+                self.phase_reason = "取消接管处理中：飞控为" + self._pilot_mode() + "，等待在途请求结束及连续模式确认"
+        else:
+            # Respect a pilot-selected third mode; keep the tombstone to catch a
+            # late OFFBOARD, but never force a mode change from another pilot mode.
+            self.phase_reason = "取消接管处理中：飞控为" + flight_mode + "；等待飞手回到" + self._pilot_mode()
 
     def _rc_fresh(self, now):
         channels = getattr(self, "rc_channels", None)
@@ -431,6 +552,8 @@ class FlightModeManagerNode:
         )
 
     def _handover_ready(self, now):
+        if (getattr(self,"selected_mode",None) == OperatorCommand.MODE_WALL and not self._wall_horizontal_ready(now,stable=True)):
+            return False
         if self.output_mode != 2 or not is_fresh(
             self.output_at, self.output_timeout_s, now
         ):
@@ -594,6 +717,8 @@ class FlightModeManagerNode:
 
     def _send_mode_request(self, mode, attempt=None):
         try:
+            if mode not in ("OFFBOARD", self._pilot_mode()):
+                return
             rospy.wait_for_service("/mavros/set_mode", timeout=0.2)
             if not kill_clear(self, rospy.Time.now()):
                 return
@@ -607,10 +732,11 @@ class FlightModeManagerNode:
                     or not self._ceiling_takeover_ready(rospy.Time.now())
                 ):
                     return
-            elif mode == "ALTCTL":
-                if self.phase != self.RETURNING or not self._handover_ready(
-                    rospy.Time.now()
-                ):
+            elif mode == self._pilot_mode():
+                if self.phase == self.CANCELING_ENTRY:
+                    if not self._entry_cancel_handover_ready(rospy.Time.now()):
+                        return
+                elif self.phase != self.RETURNING or not self._handover_ready(rospy.Time.now()):
                     return
             if attempt is not None and attempt != getattr(self, "takeover_attempt", 0):
                 return  # A canceled/previous attempt must not send a late mode change.
@@ -625,6 +751,8 @@ class FlightModeManagerNode:
         except (rospy.ROSException, rospy.ServiceException) as exc:
             rospy.logwarn("MAVROS set_mode %s failed: %s", mode, exc)
         finally:
+            if mode == "OFFBOARD":
+                self.last_offboard_finished_at = time.monotonic()
             self.request_in_flight = False
 
     def _reset(self, lock=False, reason=None):
@@ -646,7 +774,10 @@ class FlightModeManagerNode:
     def _on_timer(self, _event):
         now = rospy.Time.now()
         if not kill_clear(self, now):
-            self._reset(lock=True, reason="kill switch active or unavailable")
+            if self.phase in (self.ENTERING, self.CANCELING_ENTRY):
+                self._begin_entry_cancel("急停生效或反馈无效；输出立即停止", time.monotonic())
+            else:
+                self._reset(lock=True, reason="kill switch active or unavailable")
             self.prestream_pub.publish(Bool(data=False))
             self.phase_pub.publish(String(data=self.phase))
             self.phase_reason_pub.publish(String(data=self.phase_reason))
@@ -656,6 +787,10 @@ class FlightModeManagerNode:
         flight_mode = self.flight.mode.upper() if self.flight else ""
         flight_fresh = is_fresh(self.flight_at, self.state_timeout_s, now)
 
+        if (self.phase in (self.IDLE, self.LOCKED) and flight_fresh and flight_mode == "OFFBOARD"
+                and getattr(self, "canceled_entry_mode", None) is not None):
+            self.selected_mode = self.canceled_entry_mode
+            self._begin_entry_cancel("检测到已取消请求的迟到OFFBOARD反馈", monotonic_now)
         if self.phase == self.LOCKED and requested is None:
             self._reset(
                 lock=False,
@@ -664,7 +799,7 @@ class FlightModeManagerNode:
         if self.phase == self.IDLE:
             if (
                 requested is not None
-                and flight_mode == "ALTCTL"
+                and flight_mode == self._pilot_mode(requested)
                 and self._preflight_ready(now, requested)
             ):
                 self.takeover_attempt = getattr(self, "takeover_attempt", 0) + 1
@@ -697,10 +832,9 @@ class FlightModeManagerNode:
                 else:
                     reason = (self._preflight_failure_reason(now, self.selected_mode)
                               or "OFFBOARD 不属于本次有效接管，或预发送反馈已过期")
-                    self._reset(lock=True, reason=reason)
-                    self.cancel_pub.publish(String(data="cancel"))
-            elif flight_mode != "ALTCTL" or not self._preflight_ready(now, self.selected_mode):
-                self._reset(lock=True, reason=self._preflight_failure_reason(now, self.selected_mode) or "manual approach requires ALTCTL")
+                    self._begin_entry_cancel(reason, monotonic_now)
+            elif flight_mode != self._pilot_mode() or not self._preflight_ready(now, self.selected_mode):
+                self._reset(lock=True, reason=self._preflight_failure_reason(now, self.selected_mode) or "manual approach requires " + self._pilot_mode())
                 self.cancel_pub.publish(String(data="cancel"))
             elif self._manual_wait_elapsed(monotonic_now) >= self.manual_wall_wait_timeout_s:
                 self._reset(lock=True, reason="手动接近等待超时，贴墙请求已取消；仍由飞手控制 ALTCTL")
@@ -718,16 +852,16 @@ class FlightModeManagerNode:
                     self._set_phase(self.ENTERING)
                     self._request_mode("OFFBOARD")
                 elif self._wall_takeover_ready(now):
-                    self.phase_reason = "距离条件已满足；等待并行预发送完成，仍由飞手控制 ALTCTL"
+                    self.phase_reason = "距离条件已满足；等待并行预发送完成，仍由飞手控制 " + self._pilot_mode()
                 else:
                     self.phase_reason = self._manual_wait_reason(now, monotonic_now)
         elif self.phase == self.PRESTREAM:
             failure_reason = None
             if requested != self.selected_mode:
                 failure_reason = "operator request changed or was released"
-            elif flight_mode != "ALTCTL":
-                failure_reason = "flight mode changed from ALTCTL to {}".format(
-                    flight_mode or "unknown"
+            elif flight_mode != self._pilot_mode():
+                failure_reason = "flight mode changed from {} to {}".format(
+                    self._pilot_mode(), flight_mode or "unknown"
                 )
             elif not self._preflight_ready(now, self.selected_mode):
                 failure_reason = self._preflight_failure_reason(
@@ -751,52 +885,37 @@ class FlightModeManagerNode:
             else:
                 self.stream_since = None
         elif self.phase == self.ENTERING:
-            if self._wall_approach_aborted(now):
-                if flight_fresh and flight_mode == "OFFBOARD":
-                    self._set_phase(self.RETURNING, reason=self.wall.reason)
-                else:
-                    self._reset(lock=True, reason=self.wall.reason)
-                self.cancel_pub.publish(String(data="cancel"))
+            failure_reason = None
+            if requested != self.selected_mode:
+                failure_reason = "operator request changed or was released"
+            elif self._wall_approach_aborted(now):
+                failure_reason = self.wall.reason
+            elif not self._preflight_ready(now, self.selected_mode):
+                failure_reason = self._preflight_failure_reason(now, self.selected_mode) or "preflight safety lost"
+            elif self._entry_stream_failed(now, monotonic_now):
+                failure_reason = "OFFBOARD setpoint stream lost beyond entry grace"
+            elif monotonic_now - self.phase_since > self.enter_timeout_s:
+                failure_reason = "PX4 OFFBOARD entry timed out"
+            if failure_reason is not None:
+                self._begin_entry_cancel(failure_reason, monotonic_now)
             elif flight_fresh and flight_mode == "OFFBOARD":
-                if self._auto_wall_selected():
-                    if self._current_offboard_request(monotonic_now):
-                        self._set_phase(self.ACTIVE, reason="PX4 OFFBOARD接管已确认；开始受限自动接近")
-                    else:
-                        self._set_phase(self.RETURNING, reason="未确认本次 OFFBOARD 请求；取消自动接近")
-                        self.cancel_pub.publish(String(data="cancel"))
+                if not self._current_offboard_request(monotonic_now):
+                    self._begin_entry_cancel("未确认本次OFFBOARD请求", monotonic_now)
+                elif not self._stream_ready(now):
+                    self.phase_reason = "本次OFFBOARD已反馈；等待短暂输出间断恢复，禁止开始侧吸"
                 elif (self._manual_wall_selected() and not self._manual_wall_ready(now)
-                    and not self._wall_flip_started(now)):
+                        and not self._wall_flip_started(now)):
                     if getattr(self, "ignore_range_loss_during_attachment", False):
                         self.phase_reason = "接管等待：距离条件失效，保持中性输出，等待有效距离后翻转"
                     else:
-                        self._set_phase(self.RETURNING, reason="OFFBOARD 确认时距离条件失效，恢复水平并交回 ALTCTL")
+                        self._begin_entry_cancel("OFFBOARD确认时距离条件失效", monotonic_now)
                 else:
-                    self._set_phase(self.ACTIVE, reason="PX4 entered OFFBOARD")
-            else:
-                failure_reason = None
-                if requested != self.selected_mode:
-                    failure_reason = "operator request changed or was released"
-                elif not self._preflight_ready(now, self.selected_mode):
-                    failure_reason = self._preflight_failure_reason(
-                        now, self.selected_mode
-                    )
-                elif not self._stream_ready(now):
-                    failure_reason = "OFFBOARD setpoint stream lost"
-                if failure_reason is not None:
-                    rospy.logwarn("OFFBOARD entry stopped: %s", failure_reason)
-                    self._reset(
-                        lock=requested is not None,
-                        reason=failure_reason,
-                    )
-                elif monotonic_now - self.phase_since > self.enter_timeout_s:
-                    failure_reason = "PX4 OFFBOARD entry timed out"
-                    rospy.logerr(
-                        "%s; release command before retry",
-                        failure_reason,
-                    )
-                    self._reset(lock=True, reason=failure_reason)
-                else:
-                    self._request_mode("OFFBOARD")
+                    self.canceled_entry_mode = None
+                    self._set_phase(self.ACTIVE, reason="PX4 OFFBOARD接管已确认；开始受限自动接近" if self._auto_wall_selected() else "PX4 entered OFFBOARD")
+            elif self._stream_ready(now):
+                self._request_mode("OFFBOARD")
+        elif self.phase == self.CANCELING_ENTRY:
+            self._tick_entry_cancel(now, monotonic_now, flight_fresh, flight_mode)
         elif self.phase == self.ACTIVE:
             if flight_fresh and flight_mode != "OFFBOARD":
                 failure_reason = "PX4 left OFFBOARD for {}".format(
@@ -816,11 +935,11 @@ class FlightModeManagerNode:
                     self.ceiling_approach_timeout_returning = True
                     self._set_phase(self.RETURNING, reason="吸顶接近超时：FAULT锁存，等待ALTCTL确认后交回遥控器")
                     if self._handover_ready(now):
-                        self._request_mode("ALTCTL")
+                        self._request_mode(self._pilot_mode())
                 elif self._ceiling_baro_handover_ready(now):
                     self._set_phase(self.RETURNING, reason=self.ceiling.reason)
                     if self._handover_ready(now):
-                        self._request_mode("ALTCTL")
+                        self._request_mode(self._pilot_mode())
                 elif (self.completed and self.owner_seen
                     and (self.owner == 0 or (self.selected_mode == OperatorCommand.MODE_WALL and self.owner == 2))
                     and is_fresh(self.owner_at, self.output_timeout_s, now)):
@@ -839,18 +958,18 @@ class FlightModeManagerNode:
             if (getattr(self, "ceiling_approach_timeout_returning", False)
                     and (not flight_fresh or self.flight is None or not self.flight.connected)):
                 self.phase_reason = "waiting for fresh connected PX4 mode confirmation"
-            elif flight_fresh and flight_mode == "ALTCTL":
+            elif flight_fresh and self.flight.connected and flight_mode == self._pilot_mode():
                 self._reset(
                     lock=True,
-                    reason="returned to ALTCTL; release command before retry",
+                    reason="returned to {}; release command before retry".format(self._pilot_mode()),
                 )
             elif flight_fresh and flight_mode == "OFFBOARD" and self._handover_ready(now):
-                self._request_mode("ALTCTL")
+                self._request_mode(self._pilot_mode())
             elif flight_fresh and flight_mode == "OFFBOARD":
                 if getattr(self, "ceiling_approach_timeout_returning", False):
                     self.phase_reason = "吸顶接近超时：保持FAULT，等待有效遥控输入、飞控估计和连续输出后请求ALTCTL"
                 else:
-                    self.phase_reason = "waiting for stable attitude and continuous output before ALTCTL"
+                    self.phase_reason = "等待水平速度、姿态持续稳定和新鲜有效估计后交回" + self._pilot_mode()
             elif flight_fresh:
                 failure_reason = "unexpected flight mode during return: {}".format(
                     flight_mode or "unknown"
@@ -859,7 +978,7 @@ class FlightModeManagerNode:
                 self._reset(lock=True, reason=failure_reason)
 
         self.prestream_pub.publish(
-            Bool(data=self.phase in (self.WAITING_WALL, self.PRESTREAM, self.ENTERING, self.ACTIVE, self.RETURNING))
+            Bool(data=self.phase in (self.WAITING_WALL, self.PRESTREAM, self.ENTERING, self.CANCELING_ENTRY, self.ACTIVE, self.RETURNING))
         )
         self.phase_pub.publish(String(data=self.phase))
         phase_reason_pub = getattr(self, "phase_reason_pub", None)

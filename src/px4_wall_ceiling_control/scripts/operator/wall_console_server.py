@@ -201,7 +201,7 @@ class RemoteRuntime:
         elif name == "rc":
             value = {"channels": list(msg.channels), "rssi": msg.rssi}
         elif name == "estimator":
-            value = {"attitude": msg.attitude_status_flag, "vertical_velocity": msg.velocity_vert_status_flag}
+            value = {"attitude": msg.attitude_status_flag, "vertical_velocity": msg.velocity_vert_status_flag, "horizontal_velocity": msg.velocity_horiz_status_flag}
         elif name == "health":
             value = {"ceiling_valid": msg.ceiling_valid, "front_valid": msg.front_valid,
                      "ceiling_age_s": msg.ceiling_age_s, "front_age_s": msg.front_age_s}
@@ -213,7 +213,7 @@ class RemoteRuntime:
                       "altitude_reference_valid", "height_above_takeoff_m", "min_entry_height_m", "entry_height_ready",
                       "hold_achieved", "reached_state_name", "detach_ready", "detach_completed", "recovery_completed",
                       "detach_pending", "detach_block_reason", "flip_ready", "front_range_fresh", "top_range_fresh",
-                      "auto_approach_enabled", "approach_paused")}
+                      "auto_approach_enabled", "approach_paused", "horizontal_velocity_enabled", "horizontal_velocity_ready", "horizontal_velocity_active", "horizontal_velocity_stable", "horizontal_velocity_reason", "horizontal_velocity_x_enu_mps", "horizontal_velocity_y_enu_mps", "horizontal_target_x_enu_mps", "horizontal_target_y_enu_mps", "optical_flow_quality")}
         elif name in ("front_diagnostic", "ceiling_diagnostic", "kill"):
             value = json.loads(msg.data)
         elif name in ("phase", "reason", "owner"):
@@ -285,7 +285,7 @@ class RemoteRuntime:
                     self.state.config = validate_config(migrate_legacy_ports(running))
                 except (ValueError, TypeError):
                     enabled = False
-        return {"front_sensor_masked": self.ros.get_param("/attachment/front_sensor_masked", False), "ceiling_distance_gate_enabled": self.ros.get_param("/flight_mode_manager_node/ceiling_distance_gate_enabled", False), "ceiling_enabled": "/ceiling_attachment_decision_node" in nodes,
+        return {"wall_pilot_mode": self.ros.get_param("/flight_mode_manager_node/wall_pilot_mode","ALTCTL"), "front_sensor_masked": self.ros.get_param("/attachment/front_sensor_masked", False), "ceiling_distance_gate_enabled": self.ros.get_param("/flight_mode_manager_node/ceiling_distance_gate_enabled", False), "ceiling_enabled": "/ceiling_attachment_decision_node" in nodes,
                 "ceiling_activation_distance_m": self.ros.get_param("/ceiling_attachment_decision_node/activation_distance_m", .5),
                 "enabled": bool(enabled), "test_profile": profile, "nodes": sorted(nodes),
                 "missing": sorted(required - nodes), "logger": "/attachment_flight_logger" in nodes}
@@ -430,7 +430,7 @@ class RemoteRuntime:
                     raise ValueError("贴墙节点启动未完成，请查看缺失节点和启动日志")
                 time.sleep(0.3)
             self.state.launch_error = ""
-            self.state.event("基础程序已就绪；等待飞手在 ALTCTL 起飞并稳定")
+            self.state.event("基础程序已就绪；侧吸用POSCTL、吸顶用ALTCTL起飞并稳定")
         except Exception as error:
             self.state.launch_error = str(error)
             self.state.event(str(error), "error")
@@ -506,7 +506,7 @@ class RemoteRuntime:
                 raise ValueError("终端指令节点未订阅，消息未发送")
             self.publisher.publish(command)
         self.state.send_wall(publish)
-        return {"message": "贴墙请求已提交；保持 ALTCTL 手动接近，距离条件满足后才接管翻转"}
+        return {"message": "贴墙请求已提交；保持遥控模式稳定飞行，距离及速度反馈条件满足后接管接近"}
 
     def detach(self):
         def publish(command):

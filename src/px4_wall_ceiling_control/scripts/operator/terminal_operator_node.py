@@ -100,8 +100,9 @@ class TerminalOperatorNode:
             if self.mode != OperatorCommand.MODE_STANDBY or self.detaching:
                 rospy.logwarn("terminal operator: finish current cycle before %s", command)
                 return
-            if self.flight_mode != "ALTCTL":
-                rospy.logwarn("terminal operator: start only from PX4 ALTCTL")
+            pilot_mode = (str(rospy.get_param("/flight_mode_manager_node/wall_pilot_mode","ALTCTL")).upper() if command == "wall" else "ALTCTL")
+            if self.flight_mode != pilot_mode:
+                rospy.logwarn("terminal operator: start only from PX4 %s",pilot_mode)
                 return
             self.mode = (
                 OperatorCommand.MODE_CEILING
@@ -157,7 +158,7 @@ class TerminalOperatorNode:
                 rospy.loginfo("confirmed ALTCTL handover: front sensor control input restored")
         if self.flight_mode == "OFFBOARD":
             self.was_offboard = True
-        elif self.was_offboard and self.flight_mode == "ALTCTL":
+        elif self.was_offboard and message.connected and self.flight_mode == (str(rospy.get_param("/flight_mode_manager_node/wall_pilot_mode","ALTCTL")).upper() if self.mode == OperatorCommand.MODE_WALL else "ALTCTL"):
             self.mode = OperatorCommand.MODE_STANDBY
             self.detaching = False
             self.detach_pulse = False

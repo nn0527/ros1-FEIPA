@@ -114,7 +114,7 @@ class CeilingAttachmentDecisionNode:
             rospy.get_param("~detach_clear_hold_s", 0.20)
         )
         self.hover_thrust = clamp(
-            float(rospy.get_param("~hover_thrust", 0.50)), 0.1, 0.9
+            float(rospy.get_param("~hover_thrust", 0.49)), 0.1, 0.9
         )
         self.attach_thrust_multiplier = float(
             rospy.get_param("~attach_thrust_multiplier", 1.20)
@@ -154,7 +154,7 @@ class CeilingAttachmentDecisionNode:
 
         self.console_contact_profile = bool(rospy.get_param("~console_contact_profile", False))
         self.activation_hold_s = float(rospy.get_param("~activation_hold_s", 0.30))
-        self.wall_contact_distance_m = float(rospy.get_param("~wall_contact_distance_m", 0.056))
+        self.wall_contact_distance_m = float(rospy.get_param("~wall_contact_distance_m", 0.067))
         self.approach_contact_distance_m = float(rospy.get_param("~approach_contact_distance_m", 0.07))
         if not math.isfinite(self.approach_contact_distance_m) or self.approach_contact_distance_m <= 0:
             raise ValueError("approach_contact_distance_m must be finite and positive")

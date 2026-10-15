@@ -1,8 +1,8 @@
 <launch>
-  <!-- Dedicated ALTCTL -> wall-only entry. Calibrated bounded roll/yaw correction; no auto takeoff. -->
+  <!-- ALTCTL entry: wall uses calibrated roll/yaw; ceiling uses roll/pitch. No auto takeoff. -->
   <arg name="ceiling_serial_port" default="/dev/ttyUSB1" />
   <arg name="front_serial_port" default="/dev/ttyUSB2" />
-  <arg name="hover_thrust" default="0.45" />
+  <arg name="hover_thrust" default="0.49" />
   <arg name="preflip_right_roll_deg" default="1.7" />
   <arg name="restrained_bench" default="false" />
   <include file="$(find px4_wall_ceiling_control)/launch/system/attachment_system_mavros.launch">
@@ -26,6 +26,7 @@
     <arg name="wall_hold_time_s" value="0.0" />
     <arg name="rc_assist_enabled" value="true" />
     <arg name="rc_roll_yaw_enabled" value="true" />
+    <arg name="rc_ceiling_roll_pitch_enabled" value="true" />
     <arg name="preflip_right_roll_deg" value="$(arg preflip_right_roll_deg)" />
     <arg name="recovery_attitude_limits_enabled" value="true" />
     <arg name="require_rc_center" value="false" />
@@ -37,10 +38,13 @@
   <param name="/flight_mode_manager_node/ceiling_baro_handover_enabled" value="true" />
   <param name="/attachment/front_sensor_masked" value="false" />
   <param name="/flight_mode_manager_node/ceiling_distance_gate_enabled" value="true" />
+  <param name="/flight_mode_manager_node/wall_pilot_mode" value="POSCTL" />
+  <param name="/wall_perch_decision_node/horizontal_velocity_enabled" value="true" />
+  <param name="/wall_perch_decision_node/horizontal_approach_speed_mps" value="0.05" />
   <param name="/ceiling_attachment_decision_node/console_contact_profile" value="true" />
   <param name="/ceiling_attachment_decision_node/activation_distance_m" value="1.0" />
   <param name="/ceiling_attachment_decision_node/activation_hold_s" value="0.30" />
-  <param name="/ceiling_attachment_decision_node/wall_contact_distance_m" value="0.056" />
+  <param name="/ceiling_attachment_decision_node/wall_contact_distance_m" value="0.067" />
   <param name="/ceiling_attachment_decision_node/wall_contact_hold_s" value="1.0" />
   <param name="/ceiling_attachment_decision_node/wall_contact_window_samples" value="3" />
   <param name="/ceiling_attachment_decision_node/surface_hold_thrust" value="0.50" />

@@ -4,7 +4,8 @@
 
 `wall_console_flight.launch` 的接近入口独立使用 `approach_contact_distance_m=0.07`：
 顶部最近 3 个有效样本的中位数 ≤7 cm 时进入 `ATTACH_CONTROL`。
-后续贴顶确认仍使用 `wall_contact_distance_m=0.056` 连续 1 秒。
+后续贴顶确认使用 `wall_contact_distance_m=0.067`：原始顶距和最近 3 点中位数
+均 ≤6.7 cm，连续 1 秒后进入 `SURFACE_HOLD`。
 
 有效接近时间超过 `approach_timeout_s=12.0` 后进入锁存 `FAULT`，状态消息的
 `approach_timed_out=true` 明确请求模式管理器交回 ALTCTL。同一请求不自动重入接近。

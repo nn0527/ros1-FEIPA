@@ -23,6 +23,16 @@ spec.loader.exec_module(server)
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_wall_wait_cancel_uses_configured_posctl_mode(self):
+        state=ConsoleState()
+        state.update("runtime",{"wall_pilot_mode":"POSCTL"})
+        state.update("state",{"connected":True,"armed":True,"mode":"POSCTL"})
+        state.update("phase","WAITING_WALL");state.update("owner",0)
+        state.update("operator",{"enabled":True,"mode":3})
+        self.assertTrue(state.snapshot()["can_cancel_wait"])
+        state.update("state",{"connected":True,"armed":True,"mode":"OFFBOARD"})
+        self.assertFalse(state.snapshot()["can_cancel_wait"])
+
     def test_restart_with_stale_stopped_mavros_feedback_bootstraps_connection(self):
         for old_armed in (False, True):
             now = [0.0]

@@ -23,6 +23,7 @@ class ManualApproachTests(unittest.TestCase):
         n.manual_wait_canceled = False
         n.stream_since = None
         n.prestream_s = 1.5
+        n.enter_timeout_s = 6.0
         n.state_timeout_s = n.sensor_timeout_s = n.status_timeout_s = n.output_timeout_s = .5
         n.flight, n.flight_at = State(connected=True, armed=True, mode="ALTCTL"), self.now
         n.sensor, n.sensor_at = SensorHealth(front_valid=True, ceiling_valid=True), self.now
@@ -149,7 +150,10 @@ class ManualApproachTests(unittest.TestCase):
         self.node.phase = Manager.ENTERING
         self.node.flight.mode = "OFFBOARD"
         self.tick()
-        self.assertEqual(self.node.phase, Manager.RETURNING)
+        self.assertEqual(self.node.phase, Manager.CANCELING_ENTRY)
+        self.node._entry_cancel_handover_ready = mock.Mock(return_value=True)
+        self.tick()
+        self.clock += .31
         self.tick()
         self.node._request_mode.assert_called_once_with("ALTCTL")
 

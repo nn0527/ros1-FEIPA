@@ -1,6 +1,7 @@
 """PX4 kill-switch decoding from confirmed FCU parameters; no stick mapping guesses."""
 import json
 import math
+from px4_wall_ceiling_control.freshness import is_fresh_receipt
 
 
 class KillSwitchConfig:
@@ -46,5 +47,5 @@ def kill_clear(node, now):
     if not getattr(node, "kill_guard_enabled", False):
         return True
     at, status = node.kill_status_at, node.kill_status
-    return bool(at is not None and 0 <= (now - at).to_sec() <= 0.35 and
+    return bool(is_fresh_receipt(at, 0.35, now) and
                 status and status.get("valid") is True and status.get("active") is False)

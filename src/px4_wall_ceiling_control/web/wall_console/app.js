@@ -73,6 +73,9 @@ function paint(s){
   $("killState").classList.toggle("errorText",!kill?.valid || !!kill.active);
   text("detachCondition",wall?.state_name!=="WALL_HOLD"?"离墙仅在当前贴墙保持阶段接受请求":wall.detach_pending?"离墙请求等待中："+(wall.detach_block_reason || "等待连续稳定"):wall.detach_ready?"旋转条件已满足，可提交离墙请求":"可提交离墙请求，旋转前还需："+(wall.detach_block_reason || "等待姿态和角速度稳定"));
   text("wallBlockReason",s.can_wall?"":s.blockers.join("；"));
+  const horizontal=wall?.horizontal_velocity_enabled;
+  const hspeed=horizontal&&Number.isFinite(wall.horizontal_velocity_x_enu_mps)&&Number.isFinite(wall.horizontal_velocity_y_enu_mps)?Math.hypot(wall.horizontal_velocity_x_enu_mps,wall.horizontal_velocity_y_enu_mps):NaN;
+  text("horizontalVelocityState",horizontal?"水平速度闭环："+(wall.horizontal_velocity_reason||"等待反馈")+" · 实测 "+(Number.isFinite(hspeed)?hspeed.toFixed(3):"—")+" m/s · 光流质量 "+wall.optical_flow_quality+(wall.horizontal_velocity_stable?" · 稳定确认完成":""):"水平速度闭环未启用或反馈过期");
   for(const field of form.elements) field.disabled=s.starting || enabled || requestBusy || !control || !live;
   let title="等待启动", reason=s.blockers[0] || "飞行稳定后，可发送贴墙指令", step=0;
   if(!ssh){title="SSH 反馈中断";reason=s.ssh.error || "正在重新连接树莓派";}
@@ -92,10 +95,11 @@ function paint(s){
   const reached={SLOW_APPROACH:3,FLIP_TO_WALL:4,WALL_CAPTURE:4,WALL_HOLD:5,WALL_PIN:4,DETACH_ROTATE:6,RECOVER:7,EXIT:7};
   step=Math.max(step,reached[history?.reached_state_name] || 0,history?.hold_achieved?5:0);
   const recovered=history?.recovery_completed || history?.detach_completed;
-  const returned=!!(recovered && state?.mode==="ALTCTL" && fresh(s,"owner")===0 && ["IDLE","LOCKED"].includes(phase));
+  const pilotMode=fresh(s,"runtime")?.wall_pilot_mode || "ALTCTL";
+  const returned=!!(recovered && state?.mode===pilotMode && fresh(s,"owner")===0 && ["IDLE","LOCKED"].includes(phase));
   if(recovered)step=8;
-  if(phase==="RETURNING"){title="等待遥控接管";reason="保持水平控制输出，等待飞控确认 ALTCTL；未确认前不结束交接";}
-  if(returned){title=history?.fault_detected?"异常恢复完成，已交还遥控":"离墙完成，已交还遥控";reason="已确认 ALTCTL，输出已释放；飞手降低油门落地，再按正常流程上锁";}
+  if(phase==="RETURNING"){title="等待遥控接管";reason="保持稳定控制输出，等待飞控确认 "+pilotMode+"；未确认前不结束交接";}
+  if(returned){title=history?.fault_detected?"异常恢复完成，已交还遥控":"离墙完成，已交还遥控";reason="已确认 "+pilotMode+"，输出已释放，由飞手接管";}
   if(kill?.active){title="急停已生效";reason=state?.armed?"电机已停，飞控等待自动上锁；动作请求已禁用":"飞控已上锁，急停开关仍生效";}
   if(!live){title=!session.push?"实时反馈已暂停":"等待实时反馈";reason=!session.push?"本机停止接收数据；飞行程序与记录继续运行，动作已禁用":"需要收到新反馈后才能操作";}
   text("stageTitle",title);text("stageReason",translate[reason] || reason);
