@@ -894,9 +894,25 @@ class AttachmentOutputMuxNode:
                 return None
             thrust = float(self.fcu_attitude_target.thrust)
 
-        orientation = self._assisted_attitude(
-            now, self._level_attitude(), AttachmentControlCandidate.SOURCE_NONE
-        )
+        orientation=self._level_attitude()
+        wall=getattr(self,"wall_status",None)
+        if (wall is not None and getattr(wall,"horizontal_equilibrium_enabled",False)
+                and (self._operator_mode(now)==OperatorCommand.MODE_WALL or (
+                    flight_mode=="OFFBOARD" and wall.horizontal_equilibrium_frozen and wall.state==WallPerchStatus.STATE_IDLE))):
+            if not is_fresh(self.wall_status_at,self.status_timeout_s,now):
+                return None
+            if wall.horizontal_prestream_valid:
+                orientation=wall.horizontal_prestream_attitude
+            elif wall.horizontal_equilibrium_valid:
+                orientation=wall.horizontal_equilibrium_attitude
+            elif flight_mode != "OFFBOARD":
+                # Waiting in POSCTL: follow its fresh attitude, never replace
+                # the pilot controller's horizontal equilibrium with Euler zero.
+                orientation=self.fcu_attitude_target.orientation
+            else:
+                rospy.logerr_throttle(1.,"OFFBOARD prestream inhibited: wall equilibrium unavailable")
+                return None
+        orientation = self._assisted_attitude(now, orientation, AttachmentControlCandidate.SOURCE_NONE)
         return self._attitude_target(
             now,
             orientation,
@@ -960,12 +976,18 @@ class AttachmentOutputMuxNode:
             return target
         status = getattr(self, "wall_status", None)
         flight = getattr(self, "flight_state", None)
-        active = bool(getattr(self, "approach_attitude_limits_enabled", False)
-                      and source == AttachmentControlCandidate.SOURCE_WALL
-                      and status is not None and status.state == WallPerchStatus.STATE_SLOW_APPROACH
-                      and is_fresh(self.wall_status_at, self.status_timeout_s, now)
-                      and flight is not None and flight.mode.upper() == "OFFBOARD"
-                      and is_fresh(self.flight_state_at, self.state_timeout_s, now))
+        prestream = bool(source == AttachmentControlCandidate.SOURCE_NONE
+            and status is not None and getattr(status,"horizontal_equilibrium_enabled",False)
+            and status.state in (WallPerchStatus.STATE_IDLE,WallPerchStatus.STATE_FRONT_WALL_DETECT,
+                                 WallPerchStatus.STATE_STABILIZE_HOVER,WallPerchStatus.STATE_SLOW_APPROACH)
+            and flight is not None and flight.connected and flight.armed
+            and flight.mode.upper() in ("POSCTL","OFFBOARD")
+            and (self._operator_mode(now)==OperatorCommand.MODE_WALL
+                 or (flight.mode.upper()=="OFFBOARD" and status.horizontal_equilibrium_frozen)))
+        active = bool(status is not None and is_fresh(self.wall_status_at,self.status_timeout_s,now)
+            and flight is not None and is_fresh(self.flight_state_at,self.state_timeout_s,now)
+            and (prestream or (source==AttachmentControlCandidate.SOURCE_WALL
+                 and status.state==WallPerchStatus.STATE_SLOW_APPROACH and flight.mode.upper()=="OFFBOARD")))
         q = tuple(getattr(target.orientation, k) for k in "xyzw")
         previous = getattr(self, "approach_previous_target", None)
         previous_at = getattr(self, "approach_previous_at", None)
@@ -1101,7 +1123,7 @@ class AttachmentOutputMuxNode:
                         self.attitude_publisher.publish(target)
                         output_mode = self.OUTPUT_ATTITUDE_THRUST
                     else:
-                        reason = "handover_thrust_target_missing_stale_or_invalid"
+                        reason = "handover_thrust_or_equilibrium_missing_stale_or_invalid"
         elif self.output_enabled and self.owner != self.OWNER_NONE:
             # _flight_ready includes the independent emergency stop guard.
             checks.update({"flight_ready": self._flight_ready(now), "odom_fresh": self._odom_fresh(now)})

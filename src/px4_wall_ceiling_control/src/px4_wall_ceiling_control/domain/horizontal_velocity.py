@@ -18,8 +18,8 @@ class HorizontalVelocityController:
         self.target = (0., 0.)
         self.acceleration = (0., 0.)
 
-    def attitude(self, desired_velocity, measured_velocity, yaw, dt):
-        values = (*desired_velocity, *measured_velocity, yaw, dt)
+    def attitude(self, desired_velocity, measured_velocity, yaw, dt, equilibrium_axis=(0.,0.,1.)):
+        values = (*desired_velocity, *measured_velocity, *equilibrium_axis, yaw, dt)
         if not all(math.isfinite(value) for value in values):
             raise ValueError('nonfinite horizontal control input')
         dt = min(.05, max(0., dt))
@@ -32,6 +32,11 @@ class HorizontalVelocityController:
         scale = min(1., self.max_acceleration/norm) if norm else 1.
         self.acceleration = tuple(value*scale for value in acceleration)
         # A level-hover approximation. Final target cone/rate limits apply in the mux.
-        axis = (*self.acceleration, 9.80665)
+        if equilibrium_axis[2] <= 0:
+            raise ValueError('equilibrium must have positive vertical thrust authority')
+        # The .30 budget bounds feedback increments around measured equilibrium;
+        # it must not erase the feedforward required to hover at zero velocity.
+        axis = (9.80665*equilibrium_axis[0]/equilibrium_axis[2] + self.acceleration[0],
+                9.80665*equilibrium_axis[1]/equilibrium_axis[2] + self.acceleration[1], 9.80665)
         norm = math.sqrt(sum(value*value for value in axis))
         return attitude_from_axis_yaw(tuple(value/norm for value in axis),yaw)

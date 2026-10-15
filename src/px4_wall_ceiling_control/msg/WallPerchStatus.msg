@@ -81,3 +81,12 @@ float32 vertical_reference_m
 string vertical_reference_source
 float32 vertical_target_enu_mps
 float32 vertical_thrust_correction
+
+# Stable POSCTL feedforward and horizontal feedback through the handshake.
+bool horizontal_equilibrium_enabled
+bool horizontal_equilibrium_valid
+bool horizontal_equilibrium_frozen
+string horizontal_equilibrium_reason
+geometry_msgs/Quaternion horizontal_equilibrium_attitude
+bool horizontal_prestream_valid
+geometry_msgs/Quaternion horizontal_prestream_attitude

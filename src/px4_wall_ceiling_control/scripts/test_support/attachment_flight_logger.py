@@ -202,8 +202,11 @@ class SignalSummary:
         wall = sample("/wall_perch/status", "wall")
         for key in ("state_name", "reason", "progress", "candidate_valid", "fault_count", "thrust_normalized",
                     "front_distance_raw_m", "front_distance_filtered_m", "top_distance_raw_m",
-                    "top_distance_filtered_m", "top_range_fresh", "top_preflight_ready", "odom_fresh", "horizontal_velocity_enabled", "horizontal_velocity_ready", "horizontal_velocity_active", "horizontal_velocity_stable", "horizontal_velocity_reason", "horizontal_velocity_x_enu_mps", "horizontal_velocity_y_enu_mps", "horizontal_target_x_enu_mps", "horizontal_target_y_enu_mps", "horizontal_accel_x_enu_mps2", "horizontal_accel_y_enu_mps2", "optical_flow_quality", "vertical_control_active", "vertical_reference_valid", "vertical_reference_m", "vertical_reference_source", "vertical_target_enu_mps", "vertical_thrust_correction"):
+                    "top_distance_filtered_m", "top_range_fresh", "top_preflight_ready", "odom_fresh", "horizontal_velocity_enabled", "horizontal_velocity_ready", "horizontal_velocity_active", "horizontal_velocity_stable", "horizontal_velocity_reason", "horizontal_velocity_x_enu_mps", "horizontal_velocity_y_enu_mps", "horizontal_target_x_enu_mps", "horizontal_target_y_enu_mps", "horizontal_accel_x_enu_mps2", "horizontal_accel_y_enu_mps2", "optical_flow_quality", "vertical_control_active", "vertical_reference_valid", "vertical_reference_m", "vertical_reference_source", "vertical_target_enu_mps", "vertical_thrust_correction", "horizontal_equilibrium_enabled", "horizontal_equilibrium_valid", "horizontal_equilibrium_frozen", "horizontal_equilibrium_reason", "horizontal_prestream_valid"):
             row["wall_" + key] = getattr(wall, key, None)
+        for name in ("horizontal_equilibrium_attitude", "horizontal_prestream_attitude"):
+            value=getattr(wall,name,None)
+            for key in "xyzw":row["wall_"+name+"_"+key]=getattr(value,key,None)
         ceiling = sample("/ceiling_attachment/status", "ceiling")
         for key in ("state_name", "reason", "candidate_valid", "fault_count", "range_fresh", "odom_fresh",
                     "ceiling_distance_raw_m", "ceiling_distance_filtered_m", "activation_ready",

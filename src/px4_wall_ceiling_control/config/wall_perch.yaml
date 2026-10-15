@@ -83,6 +83,7 @@ wall_perch_decision_node:
   horizontal_velocity_enabled: false
   horizontal_approach_speed_mps: 0.05
   horizontal_velocity_kp: 1.5
+  # Feedback increment around the frozen POSCTL equilibrium; final total cone remains 5deg.
   horizontal_max_acceleration_mps2: 0.30
   horizontal_target_acceleration_mps2: 0.10
   horizontal_flow_timeout_s: 0.60

@@ -1193,7 +1193,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             self.recovery_completed = True
         old_state = self.state
         self.state = new_state
-        if getattr(self,"horizontal_velocity_enabled",False) and new_state in (WallPerchStatus.STATE_IDLE,WallPerchStatus.STATE_FRONT_WALL_DETECT,WallPerchStatus.STATE_FLIP_TO_WALL):
+        if getattr(self,"horizontal_velocity_enabled",False) and new_state in (WallPerchStatus.STATE_IDLE,WallPerchStatus.STATE_FLIP_TO_WALL):
             self._reset_horizontal_gate("阶段切换：重置水平控制历史")
         self.state_entered_at = now
         self.last_reason = reason
@@ -1295,6 +1295,9 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             self.detach_altitude_m = self.approach_altitude_m = self.recovery_altitude_m = None
             self.recovery_wait_for_level = False
             self.vertical_reference_source = "none"
+            if getattr(self,"horizontal_velocity_enabled",False):
+                self.horizontal_equilibrium.clear()
+                self.horizontal_takeover_yaw=None
 
     def _pin_triggered(self):
         if not self.pin_enabled:
@@ -1766,6 +1769,8 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         status.vertical_target_enu_mps = getattr(self, "vertical_target_speed", math.nan) if status.vertical_control_active else math.nan
         status.vertical_thrust_correction = getattr(self, "vertical_correction", math.nan) if status.vertical_control_active else math.nan
         status.reason = self.last_reason
+        if status.horizontal_equilibrium_enabled and not status.horizontal_equilibrium_valid:
+            status.reason += "; " + status.horizontal_equilibrium_reason
         if status.vertical_control_active:
             status.reason += ("; 高度闭环基准 %.3f m（%s）" % (reference, status.vertical_reference_source)
                               if reference is not None else "; 竖直速度制动：等待实际回平至5°锁定高度")
@@ -1813,6 +1818,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         self.previous_update_at = now
         self._prepare_vertical_reference(now)
         self._prepare_horizontal_velocity(now)
+        self._prepare_horizontal_equilibrium(now)
         self._update_state_machine(now)
         status = self._build_status(now)
         self.status_publisher.publish(status)

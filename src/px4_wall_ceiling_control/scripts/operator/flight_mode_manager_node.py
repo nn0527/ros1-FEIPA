@@ -325,7 +325,10 @@ class FlightModeManagerNode:
         if getattr(self, "require_rc_center", False) and not self._rc_fresh(now):
             return "RC input unavailable or invalid"
         if selected == OperatorCommand.MODE_WALL and not self._wall_horizontal_ready(now):
-            return "水平速度接管条件未就绪：" + (getattr(self.wall,"horizontal_velocity_reason","") if self.wall else "等待贴墙状态")
+            detail=(self.wall.horizontal_equilibrium_reason if self.wall is not None
+                    and getattr(self.wall,"horizontal_equilibrium_enabled",False) and not self.wall.horizontal_equilibrium_valid
+                    else getattr(self.wall,"horizontal_velocity_reason","") if self.wall else "等待贴墙状态")
+            return "水平速度接管条件未就绪：" + detail
         if selected == OperatorCommand.MODE_WALL and (
             getattr(self, "wall_bench_wait_for_ranges", False)
             or getattr(self, "ignore_range_loss_during_attachment", False)
@@ -356,6 +359,8 @@ class FlightModeManagerNode:
         wall=getattr(self,"wall",None)
         return bool(wall is not None and is_fresh(self.wall_at,self.status_timeout_s,now)
             and getattr(wall,"horizontal_velocity_enabled",False) and wall.horizontal_velocity_ready
+            and (not getattr(wall,"horizontal_equilibrium_enabled",False) or wall.horizontal_equilibrium_valid
+                 or (not stable and getattr(self,"phase",None) in (self.IDLE,self.WAITING_WALL)))
             and (not stable or wall.horizontal_velocity_stable)
             and self.estimator is not None and is_fresh(self.estimator_at,self.estimator_timeout_s,now)
             and self.estimator.velocity_horiz_status_flag and not self.estimator.const_pos_mode_status_flag
@@ -398,6 +403,7 @@ class FlightModeManagerNode:
         wall = self.wall
         return bool(wall is not None and is_fresh(self.wall_at, self.status_timeout_s, now)
                     and wall.state == WallPerchStatus.STATE_IDLE and wall.front_ready
+                    and (not getattr(wall,"horizontal_equilibrium_enabled",False) or wall.horizontal_equilibrium_valid)
                     and wall.front_range_fresh and wall.top_range_fresh and wall.sensor_health_fresh
                     and wall.top_preflight_ready and wall.entry_height_ready
                     and self.sensor is not None and is_fresh(self.sensor_at, self.sensor_timeout_s, now)
@@ -411,6 +417,7 @@ class FlightModeManagerNode:
         return bool(wall is not None and is_fresh(self.wall_at, self.status_timeout_s, now)
                     and wall.state == WallPerchStatus.STATE_IDLE
                     and wall.flip_ready and wall.front_range_fresh and wall.top_range_fresh
+                    and (not getattr(wall,"horizontal_equilibrium_enabled",False) or wall.horizontal_equilibrium_valid)
                     and wall.top_preflight_ready and wall.entry_height_ready
                     and self.sensor is not None and is_fresh(self.sensor_at, self.sensor_timeout_s, now)
                     and self.sensor.front_valid and self.sensor.ceiling_valid)
@@ -421,6 +428,9 @@ class FlightModeManagerNode:
     def _manual_wait_reason(self, now, monotonic_now):
         remaining = max(0.0, self.manual_wall_wait_timeout_s - self._manual_wait_elapsed(monotonic_now))
         if self._auto_wall_selected():
+            wall=getattr(self,"wall",None)
+            if wall is not None and getattr(wall,"horizontal_equilibrium_enabled",False) and not wall.horizontal_equilibrium_valid:
+                return "等待接管平衡基准：" + wall.horizontal_equilibrium_reason
             return "等待自动接近接管：保持 {}；前距≤0.50 m连续0.40 s且两路雷达有效，等待窗口剩余 {:.0f} 秒".format(self._pilot_mode(),remaining)
         return "等待飞手手动接近：保持 {}；需有效距离连续满足翻转阈值，等待窗口剩余 {:.0f} 秒".format(self._pilot_mode(),remaining)
 

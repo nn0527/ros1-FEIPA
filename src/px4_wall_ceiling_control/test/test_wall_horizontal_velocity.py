@@ -42,6 +42,8 @@ class HorizontalFlightTests(unittest.TestCase):
         params={'~horizontal_velocity_enabled':True,'~auto_approach':True}
         with mock.patch.object(rospy,'get_param',side_effect=lambda k,d=None:params.get(k,d)),mock.patch.object(rospy,'Publisher'),mock.patch.object(rospy,'Subscriber'),mock.patch.object(rospy,'Timer'):
             self.n=WallDecision()
+        # These tests isolate flow/phase behavior after a valid equilibrium capture.
+        self.n.horizontal_equilibrium.ready=self.n.horizontal_equilibrium.frozen=True
         self.n.state=W.STATE_SLOW_APPROACH
         self.n.q_hover=(0.,0.,0.,1.)
         self.n._auto_approach_ranges_ready=lambda now:True
