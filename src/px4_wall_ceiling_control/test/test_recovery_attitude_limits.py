@@ -78,6 +78,15 @@ class FinalTargetLimitsTest(unittest.TestCase):
         n.recovery_target_publisher=mock.Mock();n.recovery_horizontal_publisher=mock.Mock()
         return n
 
+    def control(self, state, seconds=10., sequence=1):
+        # Owned wall limits consume the phase from this exact control frame.
+        candidate = AttachmentControlCandidate(
+            source=AttachmentControlCandidate.SOURCE_WALL,
+            phase_valid=True, control_phase=state,
+            maneuver_id="recovery-limits-test", control_sequence=sequence)
+        candidate.header.stamp = rospy.Time.from_sec(seconds)
+        return candidate
+
     def target(self):
         x,y,z,w=q(12,45,30)
         return AttitudeTarget(orientation=Quaternion(x=x,y=y,z=z,w=w),thrust=.85)
@@ -85,7 +94,8 @@ class FinalTargetLimitsTest(unittest.TestCase):
     def test_recover_abort_final_thrust_and_horizontal_proxy(self):
         for state in (WallPerchStatus.STATE_RECOVER,WallPerchStatus.STATE_ABORT):
             n=self.node();n.wall_status.state=state
-            t=n._limit_final_recovery_target(rospy.Time.from_sec(10),self.target(),AttachmentControlCandidate.SOURCE_WALL)
+            t=n._limit_final_recovery_target(rospy.Time.from_sec(10),self.target(),AttachmentControlCandidate.SOURCE_WALL,
+                self.control(n.wall_status.state))
             self.assertAlmostEqual(t.thrust,.6,places=6)
             self.assertAlmostEqual(tilt(tuple(getattr(t.orientation,k) for k in "xyzw")),5)
             value=n.recovery_horizontal_publisher.publish.call_args[0][0].data
@@ -95,21 +105,25 @@ class FinalTargetLimitsTest(unittest.TestCase):
         for state in (WallPerchStatus.STATE_FLIP_TO_WALL,WallPerchStatus.STATE_WALL_CAPTURE,
                       WallPerchStatus.STATE_WALL_HOLD,WallPerchStatus.STATE_DETACH_ROTATE,WallPerchStatus.STATE_EXIT):
             n=self.node();n.wall_status.state=state;t=self.target();before=t.orientation
-            result=n._limit_final_recovery_target(rospy.Time.from_sec(10),t,AttachmentControlCandidate.SOURCE_WALL)
+            result=n._limit_final_recovery_target(rospy.Time.from_sec(10),t,AttachmentControlCandidate.SOURCE_WALL,
+                self.control(state))
             self.assertEqual(result.orientation,before);self.assertAlmostEqual(result.thrust,.85,places=6)
             n.recovery_target_publisher.publish.assert_not_called()
 
     def test_altctl_and_ceiling_outputs_are_unchanged(self):
         for mode,source in [("ALTCTL",AttachmentControlCandidate.SOURCE_WALL),("OFFBOARD",AttachmentControlCandidate.SOURCE_CEILING)]:
             n=self.node();n.flight_state.mode=mode
-            t=n._limit_final_recovery_target(rospy.Time.from_sec(10),self.target(),source)
+            t=n._limit_final_recovery_target(rospy.Time.from_sec(10),self.target(),source,
+                self.control(WallPerchStatus.STATE_RECOVER))
             self.assertAlmostEqual(t.thrust,.85,places=6)
 
     def test_recover_to_abort_keeps_slew_history(self):
         n=self.node();n.recovery_previous_target=q();n.recovery_previous_at=rospy.Time.from_sec(9.98)
-        t=n._limit_final_recovery_target(rospy.Time.from_sec(10),self.target(),AttachmentControlCandidate.SOURCE_WALL)
+        t=n._limit_final_recovery_target(rospy.Time.from_sec(10),self.target(),AttachmentControlCandidate.SOURCE_WALL,
+                self.control(n.wall_status.state))
         n.wall_status.state=WallPerchStatus.STATE_ABORT
-        t=n._limit_final_recovery_target(rospy.Time.from_sec(10.02),self.target(),AttachmentControlCandidate.SOURCE_WALL)
+        t=n._limit_final_recovery_target(rospy.Time.from_sec(10.02),self.target(),AttachmentControlCandidate.SOURCE_WALL,
+            self.control(WallPerchStatus.STATE_ABORT, 10.02, 2))
         self.assertLessEqual(tilt(tuple(getattr(t.orientation,k) for k in "xyzw")),.4+1e-6)
 
 if __name__=="__main__": unittest.main()

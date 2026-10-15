@@ -1,4 +1,6 @@
 <launch>
+  <!-- Explicit default lets rospy cache this setting instead of querying Master per log. -->
+  <param name="/rosout_disable_topics_generation" value="false" />
   <!--
     Unified ceiling-attachment + wall-perch chain with one MAVROS output owner.
     MAVROS must be started separately. Real output defaults to disabled.

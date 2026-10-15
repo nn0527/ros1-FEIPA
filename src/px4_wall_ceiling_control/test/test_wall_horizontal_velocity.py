@@ -52,7 +52,7 @@ class HorizontalFlightTests(unittest.TestCase):
 
     def feed(self,t,vx=0.,vy=0.,tilt=0.,quality=80,const=False,rate=0.,flow=True,estimator=True):
         self.time=t;now=rospy.Time.now()
-        odom=Odometry();odom.pose.pose.orientation.y=math.sin(math.radians(tilt)/2);odom.pose.pose.orientation.w=math.cos(math.radians(tilt)/2)
+        odom=Odometry();odom.header.stamp=now;odom.pose.pose.orientation.y=math.sin(math.radians(tilt)/2);odom.pose.pose.orientation.w=math.cos(math.radians(tilt)/2)
         odom.twist.twist.linear.x=vx;odom.twist.twist.linear.y=vy;odom.twist.twist.angular.y=rate
         self.n._on_odom(odom)
         if flow:

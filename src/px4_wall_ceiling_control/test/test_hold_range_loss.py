@@ -33,8 +33,10 @@ class HoldRangeLossTest(unittest.TestCase):
         for state in (WallPerchStatus.STATE_WALL_HOLD, WallPerchStatus.STATE_WALL_PIN):
             self.node.state = state
             self.assertTrue(self.node._safety_ok(self.now))
-        for state in (WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE,
-                      WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER):
+        for state in (WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE):
+            self.node.state = state
+            self.assertTrue(self.node._safety_ok(self.now))
+        for state in (WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER):
             self.node.state = state
             self.assertFalse(self.node._safety_ok(self.now))
 

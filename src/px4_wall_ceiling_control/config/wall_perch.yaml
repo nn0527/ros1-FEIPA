@@ -24,7 +24,7 @@ wall_perch_decision_node:
   flip_trigger_hold_s: 0.30
   # WP_TOP_CT_DIST / WP_TOP_CT_HLD
   top_contact_distance_m: 0.056
-  # 顶距连续确认1 s后从WALL_CAPTURE进入WALL_HOLD。
+  # 保留为HOLD后的接触诊断；进入HOLD不再等待连续近距确认。
   top_contact_hold_s: 1.00
   top_clear_distance_m: 0.10
   top_clear_hold_s: 0.50
@@ -38,22 +38,49 @@ wall_perch_decision_node:
   approach_abort_front_distance_m: 1.3
   approach_timeout_s: 20.00
   flip_time_s: 2.00
+  # Independent wall-clock limit: bounded control steps never catch up after stalls.
+  flip_duration_timeout_s: 4.00
+  # Bound target lead over fresh measured attitude; height braking remains active.
+  flip_max_tracking_error_deg: 15.0
+  # 最后10%才接入顶部雷达：2秒翻转从1.8秒起，一帧新鲜有效测距即进入HOLD。
+  flip_top_start_fraction: 0.90
   capture_time_s: 0.50
   # Safety input failures still abort immediately; these are phase limits only.
   capture_timeout_s: 8.00
   # Remain against the wall until the operator stops the wheels and requests detach.
   hold_time_s: 0.00
   hold_entry_blend_s: 0.50
-  # Bench starting gates for operator-triggered detach; tune from geometry/logs.
-  # Detach starts from measured attitude; no original hold-reference angle gate.
+  # Detach admission requires stable measured pose and bounded vertical speed.
+  # The trajectory starts from the last actual published attitude/thrust.
   detach_axis_error_deg: 5.0
   detach_max_rate_rps: 0.436332313  # 25 deg/s
-  detach_max_abs_vertical_speed_mps: 1.00
+  detach_max_abs_vertical_speed_mps: 0.20
   detach_stable_hold_s: 0.50
+  detach_request_timeout_s: 8.00
   # Detach attitude trajectory duration.
   # 90 deg over 3 s (quintic setpoint).
   detach_time_s: 3.00
+  detach_duration_timeout_s: 8.00
+  detach_max_tracking_error_deg: 15.0
+  detach_recovered_tilt_deg: 5.0
+  detach_recovered_rate_deg_s: 10.0
+  detach_recovered_hold_s: 0.30
   recover_time_s: 1.00
+  recover_timeout_s: 15.00
+  # Keep one departure height/base through DETACH, RECOVER and handover.
+  detach_height_kp: 0.50
+  detach_velocity_kp: 0.30
+  detach_velocity_ki: 0.12
+  detach_vertical_integral_limit: 0.06
+  detach_vertical_correction_limit: 0.12
+  detach_support_max_thrust: 0.85
+  return_thrust_slew_per_s: 0.50
+  recovery_horizontal_velocity_ki: 0.30
+  recovery_horizontal_integral_limit_mps2: 0.20
+  departure_retreat_speed_mps: 0.05
+  departure_clearance_distance_m: 0.30
+  departure_clearance_hold_s: 0.30
+  departure_heading_tolerance_deg: 10.0
   # Applied only in RECOVER and ABORT. ENU up is positive.
   recovery_max_up_speed_mps: 0.10
   recovery_max_down_speed_mps: 0.15
@@ -81,7 +108,9 @@ wall_perch_decision_node:
   approach_pitch_deg: 3.0
   # Optional fused-velocity feedback: console launch enables it, legacy launches keep it off.
   horizontal_velocity_enabled: false
-  horizontal_approach_speed_mps: 0.05
+  horizontal_approach_speed_mps: 0.10
+  # Approach retains the actual POSCTL collective at takeover; recovery keeps its own base.
+  approach_use_takeover_thrust: true
   horizontal_velocity_kp: 1.5
   # Approach-only ENU integral; recovery continues to use P control.
   horizontal_velocity_ki: 0.30

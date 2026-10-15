@@ -39,8 +39,12 @@
   <param name="/attachment/front_sensor_masked" value="false" />
   <param name="/flight_mode_manager_node/ceiling_distance_gate_enabled" value="true" />
   <param name="/flight_mode_manager_node/wall_pilot_mode" value="POSCTL" />
+  <param name="/wall_perch_decision_node/flip_vertical_support_enabled" value="true" />
+  <param name="/wall_perch_decision_node/flip_support_fade_start_deg" value="20.0" />
+  <param name="/wall_perch_decision_node/flip_support_fade_end_deg" value="60.0" />
+  <param name="/wall_perch_decision_node/flip_thrust_slew_per_s" value="0.50" />
   <param name="/wall_perch_decision_node/horizontal_velocity_enabled" value="true" />
-  <param name="/wall_perch_decision_node/horizontal_approach_speed_mps" value="0.05" />
+  <param name="/wall_perch_decision_node/horizontal_approach_speed_mps" value="0.10" />
   <param name="/ceiling_attachment_decision_node/console_contact_profile" value="true" />
   <param name="/ceiling_attachment_decision_node/activation_distance_m" value="1.0" />
   <param name="/ceiling_attachment_decision_node/activation_hold_s" value="0.30" />

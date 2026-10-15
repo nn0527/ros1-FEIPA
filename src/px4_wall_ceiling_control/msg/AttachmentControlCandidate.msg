@@ -22,3 +22,19 @@ geometry_msgs/Quaternion attitude_setpoint
 float32 thrust_normalized
 string reason
 
+# WALL control metadata travels atomically with attitude/thrust. Header.stamp
+# is the generation time in the ROS clock. The mux retains it in diagnostics
+# while the MAVROS output header carries the actual transport publication time.
+# Ceiling candidates retain their existing protocol and need not set these.
+bool phase_valid
+uint8 control_phase
+string maneuver_id
+uint64 control_sequence
+bool horizontal_velocity_enabled
+bool horizontal_velocity_active
+bool approach_paused
+
+# Departure support remains continuous through recovery/handover. Limit is
+# bounded by the mux global cap; it is not a request to bypass hard limits.
+bool recovery_support_valid
+float32 recovery_thrust_limit

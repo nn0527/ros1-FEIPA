@@ -213,7 +213,7 @@ class RemoteRuntime:
                       "altitude_reference_valid", "height_above_takeoff_m", "min_entry_height_m", "entry_height_ready",
                       "hold_achieved", "reached_state_name", "detach_ready", "detach_completed", "recovery_completed",
                       "detach_pending", "detach_block_reason", "flip_ready", "front_range_fresh", "top_range_fresh",
-                      "auto_approach_enabled", "approach_paused", "horizontal_velocity_enabled", "horizontal_velocity_ready", "horizontal_velocity_active", "horizontal_velocity_stable", "horizontal_velocity_reason", "horizontal_forward_target_mps", "horizontal_forward_measured_mps", "horizontal_integral_x_enu_mps2", "horizontal_integral_y_enu_mps2", "horizontal_integral_active", "horizontal_integral_reason", "horizontal_control_saturated",  "horizontal_velocity_x_enu_mps", "horizontal_velocity_y_enu_mps", "horizontal_target_x_enu_mps", "horizontal_target_y_enu_mps", "optical_flow_quality", "horizontal_equilibrium_enabled", "horizontal_equilibrium_valid", "horizontal_equilibrium_frozen", "horizontal_equilibrium_reason", "horizontal_prestream_valid")}
+                      "auto_approach_enabled", "approach_paused", "horizontal_velocity_enabled", "approach_takeover_thrust", "approach_base_vertical_thrust", "horizontal_velocity_ready", "horizontal_velocity_active", "horizontal_velocity_stable", "horizontal_velocity_reason", "horizontal_forward_target_mps", "horizontal_forward_measured_mps", "horizontal_integral_x_enu_mps2", "horizontal_integral_y_enu_mps2", "horizontal_integral_active", "horizontal_integral_reason", "horizontal_control_saturated",  "horizontal_velocity_x_enu_mps", "horizontal_velocity_y_enu_mps", "horizontal_target_x_enu_mps", "horizontal_target_y_enu_mps", "optical_flow_quality", "horizontal_equilibrium_enabled", "horizontal_equilibrium_valid", "horizontal_equilibrium_frozen", "horizontal_equilibrium_reason", "horizontal_prestream_valid", "fault_recovery_completed", "recovery_support_valid", "recovery_thrust_limit", "detach_vertical_active", "detach_vertical_reason", "detach_vertical_base_source", "detach_vertical_base_thrust", "detach_vertical_integral", "detach_vertical_integral_active", "detach_vertical_saturated", "detach_vertical_support_weight", "detach_height_error_m", "departure_clearance_ready", "departure_clearance_distance_m", "departure_clearance_reason", "recovery_horizontal_integral_x", "recovery_horizontal_integral_y", "recovery_horizontal_integral_active")}
         elif name in ("front_diagnostic", "ceiling_diagnostic", "kill"):
             value = json.loads(msg.data)
         elif name in ("phase", "reason", "owner"):
@@ -450,13 +450,152 @@ class RemoteRuntime:
             self.state.starting = False
 
     @staticmethod
+    def mavros_process_conflicts():
+        """An unresponsive process may still own a port or publish control output."""
+        control_names = {"attachment_output_mux_node", "flight_mode_manager_node",
+                         "flight_supervisor_node", "setpoint_mux_node", "ceiling_attachment_output_node",
+                         "ceiling_motor_bench_output_node", "wall_motor_bench_output_node"}
+        conflicts = []
+        for item in Path("/proc").glob("[0-9]*/cmdline"):
+            try:
+                args = [a.decode(errors="replace") for a in item.read_bytes().split(b"\0") if a]
+            except OSError:
+                continue
+            names = {Path(a).stem for a in args}
+            launch = (any("roslaunch" in a for a in args) and
+                      (("mavros" in args and "px4.launch" in args) or
+                       "wall_console_mavros.launch" in args or "wall_console_flight.launch" in args))
+            if "mavros_node" in names or names & control_names or launch:
+                conflicts.append(int(item.parent.name))
+        return sorted(conflicts)
+
+    @staticmethod
+    def cleanup_stale_mavros():
+        # Keep ROS XMLRPC and its socket settings out of the feedback process.
+        code = ("import rosnode, rosgraph; "
+                "rosnode.cleanup_master_blacklist(rosgraph.Master('/mavros_connection_repair'), ['/mavros'])")
+        subprocess.run([sys.executable, "-c", code], stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, timeout=5, check=True)
+
+    def repair_mavros(self, config=None):
+        if (config or {}).get("grounded_confirmed") is not True:
+            raise ValueError("请先确认飞机已落地、未解锁且电机停止")
+        with self.state.lock:
+            snapshot = self.state.snapshot()
+            flight = snapshot["status"]["state"].get("value") or {}
+            runtime = snapshot["status"]["runtime"].get("value") or {}
+            phase = snapshot["status"]["phase"]
+            if flight.get("armed"):
+                raise ValueError("飞控解锁或历史解锁状态未确认，不能修复连接")
+            if self.state.starting or getattr(self, "stopping", False):
+                raise ValueError("已有启动或停止操作正在进行")
+            if runtime.get("enabled") or (phase["fresh"] and phase["value"] not in (None, "IDLE", "LOCKED")):
+                raise ValueError("飞行控制链路正在运行，请先落地并停止基础链路")
+            self.stop_requested = False
+            self.state.starting = True
+            self.state.launch_error = ""
+            self.state.mavros_repair = {"state": "RUNNING", "reason": "正在检查 MAVROS、串口占用与失效登记"}
+            self.state.event("MAVROS 连接修复请求已接收")
+        threading.Thread(target=self.repair_mavros_worker, daemon=True).start()
+        return {"message": "连接修复已开始；请等待结果，修复仅启动 MAVROS，不启动飞行控制"}
+
+    def ensure_mavros_repair_state(self):
+        snapshot = self.state.snapshot()
+        if (snapshot["status"]["state"].get("value") or {}).get("armed"):
+            raise ValueError("检测到飞控解锁状态，取消连接修复")
+        runtime = snapshot["status"]["runtime"].get("value") or {}
+        phase = snapshot["status"]["phase"]
+        if runtime.get("enabled") or (phase["fresh"] and phase["value"] not in (None, "IDLE", "LOCKED")):
+            raise ValueError("控制链路已进入运行状态，取消连接修复")
+
+    def repair_mavros_worker(self):
+        try:
+            self.ensure_mavros_repair_state()
+            nodes = self.nodes()
+            if "/mavros" in nodes and self.mavros_alive():
+                item = self.state.snapshot()["status"]["state"]
+                if item["fresh"] and item["value"].get("connected") and not item["value"].get("armed"):
+                    reason = "MAVROS 与飞控已正常连接，无需重复启动"
+                    with self.state.lock:
+                        self.state.mavros_repair = {"state": "SUCCEEDED", "reason": reason}
+                        self.state.event(reason)
+                    return
+                raise ValueError("MAVROS 节点能响应，但飞控心跳无效；请检查飞控供电、接线和波特率")
+            conflicts = self.mavros_process_conflicts()
+            if conflicts:
+                raise ValueError("仍有 MAVROS 或控制进程 PID " + str(conflicts) + "；请先落地后停止基础链路，修复不会强杀进程")
+            port = self.state.config["fcu_port"]
+            if not Path(port).is_char_device():
+                raise ValueError("找不到飞控串口: " + port)
+            owners = self.port_owners(port)
+            if owners:
+                raise ValueError("飞控串口仍被进程占用 PID " + str(owners) + "，不能重复连接")
+            if not nodes:
+                self.spawn("roscore", ["roscore"])
+                deadline = time.monotonic() + 10
+                while not self.nodes():
+                    if time.monotonic() > deadline:
+                        raise ValueError("ROS master 启动超时")
+                    time.sleep(.2)
+            self.init_ros()
+            if "/mavros" in self.nodes():
+                # Check again immediately before removing only this registration.
+                if self.mavros_alive() or self.mavros_process_conflicts() or self.port_owners(port):
+                    raise ValueError("MAVROS 或串口状态已变化，取消修复；请刷新后重试")
+                self.ensure_mavros_repair_state()
+                self.cleanup_stale_mavros()
+                self.state.event("已清理失效的 /mavros 节点登记")
+            if self.stop_requested or self.mavros_process_conflicts() or self.port_owners(port):
+                raise ValueError("启动已取消或出现并发进程，未启动 MAVROS")
+            self.ensure_mavros_repair_state()
+            url = port + ":" + str(self.state.config["baud"])
+            with self.state.lock:
+                self.state.samples.pop("state", None)
+                self.state.mavros_repair = {"state": "RUNNING", "reason": "MAVROS 已重新启动，等待新的飞控心跳"}
+            self.spawn("mavros", ["roslaunch", "px4_wall_ceiling_control", "wall_console_mavros.launch", "fcu_url:=" + url])
+            deadline = time.monotonic() + 25
+            while True:
+                if self.stop_requested:
+                    raise ValueError("修复已取消")
+                child = self.children["mavros"]
+                if child.poll() is not None:
+                    raise ValueError("MAVROS 启动后退出，请检查 MAVROS 日志与串口")
+                item = self.state.snapshot()["status"]["state"]
+                if item["fresh"] and item["value"].get("connected"):
+                    if item["value"].get("armed"):
+                        raise ValueError("检测到飞控已解锁，终止后续修复操作")
+                    break
+                if time.monotonic() > deadline:
+                    raise ValueError("MAVROS 已启动但 25 秒内未收到飞控心跳；请检查供电、接线、串口与波特率")
+                time.sleep(.2)
+            self.require_mavros_task_isolation()
+            reason = "连接修复成功：已收到新的飞控心跳，可重新点击一键配置并启动"
+            with self.state.lock:
+                self.state.mavros_repair = {"state": "SUCCEEDED", "reason": reason}
+                self.state.launch_error = ""
+                self.state.event(reason)
+        except Exception as error:
+            reason = str(error)
+            with self.state.lock:
+                self.state.mavros_repair = {"state": "FAILED", "reason": reason}
+                self.state.launch_error = reason
+                self.state.event("MAVROS 连接修复失败：" + reason, "error")
+        finally:
+            with self.state.lock:
+                self.state.starting = False
+
+
+    @staticmethod
     def mavros_alive():
         """A ROS master registration can outlive the actual serial reader."""
         try:
-            result = subprocess.run(["rosnode", "ping", "-c", "1", "/mavros"],
+            # rosnode CLI exits 0 even when ping returns False. Convert its
+            # boolean result to an explicit process exit status instead.
+            code = "import rosnode, sys; sys.exit(0 if rosnode.rosnode_ping('/mavros', max_count=1, verbose=False, skip_cache=True) else 1)"
+            result = subprocess.run([sys.executable, "-c", code],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=4)
             return result.returncode == 0
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, OSError):
             return False
 
     def fcu_url_matches(self, expected):

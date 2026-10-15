@@ -2,14 +2,15 @@
 """ROS/MAVROS decision port of the reference PX4 wall_perch state machine."""
 
 import math
+import uuid
 from statistics import median
 
 import rospy
 from geometry_msgs.msg import Quaternion
-from mavros_msgs.msg import State
+from mavros_msgs.msg import State, AttitudeTarget
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Range
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, String, UInt8
 
 from px4_wall_ceiling_control.adapters.odometry import vertical_speed_enu_mps
 from px4_wall_ceiling_control.adapters.takeoff_height import TakeoffHeightReference
@@ -26,7 +27,9 @@ from px4_wall_ceiling_control.domain.geometry import (
     smoothstep5,
 )
 from px4_wall_ceiling_control.domain.sample_hold import held_samples, record_hold_sample
-from px4_wall_ceiling_control.freshness import clamp, is_valid_range, is_fresh_receipt as is_fresh
+from px4_wall_ceiling_control.freshness import (
+    clamp, is_valid_range, is_fresh_receipt as is_fresh, is_fresh_source,
+)
 from px4_wall_ceiling_control.msg import (
     AttachmentControlCandidate,
     OperatorCommand,
@@ -36,9 +39,10 @@ from px4_wall_ceiling_control.msg import (
 
 
 from px4_wall_ceiling_control.adapters.wall_horizontal_velocity import WallHorizontalVelocityMixin
+from px4_wall_ceiling_control.adapters.wall_detach_vertical import WallDetachVerticalMixin
 
 
-class WallPerchDecisionNode(WallHorizontalVelocityMixin):
+class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin):
     STATE_NAMES = {
         WallPerchStatus.STATE_IDLE: "IDLE",
         WallPerchStatus.STATE_FRONT_WALL_DETECT: "FRONT_WALL_DETECT",
@@ -56,6 +60,9 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
 
     def __init__(self):
         install_kill_guard(self, rospy, String)
+        self.maneuver_id = uuid.uuid4().hex
+        self.control_sequence = 0
+        self.odom_source_stamp = None
         self.manual_approach = bool(rospy.get_param("~manual_approach", False))
         self.manager_phase = None
         self.manager_phase_received_at = None
@@ -64,6 +71,14 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         if self.manual_approach and self.auto_approach:
             raise ValueError("manual and automatic approach cannot both be enabled")
         self.flip_thrust_follow_tilt = bool(rospy.get_param("~flip_thrust_follow_tilt", False))
+        self.flip_vertical_support_enabled = bool(rospy.get_param("~flip_vertical_support_enabled", False) and self.auto_approach)
+        self.flip_support_fade_start_rad = math.radians(float(rospy.get_param("~flip_support_fade_start_deg", 20.0)))
+        self.flip_support_fade_end_rad = math.radians(float(rospy.get_param("~flip_support_fade_end_deg", 60.0)))
+        self.flip_thrust_slew_per_s = float(rospy.get_param("~flip_thrust_slew_per_s", .50))
+        if not (0 <= self.flip_support_fade_start_rad < self.flip_support_fade_end_rad < math.pi/2
+                and math.isfinite(self.flip_thrust_slew_per_s) and 0 < self.flip_thrust_slew_per_s <= 1.):
+            raise ValueError("invalid early flip vertical support limits")
+        self._reset_flip_vertical_support()
         self.decision_enabled = bool(rospy.get_param("~decision_enabled", False))
         self.front_ready_distance_m = float(
             rospy.get_param("~front_ready_distance_m", 0.50)
@@ -104,6 +119,31 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             rospy.get_param("~approach_timeout_s", 3.0)
         )
         self.flip_time_s = max(0.01, float(rospy.get_param("~flip_time_s", 1.0)))
+        # A stalled callback must not catch up the attitude trajectory in one
+        # command. The hard deadline remains wall-clock based and independent.
+        self.flip_duration_timeout_s = float(rospy.get_param(
+            "~flip_duration_timeout_s", max(4.0, 2.0 * self.flip_time_s)))
+        if (not math.isfinite(self.flip_duration_timeout_s)
+                or self.flip_duration_timeout_s <= self.flip_time_s):
+            raise ValueError("flip_duration_timeout_s must exceed flip_time_s")
+        self.flip_max_tracking_error_rad = math.radians(float(rospy.get_param(
+            "~flip_max_tracking_error_deg", 15.0)))
+        if (not math.isfinite(self.flip_max_tracking_error_rad)
+                or not 0.0 < self.flip_max_tracking_error_rad <= math.pi / 2.):
+            raise ValueError("flip_max_tracking_error_deg must be in (0, 90]")
+        self.flip_tracking_limited = False
+        self.flip_elapsed_s = 0.0
+        self.flip_step_at = None
+        self.flip_step_dt = 0.0
+        self.flip_clock_reversed = False
+        self.flip_thrust_evaluated_at = None
+        self.q_flip_start = None
+        # Top input cannot authorize HOLD before the final 10% of the flip.
+        self.flip_top_start_fraction = clamp(
+            float(rospy.get_param("~flip_top_start_fraction", 0.90)), 0.0, 1.0
+        )
+        self.top_hold_accept_after = None
+        self.top_hold_frame_at = None
         self.capture_time_s = max(
             0.01, float(rospy.get_param("~capture_time_s", 0.20))
         )
@@ -122,7 +162,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             rospy.get_param("~detach_max_rate_rps", math.radians(25.0))
         )
         self.detach_max_abs_vertical_speed_mps = float(
-            rospy.get_param("~detach_max_abs_vertical_speed_mps", 1.00)
+            rospy.get_param("~detach_max_abs_vertical_speed_mps", 0.20)
         )
         self.detach_stable_hold_s = float(
             rospy.get_param("~detach_stable_hold_s", 0.50)
@@ -130,7 +170,30 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         self.detach_time_s = max(
             0.01, float(rospy.get_param("~detach_time_s", 1.0))
         )
+        self.detach_request_timeout_s = float(rospy.get_param("~detach_request_timeout_s", 8.0))
+        self.detach_duration_timeout_s = float(rospy.get_param("~detach_duration_timeout_s", 8.0))
+        self.detach_max_tracking_error_rad = math.radians(float(rospy.get_param("~detach_max_tracking_error_deg", 15.0)))
+        self.detach_recovered_tilt_rad = math.radians(float(rospy.get_param("~detach_recovered_tilt_deg", 5.0)))
+        self.detach_recovered_rate_rps = math.radians(float(rospy.get_param("~detach_recovered_rate_deg_s", 10.0)))
+        self.detach_recovered_hold_s = float(rospy.get_param("~detach_recovered_hold_s", .30))
+        self.recover_timeout_s = float(rospy.get_param("~recover_timeout_s", 15.0))
+        if (not all(math.isfinite(v) and v > 0. for v in (
+                self.detach_request_timeout_s, self.detach_duration_timeout_s,
+                self.detach_max_tracking_error_rad, self.detach_recovered_tilt_rad,
+                self.detach_recovered_rate_rps, self.detach_recovered_hold_s,
+                self.recover_timeout_s))
+                or self.detach_duration_timeout_s <= self.detach_time_s
+                or self.detach_max_tracking_error_rad > math.pi/2.
+                or self.detach_recovered_tilt_rad > math.radians(5.)):
+            raise ValueError("invalid detach duration or recovery confirmation limits")
+        self.detach_elapsed_s = self.detach_step_dt = 0.
+        self.detach_step_at = None
+        self.detach_clock_reversed = self.detach_tracking_limited = False
+        self.detach_recovered_since = self.detach_recovered_last_stamp = None
+        self.detach_recovered_samples = 0
         self.recover_time_s = float(rospy.get_param("~recover_time_s", 0.50))
+        if not math.isfinite(self.recover_time_s) or not 0. <= self.recover_time_s < self.recover_timeout_s:
+            raise ValueError("recover_time_s must be below recover_timeout_s")
         # Approach/recovery vertical velocity loop; all thrust values are normalized.
         self.recovery_max_up_speed_mps = float(rospy.get_param("~recovery_max_up_speed_mps", 0.10))
         self.recovery_max_down_speed_mps = float(rospy.get_param("~recovery_max_down_speed_mps", 0.15))
@@ -230,6 +293,9 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         self.max_down_velocity_mps = float(
             rospy.get_param("~max_down_velocity_mps", 0.80)
         )
+        if (not math.isfinite(self.detach_max_abs_vertical_speed_mps)
+                or not 0. < self.detach_max_abs_vertical_speed_mps <= self.max_down_velocity_mps):
+            raise ValueError("detach admission speed must be positive and no greater than descent protection")
         self.min_altitude_m = float(rospy.get_param("~min_altitude_m", 0.30))
         self.altitude_reference = rospy.get_param("~altitude_reference", "arming_ground")
         self.bench_wait_for_ranges = bool(rospy.get_param("~bench_wait_for_ranges", False))
@@ -302,11 +368,13 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         self.state_entered_at = rospy.Time.now()
         self.front_range = None
         self.front_received_at = None
+        self.front_source_stamp = None
         self.approach_abort_front_distance_m = float(rospy.get_param("~approach_abort_front_distance_m", 1.3))
         self.approach_far_sample = None
         self.front_filtered_m = None
         self.top_range = None
         self.top_received_at = None
+        self.top_source_stamp = None
         self.top_filtered_m = None
         self.sensor_health = None
         self.sensor_health_received_at = None
@@ -334,6 +402,9 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         self.q_detach_start = self.q_contact
         self.detach_altitude_m = None  # Rotation-only legacy reference.
         self.approach_altitude_m = None
+        self.approach_takeover_source = None
+        self.approach_takeover_thrust = None
+        self.approach_base_vertical_thrust = None
         self.recovery_altitude_m = None
         self.recovery_wait_for_level = False
         self.vertical_reference_source = "none"
@@ -342,7 +413,9 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         self.hold_achieved = False
         self.reached_state = WallPerchStatus.STATE_IDLE
         self.detach_completed = False
+        self.fault_recovery_completed = False
         self.detach_stable_since = None
+        self.detach_stable_last_stamp = None
         self.detach_stable_samples = 0
         self.wall_pressure_thrust_command = self._wall_pressure_start_thrust()
         self.previous_update_at = None
@@ -412,6 +485,19 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             queue_size=10,
         )
         self._init_horizontal_velocity()
+        self._init_detach_vertical()
+        if not self.horizontal_velocity_enabled:
+            # Flip and detach continuity need final output feedback even when
+            # horizontal velocity control is disabled in a launch profile.
+            rospy.Subscriber('/attachment/output_owner', UInt8,
+                             self._on_horizontal_output_owner, queue_size=10)
+            rospy.Subscriber('/mavros/setpoint_raw/attitude', AttitudeTarget,
+                             self._on_horizontal_output, queue_size=10)
+        self.approach_use_takeover_thrust = bool(
+            rospy.get_param("~approach_use_takeover_thrust", True)
+            and self.auto_approach and self.horizontal_velocity_enabled)
+        self.approach_source_timeout_s = float(rospy.get_param(
+            "/attachment_output_mux_node/fcu_target_timeout_s", .35))
         publish_rate_hz = float(rospy.get_param("~publish_rate_hz", 50.0))
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / max(publish_rate_hz, 2.0)), self._on_timer
@@ -447,7 +533,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             return min(target, value + step)
         return max(target, value - step)
 
-    def _wall_pressure_thrust(self):
+    def _wall_pressure_thrust(self, now=None):
         """Adjust wall pressure from the top lidar after the vehicle rotates."""
         start = self._wall_pressure_start_thrust()
         nominal = self._wall_pressure_nominal_thrust()
@@ -461,7 +547,10 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             upper,
         )
         top_distance = getattr(self, "top_filtered_m", None)
-        if top_distance is None:
+        now = rospy.Time.now() if now is None else now
+        if top_distance is None or not self._top_fresh(now):
+            # A brief measurement outage holds the last bounded pressure;
+            # cached distance never drives another increase or decrease.
             return thrust
 
         error = top_distance - getattr(
@@ -489,6 +578,15 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         self.wall_pressure_thrust_command = thrust
         return thrust
 
+    def _accept_range_source(self, direction, message, now):
+        stamp = message.header.stamp
+        previous = getattr(self, direction + "_source_stamp", None)
+        if (not is_fresh_source(stamp, self.sensor_timeout_s, now, future_tolerance_s=0.)
+                or (previous is not None and stamp <= previous)):
+            return False
+        setattr(self, direction + "_source_stamp", stamp)
+        return True
+
     def _on_front_range(self, message):
         if not is_valid_range(message):
             if getattr(self, "auto_approach", False) and self._approach_stage():
@@ -496,11 +594,16 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
                 self.flip_ready_since = self.flip_ready_last_sample_at = None
             return
         now = rospy.Time.now()
+        if not self._accept_range_source("front", message, now):
+            return
         previous = (
             None
-            if not is_fresh(self.front_received_at, self.sensor_timeout_s, now)
+            if not self._front_fresh(now)
             else self.front_filtered_m
         )
+        if previous is None:
+            self.front_ready_since = self.front_ready_last_sample_at = None
+            self.flip_ready_since = self.flip_ready_last_sample_at = None
         if self._approach_stage() and self._mode_requested(now) and message.range > getattr(self, "approach_abort_front_distance_m", 1.3):
             self.approach_far_sample = (now, float(message.range))
         self.front_range = message
@@ -512,7 +615,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         ) = self._record_hold_sample(
             self.front_filtered_m <= self.front_ready_distance_m
             and (not getattr(self, "auto_approach", False) or not self._approach_stage() or self._auto_approach_ranges_ready(now)),
-            now,
+            message.header.stamp,
             self.front_ready_since,
         )
         (
@@ -521,15 +624,16 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         ) = self._record_hold_sample(
             self.front_filtered_m <= self.flip_trigger_distance_m
             and (not getattr(self, "auto_approach", False) or not self._approach_stage() or self._auto_approach_ranges_ready(now)),
-            now,
+            message.header.stamp,
             self.flip_ready_since,
         )
 
     def _on_top_range(self, message):
+        now = rospy.Time.now()
+        if self.state == WallPerchStatus.STATE_FLIP_TO_WALL and not self._late_top_window_open(now):
+            return  # The early flip does not consume top measurements.
         if not is_valid_range(message):
-            if getattr(self, "auto_approach", False) and self._approach_stage():
-                self.front_ready_since = self.front_ready_last_sample_at = None
-                self.flip_ready_since = self.flip_ready_last_sample_at = None
+            # Top failures must never reset the forward-only flip gate.
             # A bad sample must not count toward continuous contact confirmation.
             # Keep the last valid range and its original timestamp for the
             # bounded bench safety grace; never refresh them with invalid data.
@@ -539,13 +643,20 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             self.top_capture_near_samples = 0
             return
         now = rospy.Time.now()
+        if not self._accept_range_source("top", message, now):
+            return
         previous = (
             None
-            if not is_fresh(self.top_received_at, self.sensor_timeout_s, now)
+            if not self._top_fresh(now)
             else self.top_filtered_m
         )
         self.top_range = message
         self.top_received_at = now
+        if self.state in (WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE):
+            after = getattr(self, "top_hold_accept_after", None)
+            stamp = message.header.stamp
+            if after is not None and stamp >= after:
+                self.top_hold_frame_at = stamp
         if previous is None:
             self.top_capture_samples = []
             self.top_capture_near_samples = 0
@@ -576,7 +687,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             self.top_contact_last_sample_at,
         ) = self._record_hold_sample(
             contact,
-            now,
+            message.header.stamp,
             self.top_contact_since,
         )
         (
@@ -584,20 +695,29 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             self.top_clear_last_sample_at,
         ) = self._record_hold_sample(
             self.top_filtered_m >= self.top_clear_distance_m,
-            now,
+            message.header.stamp,
             self.top_clear_since,
         )
 
     def _on_sensor_health(self, message):
         self.sensor_health = message
         self.sensor_health_received_at = rospy.Time.now()
-        if getattr(self, "auto_approach", False) and self._approach_stage() and not (message.front_valid and message.ceiling_valid):
+        if getattr(self, "auto_approach", False) and self._approach_stage() and not message.front_valid:
             self.front_ready_since = self.front_ready_last_sample_at = None
             self.flip_ready_since = self.flip_ready_last_sample_at = None
 
     def _on_odom(self, message):
-        self.odom = message
         now = rospy.Time.now()
+        stamp = message.header.stamp
+        previous = getattr(self, "odom_source_stamp", None)
+        if (not is_fresh_source(stamp, self.odom_timeout_s, now)
+                or (previous is not None and stamp <= previous)):
+            # Receiving a replay does not refresh feedback or stability evidence.
+            return
+        gap = (not is_fresh(getattr(self, "odom_received_at", None), self.odom_timeout_s, now)
+               or (previous is not None and (stamp - previous).to_sec() > self.odom_timeout_s))
+        self.odom = message
+        self.odom_source_stamp = stamp
         self.odom_received_at = now
         if hasattr(self, "takeoff_height"):
             flight = self.flight_state
@@ -606,23 +726,69 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             self.takeoff_height.observe_odom(message.pose.pose.position.z, now.to_sec(), confirmed)
         if self.state == WallPerchStatus.STATE_WALL_HOLD:
             if self._detach_pose_valid():
-                if self.detach_stable_since is None:
-                    self.detach_stable_since = now
+                if self.detach_stable_since is None or gap:
+                    self.detach_stable_since = stamp
+                    self.detach_stable_samples = 0
+                self.detach_stable_last_stamp = stamp
                 self.detach_stable_samples += 1
             else:
                 self.detach_stable_since = None
+                self.detach_stable_last_stamp = None
                 self.detach_stable_samples = 0
+        if self.state == WallPerchStatus.STATE_DETACH_ROTATE and not getattr(self, "bench_wait_for_ranges", False):
+            if self._detach_rotation_pose_valid():
+                if getattr(self, "detach_recovered_since", None) is None or gap:
+                    self.detach_recovered_since = stamp
+                    self.detach_recovered_samples = 0
+                self.detach_recovered_last_stamp = stamp
+                self.detach_recovered_samples += 1
+            else:
+                self.detach_recovered_since = self.detach_recovered_last_stamp = None
+                self.detach_recovered_samples = 0
+
+    def _capture_approach_takeover_thrust(self, now):
+        # Snapshot only the last POSCTL feedback. OFFBOARD echoes are never learned.
+        self.approach_takeover_thrust = self.approach_base_vertical_thrust = None
+        sample = getattr(self, "approach_takeover_source", None)
+        if sample is None or not self._odom_fresh(now):
+            return
+        target, received_at = sample
+        if (not is_fresh(received_at, self.approach_source_timeout_s, now)
+                or not is_fresh_source(target.header.stamp, self.approach_source_timeout_s, now)
+                or target.type_mask & AttitudeTarget.IGNORE_THRUST
+                or not math.isfinite(target.thrust) or not .1 <= target.thrust <= 1.):
+            return
+        attitude = self._current_quaternion()
+        if attitude is None:
+            return
+        vertical_fraction = rotate_vector(attitude, (0., 0., 1.))[2]
+        if not math.isfinite(vertical_fraction) or vertical_fraction <= 0:
+            return
+        self.approach_takeover_thrust = float(target.thrust)
+        self.approach_base_vertical_thrust = target.thrust * vertical_fraction
+        rospy.loginfo("wall approach: captured takeover thrust %.3f, vertical support %.3f",
+                      self.approach_takeover_thrust, self.approach_base_vertical_thrust)
 
     def _on_state(self, message):
         previous_mode = getattr(getattr(self, "flight_state", None), "mode", "")
         self.flight_state = message
         self.flight_state_received_at = rospy.Time.now()
         if message.connected and message.armed and message.mode == "OFFBOARD" and previous_mode != "OFFBOARD":
+            if getattr(self, "approach_use_takeover_thrust", False) and previous_mode.upper() == "POSCTL":
+                self._capture_approach_takeover_thrust(self.flight_state_received_at)
             if self._odom_fresh(self.flight_state_received_at):
                 feedback = self._height_feedback()
                 if feedback is not None:
                     self.approach_altitude_m = feedback[0]
                     rospy.loginfo("wall vertical: takeover height %.3f m", feedback[0])
+        if (not message.connected or not message.armed
+                or (previous_mode.upper() == "OFFBOARD" and message.mode.upper() != "OFFBOARD")):
+            if hasattr(self, "_reset_recovery_horizontal"):
+                self._reset_recovery_horizontal("退出本次OFFBOARD：取消退墙动作", clear_departure=True)
+        if not message.armed:
+            self._reset_flip_vertical_support()
+            self._reset_detach_vertical()
+            self.approach_takeover_thrust = self.approach_base_vertical_thrust = None
         if hasattr(self, "takeoff_height"):
             self.takeoff_height.observe_state(message.connected, message.armed,
                                               self.flight_state_received_at.to_sec())
@@ -645,7 +811,8 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         self.operator_received_at = rospy.Time.now()
 
     def _on_detach(self, message):
-        if message.data and self.state == WallPerchStatus.STATE_WALL_HOLD:
+        if (message.data and self.state == WallPerchStatus.STATE_WALL_HOLD
+                and not self.detach_requested):
             self.detach_requested = True
             self.detach_requested_at = rospy.Time.now()
 
@@ -711,7 +878,8 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         return bool(
             math.isfinite(velocity_z)
             and (getattr(self, "bench_wait_for_ranges", False) or
-                 abs(velocity_z) <= self.detach_max_abs_vertical_speed_mps)
+                 abs(velocity_z) <= min(self.detach_max_abs_vertical_speed_mps,
+                                       self.max_down_velocity_mps))
         )
 
     def _detach_pose_ready(self, now):
@@ -720,7 +888,8 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             and self._state_age(now) >= self.hold_entry_blend_s
             and self.detach_stable_since is not None
             and self.detach_stable_samples >= 2
-            and (now - self.detach_stable_since).to_sec() >= self.detach_stable_hold_s
+            and getattr(self, "detach_stable_last_stamp", None) is not None
+            and (self.detach_stable_last_stamp - self.detach_stable_since).to_sec() >= self.detach_stable_hold_s
             and self._detach_pose_valid()
         )
 
@@ -757,12 +926,16 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
     def _front_fresh(self, now):
         return bool(
             is_fresh(self.front_received_at, self.sensor_timeout_s, now)
+            and getattr(self, "front_range", None) is not None
+            and is_fresh_source(self.front_range.header.stamp, self.sensor_timeout_s, now, future_tolerance_s=0.)
             and self.front_filtered_m is not None
         )
 
     def _top_fresh(self, now):
         return bool(
             is_fresh(self.top_received_at, self.sensor_timeout_s, now)
+            and getattr(self, "top_range", None) is not None
+            and is_fresh_source(self.top_range.header.stamp, self.sensor_timeout_s, now, future_tolerance_s=0.)
             and self.top_filtered_m is not None
         )
 
@@ -816,6 +989,10 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         )
 
     def _top_preflight_ready(self, now):
+        if self._approach_stage() or self.state in (
+            WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE,
+        ):
+            return True  # Top input is not an entry/flip safety prerequisite.
         if self._ignore_hold_range_loss() or self._ignore_attachment_range_loss():
             return True
         if getattr(self, "bench_wait_for_ranges", False) and self.state in (
@@ -842,6 +1019,8 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
     def _odom_fresh(self, now):
         return bool(
             is_fresh(self.odom_received_at, self.odom_timeout_s, now)
+            and getattr(self, "odom", None) is not None
+            and is_fresh_source(self.odom.header.stamp, self.odom_timeout_s, now)
             and self._current_quaternion() is not None
         )
 
@@ -859,6 +1038,10 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         return True
 
     def _top_required(self):
+        if self._approach_stage() or self.state in (
+            WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE,
+        ):
+            return False  # Wait for a late valid frame; absence is not an immediate abort.
         if self._ignore_hold_range_loss() or self._ignore_attachment_range_loss():
             return False
         if getattr(self, "bench_wait_for_ranges", False) and self.state in (
@@ -938,11 +1121,17 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         return bool(getattr(self, "ignore_range_loss_during_attachment", False)
                     or self._auto_approach_ranges_ready(now))
 
+    def _front_flip_input_ready(self, now):
+        # Only real, fresh forward input authorizes the flip. Top health is unrelated.
+        return bool(self._sensor_health_fresh(now) and self.sensor_health.front_valid
+                    and self._front_fresh(now))
+
     def _auto_approach_ranges_ready(self, now):
-        # Strict measured-input gate; no error-code grace or retained valid bit.
-        return self._bench_ranges_ready(now)
+        return self._front_flip_input_ready(now)
 
     def _bench_ranges_ready(self, now):
+        if self._approach_stage():
+            return self._front_flip_input_ready(now)
         return bool(self._sensor_health_fresh(now) and self.sensor_health.front_valid
                     and self.sensor_health.ceiling_valid and self._front_fresh(now)
                     and self._top_fresh(now))
@@ -998,7 +1187,9 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         return clamp(vertical_demand / max(vertical_fraction, 1.0e-3), 0.1, self.max_thrust)
 
     def _prepare_vertical_reference(self, now):
-        """Latch exactly once from fresh measured attitude/height, never from a target."""
+        """Legacy recovery reference; normal detach retains its departure height."""
+        if getattr(self, "detach_vertical_active", False):
+            return
         if not getattr(self, "recovery_wait_for_level", False) or not self._odom_fresh(now):
             return
         feedback, attitude = self._height_feedback(), self._current_quaternion()
@@ -1011,7 +1202,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             self.vertical_reference_source = "first_level_5deg"
             rospy.loginfo("wall vertical: first actual level height %.3f m", feedback[0])
 
-    def _vertical_height_thrust(self, reference):
+    def _vertical_height_thrust(self, reference, base_override=None):
         """Height -> bounded ENU vz -> collective, including descent braking."""
         feedback = self._height_feedback()
         attitude = self._current_quaternion()
@@ -1026,7 +1217,17 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         correction = min(self.recovery_positive_compensation_max,
                          self.recovery_velocity_kp * (target_speed - speed))
         self.vertical_target_speed, self.vertical_correction = target_speed, correction
-        vertical_demand = max(0.0, self.hover_thrust + correction)
+        base_thrust = self.hover_thrust
+        if (getattr(self, "approach_use_takeover_thrust", False)
+                and self.state == WallPerchStatus.STATE_SLOW_APPROACH):
+            base_thrust = getattr(self, "approach_base_vertical_thrust", None)
+            if base_thrust is None:
+                return math.nan  # Do not substitute the old fixed hover value.
+        if base_override is not None:
+            base_thrust = base_override
+        if not math.isfinite(base_thrust):
+            return math.nan
+        vertical_demand = max(0.0, base_thrust + correction)
         vertical_fraction = max(0.0, rotate_vector(attitude, (0., 0., 1.))[2])
         return clamp(vertical_demand / max(vertical_fraction, 1.e-3),
                      0.1, min(self.max_thrust, self.recovery_max_thrust))
@@ -1116,6 +1317,74 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             self.flip_trigger_hold_s,
         )
 
+    def _advance_flip_progress(self, now):
+        """One capped elapsed-time budget for attitude and thrust per control tick.
+
+        Discard excess time after a callback stall. Sensor callbacks only read
+        this clock; they cannot accelerate the commanded trajectory.
+        """
+        previous = getattr(self, "flip_step_at", None)
+        if previous is None:
+            self.flip_step_at = now
+            self.flip_step_dt = 0.0
+            self.flip_elapsed_s = 0.0
+            return
+        if now == previous:
+            return
+        delta = (now - previous).to_sec()
+        if delta < 0.0:
+            self.flip_clock_reversed = True
+            self.flip_step_dt = 0.0
+            return
+        self.flip_step_dt = min(delta, .05)
+        self.flip_step_at = now
+        elapsed = getattr(self, "flip_elapsed_s", 0.0)
+        proposed = min(self.flip_time_s, elapsed + self.flip_step_dt)
+        measured = self._current_quaternion() if self._odom_fresh(now) else None
+        limit = getattr(self, "flip_max_tracking_error_rad", math.radians(15.))
+        def error(seconds):
+            target = self._quat_slerp(self.q_flip_start, self.q_wall,
+                self._smoothstep5(seconds / self.flip_time_s))
+            return quaternion_angle(target, measured)
+        current_error = error(elapsed) if measured is not None else math.inf
+        next_error = error(proposed) if measured is not None else math.inf
+        if measured is None or (current_error > limit and next_error >= current_error):
+            proposed = elapsed
+        elif current_error <= limit and next_error > limit:
+            # Bound only target lead. Vertical thrust still spends the whole
+            # capped elapsed-time budget so tracking lag cannot freeze braking.
+            low, high = elapsed, proposed
+            for _ in range(20):
+                middle = .5 * (low + high)
+                if error(middle) <= limit:
+                    low = middle
+                else:
+                    high = middle
+            proposed = low
+        self.flip_tracking_limited = proposed + 1.e-9 < min(self.flip_time_s, elapsed + self.flip_step_dt)
+        self.flip_elapsed_s = proposed
+        if (self._flip_progress() >= getattr(self, "flip_top_start_fraction", .90)
+                and getattr(self, "top_hold_accept_after", None) is None):
+            # The qualifying source frame must be generated after the actual
+            # window opening, not after the old start+nominal-time estimate.
+            self.top_hold_accept_after = now
+            self.top_hold_frame_at = None
+
+    def _flip_progress(self):
+        return clamp(getattr(self, "flip_elapsed_s", 0.0) / self.flip_time_s, 0.0, 1.0)
+
+    def _late_top_window_open(self, now):
+        after = getattr(self, "top_hold_accept_after", None)
+        return bool(after is not None and now >= after
+                    and (self.state != WallPerchStatus.STATE_FLIP_TO_WALL
+                         or self._flip_progress() >= getattr(self, "flip_top_start_fraction", .90)))
+
+    def _late_top_frame_ready(self, now):
+        frame_at = getattr(self, "top_hold_frame_at", None)
+        return bool(self._late_top_window_open(now) and frame_at is not None
+                    and is_fresh(frame_at, self.sensor_timeout_s, now)
+                    and self._top_fresh(now))
+
     def _top_contact_ready(self, now):
         fresh = self._top_fresh(now)
         if not fresh:
@@ -1170,15 +1439,39 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             self.last_reason = reason
             return
         if (
-            new_state == WallPerchStatus.STATE_WALL_CAPTURE
+            new_state in (WallPerchStatus.STATE_WALL_CAPTURE, WallPerchStatus.STATE_WALL_HOLD)
             and self.state == WallPerchStatus.STATE_FLIP_TO_WALL
         ):
             # Contact can arrive before the flip timer ends. Preserve the
             # current commanded attitude instead of jumping to q_wall.
-            progress = clamp(self._state_age(now) / self.flip_time_s, 0.0, 1.0)
+            progress = self._flip_progress()
             self.q_contact = self._quat_slerp(
-                self.q_hover, self.q_wall, self._smoothstep5(progress)
+                self.q_flip_start, self.q_wall, self._smoothstep5(progress)
             )
+        if new_state == WallPerchStatus.STATE_FLIP_TO_WALL:
+            self.q_flip_start = self._flip_entry_quaternion(now)
+            if self.q_flip_start is None:
+                self.fault_count += 1
+                self._enter_state(WallPerchStatus.STATE_ABORT, now, "flip attitude source missing or stale")
+                return
+        if new_state == WallPerchStatus.STATE_FLIP_TO_WALL and getattr(self, "flip_vertical_support_enabled", False):
+            if not self._prepare_flip_vertical_support(now):
+                self.fault_count += 1
+                self._enter_state(WallPerchStatus.STATE_ABORT, now, "flip vertical support source missing or stale")
+                return
+        if new_state == WallPerchStatus.STATE_DETACH_ROTATE and not getattr(self, "bench_wait_for_ranges", False):
+            output = self._valid_wall_output(now)
+            if output is None or not self._begin_detach_vertical(now, output):
+                self.last_reason = "离墙等待：" + (getattr(self, "detach_vertical_reason", "")
+                    if output is not None else "最终姿态／推力输出无效或过期")
+                return
+            q = output.orientation
+            self.q_detach_start = self._quat_normalize((q.x, q.y, q.z, q.w))
+        if new_state in (WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_FRONT_WALL_DETECT):
+            self._reset_flip_vertical_support()
+            self._reset_detach_vertical()
+            if hasattr(self, "_reset_recovery_horizontal"):
+                self._reset_recovery_horizontal("新动作／释放：清零恢复控制", clear_departure=True)
         rospy.loginfo(
             "wall perch: %s -> %s (%s)",
             self.STATE_NAMES[self.state],
@@ -1186,8 +1479,11 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             reason,
         )
         if new_state == WallPerchStatus.STATE_FRONT_WALL_DETECT:
+            self.maneuver_id = uuid.uuid4().hex
+            self.control_sequence = 0
             self.hold_achieved = False
             self.detach_completed = False
+            self.fault_recovery_completed = False
             self.reached_state = new_state
         elif new_state not in (WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT):
             self.reached_state = max(getattr(self, "reached_state", 0), new_state)
@@ -1196,10 +1492,11 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         if new_state == WallPerchStatus.STATE_EXIT and self.state == WallPerchStatus.STATE_RECOVER:
             self.detach_completed = True
             self.reached_state = new_state
-        if new_state == WallPerchStatus.STATE_EXIT and self.state in (
-            WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT,
-        ):
+        if new_state == WallPerchStatus.STATE_EXIT and self.state == WallPerchStatus.STATE_RECOVER:
             self.recovery_completed = True
+        elif new_state == WallPerchStatus.STATE_EXIT and self.state == WallPerchStatus.STATE_ABORT:
+            self.recovery_completed = False
+            self.fault_recovery_completed = True
         old_state = self.state
         self.state = new_state
         if getattr(self,"horizontal_velocity_enabled",False):
@@ -1208,6 +1505,17 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             self._reset_horizontal_gate("阶段切换：重置水平控制历史")
         self.state_entered_at = now
         self.last_reason = reason
+        if new_state == WallPerchStatus.STATE_FLIP_TO_WALL:
+            self.flip_elapsed_s = self.flip_step_dt = 0.0
+            self.flip_step_at = now
+            self.flip_clock_reversed = False
+            self.flip_tracking_limited = False
+            self.flip_thrust_evaluated_at = None
+            self.top_hold_accept_after = now if getattr(self, "flip_top_start_fraction", .90) == 0. else None
+            self.top_hold_frame_at = None
+        elif new_state not in (WallPerchStatus.STATE_WALL_CAPTURE, WallPerchStatus.STATE_WALL_HOLD):
+            self.top_hold_accept_after = None
+            self.top_hold_frame_at = None
         if new_state in (WallPerchStatus.STATE_FLIP_TO_WALL,
                          WallPerchStatus.STATE_WALL_CAPTURE):
             self.top_capture_samples = []
@@ -1260,22 +1568,33 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             )
             self.detach_requested = False
             self.detach_stable_since = None
+            self.detach_stable_last_stamp = None
             self.detach_stable_samples = 0
         elif new_state == WallPerchStatus.STATE_RECOVER:
             self.top_clear_since = None
             self.top_clear_last_sample_at = None
         elif new_state == WallPerchStatus.STATE_DETACH_ROTATE:
-            self.recovery_altitude_m = None
-            self.recovery_wait_for_level = True
-            self.vertical_reference_source = "waiting_first_level_5deg"
-            self.q_detach_start = self._current_quaternion() or self.q_contact
-            feedback = self._height_feedback()
-            self.detach_altitude_m = feedback[0] if feedback is not None else None
             self.detach_requested = False
             if getattr(self, "bench_wait_for_ranges", False):
-                self.bench_detach_thrust_value = self._wall_pressure_thrust()
+                self.recovery_altitude_m = None
+                self.recovery_wait_for_level = True
+                self.vertical_reference_source = "waiting_first_level_5deg"
+                self.q_detach_start = self._current_quaternion() or self.q_contact
+                feedback = self._height_feedback()
+                self.detach_altitude_m = feedback[0] if feedback is not None else None
+                self.bench_detach_thrust_value = self._wall_pressure_thrust(now)
                 self.bench_detach_thrust_at = now
+            else:
+                self.detach_elapsed_s = self.detach_step_dt = 0.
+                self.detach_step_at = now
+                self.detach_clock_reversed = self.detach_tracking_limited = False
+                self.detach_recovered_since = self.detach_recovered_last_stamp = None
+                self.detach_recovered_samples = 0
+                self._begin_departure_clearance(now)
         elif new_state == WallPerchStatus.STATE_ABORT:
+            self.recovery_completed = False
+            if hasattr(self, "_reset_recovery_horizontal"):
+                self._reset_recovery_horizontal("异常恢复：取消主动退墙", clear_departure=True)
             if old_state in (WallPerchStatus.STATE_FRONT_WALL_DETECT,
                              WallPerchStatus.STATE_STABILIZE_HOVER,
                              WallPerchStatus.STATE_SLOW_APPROACH):
@@ -1283,7 +1602,8 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
                 self.recovery_wait_for_level = self.recovery_altitude_m is None
                 self.vertical_reference_source = ("offboard_takeover" if self.recovery_altitude_m is not None
                                                   else "waiting_first_level_5deg")
-            elif old_state not in (WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER):
+            elif (not getattr(self, "detach_vertical_active", False)
+                  and old_state not in (WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER)):
                 self.recovery_altitude_m = None
                 self.recovery_wait_for_level = True
                 self.vertical_reference_source = "waiting_first_level_5deg"
@@ -1303,6 +1623,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             self.top_clear_since = None
             self.top_clear_last_sample_at = None
         elif new_state == WallPerchStatus.STATE_IDLE:
+            self.approach_takeover_thrust = self.approach_base_vertical_thrust = None
             self.detach_altitude_m = self.approach_altitude_m = self.recovery_altitude_m = None
             self.recovery_wait_for_level = False
             self.vertical_reference_source = "none"
@@ -1366,14 +1687,12 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
                     and self._ignore_attachment_range_loss()
                     and (not self._bench_ranges_ready(now)
                          or (getattr(self, "manual_approach", False) and not self._flip_ready(now)))):
-                self.last_reason = "接管等待：需要两路新鲜有效距离"
+                self.last_reason = "接管等待：需要前向雷达新鲜有效距离"
                 self.flip_ready_since = self.flip_ready_last_sample_at = None
             elif mode_requested and not self.rearm_required and altitude_ok and safety_ok:
                 self._enter_state(WallPerchStatus.STATE_FRONT_WALL_DETECT, now, "wall mode armed")
                 if getattr(self, "manual_approach", False):
-                    ready = (self._flip_ready(now) and self._top_fresh(now)
-                             and self._sensor_health_fresh(now)
-                             and self.sensor_health.front_valid and self.sensor_health.ceiling_valid)
+                    ready = self._flip_ready(now) and self._front_flip_input_ready(now)
                     self._enter_state(WallPerchStatus.STATE_FLIP_TO_WALL if ready else WallPerchStatus.STATE_ABORT,
                                       now, "manual approach complete; begin flip" if ready else "manual flip gate lost during takeover")
             elif mode_requested:
@@ -1422,7 +1741,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
                     self._enter_state(WallPerchStatus.STATE_ABORT, now, "自动接近超时：总时限20秒")
                 elif not self._auto_approach_ranges_ready(now):
                     self.flip_ready_since = self.flip_ready_last_sample_at = None
-                    self.last_reason = ("雷达告警：无效或过期，继续自动接近；等待有效距离确认翻转"
+                    self.last_reason = ("前向雷达告警：无效或过期，继续自动接近；等待有效前距确认翻转"
                                         if self._approach_motion_allowed(now) else
                                         "自动接近暂停：雷达无效或过期，自主目标返回水平；总时限20秒")
                 elif getattr(self,"horizontal_velocity_enabled",False) and not self.horizontal_velocity_ready:
@@ -1437,30 +1756,32 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "approach safety failure")
             elif (self._bench_waiting() or self._ignore_attachment_range_loss()) and not self._bench_ranges_ready(now):
-                self.last_reason = "接近暂停：等待两路新鲜有效距离，不凭无效距离触发翻转"
+                self.last_reason = "接近暂停：等待前向雷达新鲜有效距离，不凭无效距离触发翻转"
                 self.state_entered_at = now
                 self.flip_ready_since = self.flip_ready_last_sample_at = None
             elif self._state_age(now) > self.approach_timeout_s:
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "approach timeout")
-            elif not self._top_fresh(now):
-                self.fault_count += 1
-                self._enter_state(
-                    WallPerchStatus.STATE_ABORT,
-                    now,
-                    "top range unavailable before flip",
-                )
             elif self._flip_ready(now):
                 self._enter_state(WallPerchStatus.STATE_FLIP_TO_WALL, now, "flip distance reached")
 
         elif self.state == WallPerchStatus.STATE_FLIP_TO_WALL:
-            if not self._safety_ok(now):
+            self._advance_flip_progress(now)
+            if getattr(self, "flip_clock_reversed", False):
+                self.fault_count += 1
+                self._enter_state(WallPerchStatus.STATE_ABORT, now, "flip clock moved backwards")
+            elif self._state_age(now) >= getattr(self, "flip_duration_timeout_s", max(4., 2.*self.flip_time_s)):
+                self.fault_count += 1
+                self._enter_state(WallPerchStatus.STATE_ABORT, now, "flip wall-clock duration timeout")
+            elif not self._safety_ok(now):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "flip sensor or flight failure")
+            elif self._late_top_frame_ready(now):
+                self._enter_state(WallPerchStatus.STATE_WALL_HOLD, now, "late flip top frame valid")
             elif self._pin_triggered():
                 self._enter_state(WallPerchStatus.STATE_WALL_PIN, now, "pin pitch reached")
-            elif self._state_age(now) >= self.flip_time_s or self._top_contact_detected(now):
-                self._enter_state(WallPerchStatus.STATE_WALL_CAPTURE, now, "flip complete or contact seen")
+            elif self._flip_progress() >= 1.0:
+                self._enter_state(WallPerchStatus.STATE_WALL_CAPTURE, now, "flip complete; waiting for one valid top frame")
 
         elif self.state == WallPerchStatus.STATE_WALL_CAPTURE:
             if not self._safety_ok(now):
@@ -1468,22 +1789,14 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "capture safety failure")
             elif self._pin_triggered():
                 self._enter_state(WallPerchStatus.STATE_WALL_PIN, now, "pin pitch reached")
-            elif self._top_contact_ready(now):
-                self._enter_state(WallPerchStatus.STATE_WALL_HOLD, now, "wall contact confirmed")
+            elif self._late_top_frame_ready(now):
+                self._enter_state(WallPerchStatus.STATE_WALL_HOLD, now, "top frame valid after flip")
             elif self._state_age(now) > self.capture_timeout_s:
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "wall capture timeout")
 
         elif self.state == WallPerchStatus.STATE_WALL_HOLD:
-            contact_lost = bool(
-                self.top_filtered_m is not None
-                and self.top_filtered_m
-                > getattr(
-                    self,
-                    "top_clear_distance_m",
-                    getattr(self, "top_contact_distance_m", float("inf")),
-                )
-            )
+            contact_lost = self._top_clear_ready(now)
             if not self._safety_ok(now) or contact_lost:
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "wall contact or safety lost")
@@ -1492,17 +1805,15 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             elif self.detach_requested or (
                 self.hold_time_s > 0.0 and self._state_age(now) >= self.hold_time_s
             ):
-                if self._detach_pose_ready(now):
-                    self._enter_state(
-                        WallPerchStatus.STATE_DETACH_ROTATE, now, "detach requested"
-                    )
+                requested_at = getattr(self, "detach_requested_at", now)
+                if (self.detach_requested and (now - requested_at).to_sec() >=
+                        getattr(self, "detach_request_timeout_s", 8.)):
+                    self.detach_requested = False
+                    self.last_reason = "离墙等待超时，请求已取消；" + self._detach_block_reason(now)
+                elif self._detach_pose_ready(now):
+                    self._enter_state(WallPerchStatus.STATE_DETACH_ROTATE, now, "detach requested")
                 elif self.detach_requested:
-                    requested_at = getattr(self, "detach_requested_at", now)
-                    if (now - requested_at).to_sec() > 8.0:
-                        self.detach_requested = False
-                        self.last_reason = "离墙等待超时，请求已取消；" + self._detach_block_reason(now)
-                    else:
-                        self.last_reason = "离墙请求已接收；" + self._detach_block_reason(now)
+                    self.last_reason = "离墙请求已接收；" + self._detach_block_reason(now)
 
         elif self.state == WallPerchStatus.STATE_WALL_PIN:
             if not self._flight_ready(now):
@@ -1512,15 +1823,32 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "pin hold timeout")
 
         elif self.state == WallPerchStatus.STATE_DETACH_ROTATE:
-            if not self._safety_ok(now) or self._height_feedback() is None:
+            bench = getattr(self, "bench_wait_for_ranges", False)
+            if not bench:
+                self._advance_detach_progress(now)
+            if getattr(self, "detach_vertical_fault", ""):
+                self.fault_count += 1
+                self._enter_state(WallPerchStatus.STATE_ABORT, now, self.detach_vertical_fault)
+            elif not self._safety_ok(now) or self._height_feedback() is None:
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "detach safety input lost")
+            elif not bench and (self.detach_clock_reversed or self._state_age(now) >= self.detach_duration_timeout_s):
+                self.fault_count += 1
+                self._enter_state(WallPerchStatus.STATE_ABORT, now, "detach clock reversed" if self.detach_clock_reversed else "detach rotation timeout")
             elif ((self._attitude_recovered() and self._rates_safe(self.recover_max_rate_rps))
-                  if getattr(self, "bench_wait_for_ranges", False)
-                  else self._state_age(now) >= self.detach_time_s):
-                self._enter_state(WallPerchStatus.STATE_RECOVER, now, "detach attitude recovered" if getattr(self, "bench_wait_for_ranges", False) else "detach rotation complete")
+                  if bench else self._detach_rotation_ready(now)):
+                self._enter_state(WallPerchStatus.STATE_RECOVER, now, "detach measured and published attitude recovered")
 
         elif self.state == WallPerchStatus.STATE_RECOVER:
+            if getattr(self, "detach_vertical_fault", ""):
+                self.fault_count += 1
+                self._enter_state(WallPerchStatus.STATE_ABORT, now, self.detach_vertical_fault)
+                return
+            if (not getattr(self, "bench_wait_for_ranges", False)
+                    and self._state_age(now) >= getattr(self, "recover_timeout_s", 15.)):
+                self.fault_count += 1
+                self._enter_state(WallPerchStatus.STATE_ABORT, now, "recovery timeout; normal detach incomplete")
+                return
             if not self._safety_ok(now) or self._height_feedback() is None:
                 self.fault_count += 1
                 self._enter_state(
@@ -1537,10 +1865,9 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             if (
                 self._state_age(now) >= self.recover_time_s
                 and stable
-                and (getattr(self, "bench_wait_for_ranges", False)
-                     or self._ignore_attachment_range_loss() or self._top_clear_ready(now))
                 and self._detach_height_settled()
                 and self._horizontal_recovery_ready(now)
+                and (getattr(self, "bench_wait_for_ranges", False) or self._departure_clearance_ready(now))
             ):
                 self._enter_state(WallPerchStatus.STATE_EXIT, now, "recovery complete")
 
@@ -1548,7 +1875,9 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             # Keep a bounded level target until fresh FCU feedback confirms
             # OFFBOARD has ended. Owner release alone is not RC handover.
             if self._flight_ready(now):
-                self.last_reason = "recovery complete; waiting for pilot mode handover"
+                self.last_reason = ("fault recovery complete; waiting for pilot mode handover"
+                    if getattr(self, "fault_recovery_completed", False)
+                    else "recovery complete; waiting for pilot mode handover")
             elif is_fresh(self.flight_state_received_at, self.state_timeout_s, now):
                 self._enter_state(WallPerchStatus.STATE_IDLE, now, "control released")
 
@@ -1563,7 +1892,147 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             if self._state_age(now) >= self.recover_time_s and stable and self._horizontal_recovery_ready(now):
                 self._enter_state(WallPerchStatus.STATE_EXIT, now, "abort recovery complete")
 
-    def _flip_thrust(self):
+    def _valid_wall_output(self, now):
+        """Return only the last fresh, actually published WALL attitude/thrust."""
+        output = getattr(self, "horizontal_output", None)
+        if (output is None or output.type_mask & (AttitudeTarget.IGNORE_ATTITUDE | AttitudeTarget.IGNORE_THRUST)
+                or not is_fresh(getattr(self, "horizontal_output_at", None), .20, now)
+                or not is_fresh_source(output.header.stamp, .20, now, future_tolerance_s=0.)
+                or getattr(self, "horizontal_output_owner", None) != AttachmentControlCandidate.SOURCE_WALL
+                or not is_fresh(getattr(self, "horizontal_output_owner_at", None), .30, now)
+                or not math.isfinite(output.thrust) or not .1 <= output.thrust <= self.max_thrust):
+            return None
+        q = output.orientation
+        values = (q.x, q.y, q.z, q.w)
+        if not all(math.isfinite(v) for v in values) or sum(v*v for v in values) <= 1.e-12:
+            return None
+        return output
+
+    def _detach_progress(self):
+        return clamp(getattr(self, "detach_elapsed_s", 0.) / self.detach_time_s, 0., 1.)
+
+    def _advance_detach_progress(self, now):
+        previous = getattr(self, "detach_step_at", None)
+        if previous is None:
+            self.detach_step_at = now
+            self.detach_elapsed_s = self.detach_step_dt = 0.
+            return
+        if now == previous:
+            return
+        delta = (now - previous).to_sec()
+        if delta < 0.:
+            self.detach_clock_reversed = True
+            self.detach_step_dt = 0.
+            return
+        self.detach_step_at = now
+        self.detach_step_dt = min(delta, .05)
+        elapsed = self.detach_elapsed_s
+        proposed = min(self.detach_time_s, elapsed + self.detach_step_dt)
+        measured = self._current_quaternion() if self._odom_fresh(now) else None
+        limit = getattr(self, "detach_max_tracking_error_rad", math.radians(15.))
+        def error(seconds):
+            target = self._quat_slerp(self.q_detach_start, self.q_hover,
+                                     self._smoothstep5(seconds / self.detach_time_s))
+            return quaternion_angle(target, measured)
+        current_error = error(elapsed) if measured is not None else math.inf
+        next_error = error(proposed) if measured is not None else math.inf
+        if measured is None or (current_error > limit and next_error >= current_error):
+            proposed = elapsed
+        elif current_error <= limit and next_error > limit:
+            low, high = elapsed, proposed
+            for _ in range(20):
+                middle = .5 * (low + high)
+                if error(middle) <= limit:
+                    low = middle
+                else:
+                    high = middle
+            proposed = low
+        self.detach_tracking_limited = proposed + 1.e-9 < min(self.detach_time_s, elapsed + self.detach_step_dt)
+        self.detach_elapsed_s = proposed
+
+    def _detach_rotation_pose_valid(self):
+        attitude = self._current_quaternion()
+        if attitude is None or getattr(self, "odom", None) is None:
+            return False
+        tilt = math.acos(clamp(rotate_vector(attitude, (0., 0., 1.))[2], -1., 1.))
+        rates = self.odom.twist.twist.angular
+        omega = (rates.x, rates.y, rates.z)
+        return bool(tilt <= getattr(self, "detach_recovered_tilt_rad", math.radians(5.))
+                    and all(math.isfinite(v) for v in omega)
+                    and math.sqrt(sum(v*v for v in omega)) <=
+                    getattr(self, "detach_recovered_rate_rps", math.radians(10.)))
+
+    def _detach_rotation_ready(self, now):
+        if (self._detach_progress() < 1. or not self._odom_fresh(now)
+                or not self._detach_rotation_pose_valid()
+                or getattr(self, "detach_recovered_samples", 0) < 2
+                or getattr(self, "detach_recovered_since", None) is None
+                or getattr(self, "detach_recovered_last_stamp", None) is None
+                or (self.detach_recovered_last_stamp - self.detach_recovered_since).to_sec()
+                   < getattr(self, "detach_recovered_hold_s", .30)):
+            return False
+        output = self._valid_wall_output(now)
+        if output is None:
+            return False
+        q = output.orientation
+        tilt = math.acos(clamp(rotate_vector((q.x, q.y, q.z, q.w), (0., 0., 1.))[2], -1., 1.))
+        # RECOVER's five-degree cone must not force a discontinuous projection
+        # of a previous command which is still outside that cone.
+        return tilt <= getattr(self, "detach_recovered_tilt_rad", math.radians(5.))
+
+    def _flip_entry_quaternion(self, now):
+        output = getattr(self, "horizontal_output", None)
+        if (output is not None
+                and not output.type_mask & AttitudeTarget.IGNORE_ATTITUDE
+                and is_fresh(getattr(self, "horizontal_output_at", None), .20, now)
+                and is_fresh_source(output.header.stamp, .20, now, future_tolerance_s=0.)
+                and getattr(self, "horizontal_output_owner", None) == AttachmentControlCandidate.SOURCE_WALL
+                and is_fresh(getattr(self, "horizontal_output_owner_at", None), .30, now)):
+            q = output.orientation
+            values = (q.x, q.y, q.z, q.w)
+            if (all(math.isfinite(v) for v in values)
+                    and sum(v*v for v in values) > 1.e-12):
+                return self._quat_normalize(values)
+        # Manual/bench acquisition begins at FLIP and has no preceding WALL
+        # publication. It may start from fresh measured attitude, never zero.
+        if not getattr(self, "auto_approach", False) and self._odom_fresh(now):
+            return self._current_quaternion()
+        return None
+
+    def _reset_flip_vertical_support(self):
+        self.flip_entry_thrust = self.flip_base_vertical_thrust = None
+        self.flip_altitude_m = None
+        self.flip_support_weight = 0.0
+        self.flip_support_thrust = self.flip_pressure_thrust = math.nan
+        self.flip_thrust_value = self.flip_thrust_at = None
+
+    def _prepare_flip_vertical_support(self, now):
+        self._reset_flip_vertical_support()
+        output = getattr(self, "horizontal_output", None)
+        base = getattr(self, "approach_base_vertical_thrust", None)
+        reference = getattr(self, "approach_altitude_m", None)
+        if (self.state != WallPerchStatus.STATE_SLOW_APPROACH or not self._odom_fresh(now)
+                or base is None or not math.isfinite(base) or base <= 0
+                or reference is None or not math.isfinite(reference)
+                or output is None or output.type_mask & AttitudeTarget.IGNORE_THRUST
+                or not math.isfinite(output.thrust) or not .1 <= output.thrust <= self.max_thrust
+                or not is_fresh(getattr(self, "horizontal_output_at", None), .20, now)
+                or not is_fresh_source(output.header.stamp, .20, now, future_tolerance_s=0.)
+                or getattr(self, "horizontal_output_owner", None) != AttachmentControlCandidate.SOURCE_WALL
+                or not is_fresh(getattr(self, "horizontal_output_owner_at", None), .30, now)):
+            return False
+        # Keep feedback correction separate from the captured vertical feedforward.
+        # Capturing the complete last command as base would add its correction twice.
+        self.flip_entry_thrust = self.flip_thrust_value = float(output.thrust)
+        self.flip_base_vertical_thrust = base
+        self.flip_altitude_m = reference
+        self.flip_thrust_at = now
+        self.flip_support_weight = 1.0
+        rospy.loginfo("wall flip support: entry %.3f, vertical base %.3f, height %.3f m",
+                      self.flip_entry_thrust, base, reference)
+        return True
+
+    def _legacy_flip_thrust(self):
         if not getattr(self, "flip_thrust_follow_tilt", False):
             return self.hover_thrust * self.flip_thrust_multiplier
         attitude = self._current_quaternion()
@@ -1575,6 +2044,45 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         angle = math.acos(clamp(up[2], -1.0, 1.0))
         blend = self._smoothstep5(clamp(angle / max(abs(self.wall_angle_rad), 1e-6), 0.0, 1.0))
         return self.hover_thrust * (1.0 + (self.flip_thrust_multiplier - 1.0) * blend)
+
+    def _flip_thrust(self, now=None):
+        legacy = self._legacy_flip_thrust()
+        if not getattr(self, "flip_vertical_support_enabled", False):
+            return legacy
+        now = rospy.Time.now() if now is None else now
+        self._advance_flip_progress(now)
+        if getattr(self, "flip_clock_reversed", False):
+            return math.nan
+        if getattr(self, "flip_thrust_evaluated_at", None) == now:
+            return self.flip_thrust_value
+        attitude = self._current_quaternion()
+        if (attitude is None or not self._odom_fresh(now)
+                or getattr(self, "flip_base_vertical_thrust", None) is None
+                or getattr(self, "flip_thrust_at", None) is None):
+            return math.nan
+        tilt = math.acos(clamp(rotate_vector(attitude, (0., 0., 1.))[2], -1., 1.))
+        blend = self._smoothstep5(clamp((tilt-self.flip_support_fade_start_rad) /
+            (self.flip_support_fade_end_rad-self.flip_support_fade_start_rad), 0., 1.))
+        # Fade only out; noisy angle feedback must not reenable height pulling near contact.
+        self.flip_support_weight = min(self.flip_support_weight, 1.-blend)
+        self.flip_pressure_thrust = legacy
+        self.flip_support_thrust = math.nan
+        desired = legacy
+        self.vertical_target_speed = self.vertical_correction = math.nan
+        if self.flip_support_weight > 0.:
+            support = self._vertical_height_thrust(self.flip_altitude_m, self.flip_base_vertical_thrust)
+            if not math.isfinite(support):
+                return math.nan
+            self.flip_support_thrust = support
+            desired = self.flip_support_weight*support + (1.-self.flip_support_weight)*legacy
+        # The first flip target equals the last actually sent approach thrust.
+        # Subsequent correction and pressure transitions share one collective slew bound.
+        step = self.flip_thrust_slew_per_s*self.flip_step_dt
+        result = clamp(desired, self.flip_thrust_value-step, self.flip_thrust_value+step)
+        self.flip_thrust_value = clamp(result, .1, self.max_thrust)
+        self.flip_thrust_at = now
+        self.flip_thrust_evaluated_at = now
+        return self.flip_thrust_value
 
     def _candidate(self, now):
         if (self.state == WallPerchStatus.STATE_SLOW_APPROACH
@@ -1599,15 +2107,16 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             quaternion = self._quat_normalize(self._quat_multiply(self.q_hover, pitch))
             thrust = self._vertical_height_thrust(getattr(self, "approach_altitude_m", None))
         elif self.state == WallPerchStatus.STATE_FLIP_TO_WALL:
-            progress = clamp(self._state_age(now) / self.flip_time_s, 0.0, 1.0)
+            self._advance_flip_progress(now)
+            progress = self._flip_progress()
             quaternion = self._quat_slerp(
-                self.q_hover, self.q_wall, self._smoothstep5(progress)
+                self.q_flip_start, self.q_wall, self._smoothstep5(progress)
             )
-            thrust = self._flip_thrust()
+            thrust = self._flip_thrust(now)
         elif self.state == WallPerchStatus.STATE_WALL_CAPTURE:
             progress = clamp(self._state_age(now) / self.capture_time_s, 0.0, 1.0)
             quaternion = self.q_contact
-            thrust = self._wall_pressure_thrust()
+            thrust = self._wall_pressure_thrust(now)
         elif self.state == WallPerchStatus.STATE_WALL_HOLD:
             progress = 1.0
             followed = self._hold_follow_quaternion()
@@ -1615,7 +2124,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
                 self._state_age(now) / self.hold_entry_blend_s
             )
             quaternion = self._quat_slerp(self.q_contact, followed, entry)
-            thrust = self._wall_pressure_thrust()
+            thrust = self._wall_pressure_thrust(now)
         elif self.state == WallPerchStatus.STATE_WALL_PIN:
             quaternion = self.q_contact
             thrust = self.pin_thrust
@@ -1631,36 +2140,14 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
                 tilt = math.acos(clamp(rotate_vector(attitude, (0, 0, 1))[2], -1, 1))
                 progress = clamp(1.0 - tilt / max(start_tilt, 1.0e-3), 0, 1)
         elif self.state == WallPerchStatus.STATE_DETACH_ROTATE:
-            progress = clamp(self._state_age(now) / self.detach_time_s, 0.0, 1.0)
-            smoothed = self._smoothstep5(progress)
-            quaternion = self._quat_slerp(
-                self.q_detach_start, self.q_hover, smoothed
-            )
-            hold_thrust = self.hover_thrust * self.hold_thrust_multiplier
-            # While nearly vertical, wall contact must still carry the weight.
-            # Keep the wall-pressure command while the wheels roll on the wall.
-            # Blend to altitude control as the thrust axis gains vertical
-            # authority; the pressure component fades as the body levels.
-            attitude = self._current_quaternion()
-            vertical_fraction = (
-                max(0.0, rotate_vector(attitude, (0.0, 0.0, 1.0))[2])
-                if attitude is not None else 0.0
-            )
-            start = math.cos(self.detach_compensation_start_rad)
-            full = min(1.0, max(start + 0.01, self.hover_thrust / self.max_thrust))
-            blend = self._smoothstep5((vertical_fraction - start) / (full - start))
-            thrust = hold_thrust + blend * (self._height_hold_thrust() - hold_thrust)
-            if getattr(self, "recovery_altitude_m", None) is not None:
-                thrust = self._recovery_height_thrust()
-        elif self.state == WallPerchStatus.STATE_RECOVER:
+            self._advance_detach_progress(now)
+            progress = self._detach_progress()
+            quaternion = self._quat_slerp(self.q_detach_start, self.q_hover, self._smoothstep5(progress))
+            thrust = self._detach_vertical_thrust(now, self.detach_step_dt)
+        elif self.state in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT, WallPerchStatus.STATE_ABORT):
             quaternion = self.q_hover
-            thrust = self._recovery_height_thrust()
-        elif self.state == WallPerchStatus.STATE_EXIT:
-            quaternion = self.q_hover
-            thrust = self._recovery_height_thrust()
-        elif self.state == WallPerchStatus.STATE_ABORT:
-            quaternion = self.q_hover
-            thrust = self._recovery_height_thrust()
+            thrust = (self._detach_vertical_thrust(now, min(.05, max(0., self.control_dt)))
+                      if getattr(self, "detach_vertical_active", False) else self._recovery_height_thrust())
 
         quaternion = self._horizontal_attitude(now, quaternion)
         if quaternion is not None and math.isfinite(thrust):
@@ -1670,7 +2157,9 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
                 thrust = clamp(thrust, self.bench_detach_thrust_value - delta, self.bench_detach_thrust_value + delta)
                 self.bench_detach_thrust_value, self.bench_detach_thrust_at = thrust, now
             thrust = clamp(thrust, 0.1, self.max_thrust)
-            if self.state in (WallPerchStatus.STATE_SLOW_APPROACH, WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT) or (self.state == WallPerchStatus.STATE_DETACH_ROTATE and getattr(self, "recovery_altitude_m", None) is not None):
+            if (not getattr(self, "detach_vertical_active", False)
+                    and (self.state in (WallPerchStatus.STATE_SLOW_APPROACH, WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT)
+                         or (self.state == WallPerchStatus.STATE_DETACH_ROTATE and getattr(self, "recovery_altitude_m", None) is not None))):
                 thrust = min(thrust, self.recovery_max_thrust)
         return neutral, quaternion, thrust, progress
 
@@ -1702,6 +2191,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         status.reached_state_name = self.STATE_NAMES[getattr(self, "reached_state", self.state)]
         status.detach_completed = getattr(self, "detach_completed", False)
         status.recovery_completed = getattr(self, "recovery_completed", False)
+        status.fault_recovery_completed = getattr(self, "fault_recovery_completed", False)
         status.detach_pending = bool(getattr(self, "detach_requested", False) and self.state == WallPerchStatus.STATE_WALL_HOLD)
         status.detach_block_reason = self._detach_block_reason(now) if self.state == WallPerchStatus.STATE_WALL_HOLD and not self._detach_pose_ready(now) else ""
         status.detach_ready = bool(self.state == WallPerchStatus.STATE_WALL_HOLD
@@ -1725,13 +2215,12 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             self.flip_ready_last_sample_at,
             self.flip_trigger_hold_s,
         )
-        status.top_contact_ready = self._held_status(
-            status.top_range_fresh
-            and self.top_filtered_m <= self.top_contact_distance_m,
-            self.top_contact_since,
-            self.top_contact_last_sample_at,
-            self.top_contact_hold_s,
-        )
+        status.top_contact_ready = (self._late_top_frame_ready(now)
+            if self.state in (WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE)
+            else self._held_status(
+                status.top_range_fresh and self.top_filtered_m <= self.top_contact_distance_m,
+                self.top_contact_since, self.top_contact_last_sample_at, self.top_contact_hold_s,
+            ))
         status.top_clear_ready = self._held_status(
             status.top_range_fresh
             and self.top_filtered_m >= self.top_clear_distance_m,
@@ -1773,30 +2262,65 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         status.progress = progress
         status.fault_count = self.fault_count
         self._fill_horizontal_status(status)
-        reference = (getattr(self, "approach_altitude_m", None) if self.state == WallPerchStatus.STATE_SLOW_APPROACH
+        flip_support = bool(self.state == WallPerchStatus.STATE_FLIP_TO_WALL
+                            and getattr(self, "flip_vertical_support_enabled", False))
+        reference = (getattr(self, "flip_altitude_m", None) if flip_support else
+                     getattr(self, "approach_altitude_m", None) if self.state == WallPerchStatus.STATE_SLOW_APPROACH
                      else getattr(self, "recovery_altitude_m", None))
         status.vertical_control_active = self.state in (WallPerchStatus.STATE_SLOW_APPROACH,
             WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT) or (
             self.state == WallPerchStatus.STATE_DETACH_ROTATE and reference is not None)
+        status.vertical_control_active = status.vertical_control_active or (flip_support and self.flip_support_weight > 0.)
         status.vertical_reference_valid = reference is not None
         status.vertical_reference_m = reference if reference is not None else math.nan
         status.vertical_reference_source = getattr(self, "vertical_reference_source", "none")
         status.vertical_target_enu_mps = getattr(self, "vertical_target_speed", math.nan) if status.vertical_control_active else math.nan
         status.vertical_thrust_correction = getattr(self, "vertical_correction", math.nan) if status.vertical_control_active else math.nan
+        status.approach_takeover_thrust = (getattr(self, "approach_takeover_thrust", None)
+                                           if getattr(self, "approach_takeover_thrust", None) is not None else math.nan)
+        status.approach_base_vertical_thrust = (getattr(self, "approach_base_vertical_thrust", None)
+                                               if getattr(self, "approach_base_vertical_thrust", None) is not None else math.nan)
+        status.flip_vertical_support_enabled = flip_support
+        status.flip_vertical_support_weight = self.flip_support_weight if flip_support else 0.
+        status.flip_entry_thrust = self.flip_entry_thrust if flip_support and self.flip_entry_thrust is not None else math.nan
+        status.flip_base_vertical_thrust = self.flip_base_vertical_thrust if flip_support and self.flip_base_vertical_thrust is not None else math.nan
+        status.flip_support_thrust = self.flip_support_thrust if flip_support else math.nan
+        status.flip_pressure_thrust = self.flip_pressure_thrust if flip_support else math.nan
         status.reason = self.last_reason
+        if self.state == WallPerchStatus.STATE_FLIP_TO_WALL and getattr(self, "flip_tracking_limited", False):
+            status.reason += "; 翻转目标跟踪误差受限，减缓姿态轨迹"
+        if flip_support:
+            status.reason += ("; 翻转初段竖直闭环（继承接近基准）" if self.flip_support_weight >= 1. else
+                              "; 竖直支撑平滑退出" if self.flip_support_weight > 0. else "; 已切换原贴墙推力")
         if status.horizontal_equilibrium_enabled and not status.horizontal_equilibrium_valid:
             status.reason += "; " + status.horizontal_equilibrium_reason
         if status.vertical_control_active:
             status.reason += ("; 高度闭环基准 %.3f m（%s）" % (reference, status.vertical_reference_source)
                               if reference is not None else "; 竖直速度制动：等待实际回平至5°锁定高度")
+        if self.state == WallPerchStatus.STATE_SLOW_APPROACH and getattr(self, "approach_use_takeover_thrust", False):
+            status.reason += ("; 接管推力 %.3f，竖直支撑基准 %.3f" % (
+                self.approach_takeover_thrust, self.approach_base_vertical_thrust)
+                if self.approach_base_vertical_thrust is not None else "; 接管推力缺失，禁止使用固定值替代")
         if status.horizontal_velocity_enabled and self.state in (WallPerchStatus.STATE_RECOVER,WallPerchStatus.STATE_ABORT,WallPerchStatus.STATE_EXIT):
             status.reason += "; " + status.horizontal_velocity_reason
+        if self.state == WallPerchStatus.STATE_DETACH_ROTATE and getattr(self, "detach_tracking_limited", False):
+            status.reason += "; 脱离轨迹跟踪误差受限"
+        self._fill_detach_vertical_status(status)
         return status
 
     @staticmethod
-    def _build_control_candidate(status):
+    def _build_control_candidate(status, maneuver_id="", control_sequence=0):
         candidate = AttachmentControlCandidate()
         candidate.header = status.header
+        candidate.phase_valid = bool(maneuver_id and control_sequence > 0)
+        candidate.control_phase = status.state
+        candidate.maneuver_id = maneuver_id
+        candidate.control_sequence = control_sequence
+        candidate.horizontal_velocity_enabled = status.horizontal_velocity_enabled
+        candidate.horizontal_velocity_active = status.horizontal_velocity_active
+        candidate.approach_paused = status.approach_paused
+        candidate.recovery_support_valid = status.recovery_support_valid
+        candidate.recovery_thrust_limit = status.recovery_thrust_limit
         candidate.source = AttachmentControlCandidate.SOURCE_WALL
         candidate.acquire_request = status.acquire_request
         candidate.keep_ownership = status.keep_ownership
@@ -1837,12 +2361,15 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         self._update_state_machine(now)
         status = self._build_status(now)
         self.status_publisher.publish(status)
+        self.control_sequence += 1
         self.control_candidate_publisher.publish(
-            self._build_control_candidate(status)
+            self._build_control_candidate(status, self.maneuver_id, self.control_sequence)
         )
 
 
 if __name__ == "__main__":
     rospy.init_node("wall_perch_decision_node")
+    from px4_wall_ceiling_control.adapters.async_logging import install_ros_async_logging
+    install_ros_async_logging(rospy)
     WallPerchDecisionNode()
     rospy.spin()

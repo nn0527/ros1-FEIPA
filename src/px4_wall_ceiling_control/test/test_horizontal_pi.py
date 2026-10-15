@@ -152,7 +152,8 @@ if rospy is not None:
         def test_expired_flow_and_velocity_source_clear_integral(self):
             self.tick(10.60,stamp=9.)
             self.assertEqual(self.n.horizontal_controller.integral,(0.,0.))
-            self.assertIn('速度源时间戳',self.n.horizontal_integral_reason)
+            # Source freshness now rejects this sample at the odometry gate.
+            self.assertEqual(self.n.horizontal_integral_reason, '等待新鲜有效里程计')
             self.n.horizontal_controller.integral=(.1,0)
             self.f.time=11.3
             self.n._horizontal_attitude(rospy.Time.now(),self.n.q_hover)

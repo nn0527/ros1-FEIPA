@@ -99,3 +99,37 @@ float32 horizontal_integral_y_enu_mps2
 bool horizontal_integral_active
 string horizontal_integral_reason
 bool horizontal_control_saturated
+
+# Actual POSCTL thrust captured once on entry to OFFBOARD; approach only.
+float32 approach_takeover_thrust
+float32 approach_base_vertical_thrust
+
+# Bumpless early flip support; collective targets, not measured motor force.
+bool flip_vertical_support_enabled
+float32 flip_vertical_support_weight
+float32 flip_entry_thrust
+float32 flip_base_vertical_thrust
+float32 flip_support_thrust
+float32 flip_pressure_thrust
+
+# Normal and fault recovery outcomes are distinct.
+bool fault_recovery_completed
+# Continuous support referenced to the accepted departure height.
+bool recovery_support_valid
+float32 recovery_thrust_limit
+bool detach_vertical_active
+string detach_vertical_reason
+string detach_vertical_base_source
+float32 detach_vertical_base_thrust
+float32 detach_vertical_integral
+bool detach_vertical_integral_active
+bool detach_vertical_saturated
+float32 detach_vertical_support_weight
+float32 detach_height_error_m
+# Clearance is evaluated with the front sensor after actual return to level.
+bool departure_clearance_ready
+float32 departure_clearance_distance_m
+string departure_clearance_reason
+float32 recovery_horizontal_integral_x
+float32 recovery_horizontal_integral_y
+bool recovery_horizontal_integral_active

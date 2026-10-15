@@ -12,8 +12,9 @@ class AttachmentRangeLossTest(m.HoldRangeLossTest):
    self.node.state=state;self.assertFalse(self.node._safety_ok(self.now))
  def test_disable_parameter_restores_loss_protection(self):
   self.node.ignore_range_loss_during_attachment=False;self.node.ignore_range_loss_during_hold=False
-  for state in [S.STATE_FLIP_TO_WALL,S.STATE_WALL_CAPTURE,S.STATE_WALL_HOLD]:
-   self.node.state=state;self.assertFalse(self.node._safety_ok(self.now))
+  for state in [S.STATE_FLIP_TO_WALL,S.STATE_WALL_CAPTURE]:
+   self.node.state=state;self.assertTrue(self.node._safety_ok(self.now))
+  self.node.state=S.STATE_WALL_HOLD;self.assertFalse(self.node._safety_ok(self.now))
  def test_stale_data_does_not_confirm_contact(self):
   self.node.state=S.STATE_WALL_CAPTURE;self.node.top_contact_since=self.now;self.node.top_contact_last_sample_at=self.now
   self.node.top_capture_near_samples=0;self.node.top_capture_window_samples=3

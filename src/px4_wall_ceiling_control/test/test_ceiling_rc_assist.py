@@ -101,12 +101,22 @@ class CeilingRcAssistTest(unittest.TestCase):
         node.operator.mode = OperatorCommand.MODE_WALL
         self.assertTrue(node._rc_ready(now))
 
+    def wall_control(self, node, now):
+        # Match the atomic phase metadata required by an owned wall command.
+        candidate = Candidate(source=Candidate.SOURCE_WALL, phase_valid=True,
+                              control_phase=node.wall_status.state,
+                              maneuver_id="ceiling-axis-switch-test",
+                              control_sequence=max(1, int(now.to_nsec())))
+        candidate.header.stamp = now
+        return candidate
+
     def test_axis_switch_does_not_transfer_old_trim(self):
         node, _ = self.fixture()
         node.rc_channels = (2000, 2000, 1500, 2000)
         for i in range(1, 11):
             now = self.tick(node, 10 + i * .1)
-            node._assisted_attitude(now, Quaternion(w=1), Candidate.SOURCE_WALL)
+            node._assisted_attitude(now, Quaternion(w=1), Candidate.SOURCE_WALL,
+                                    self.wall_control(node, now))
         self.assertNotEqual(node.rc_yaw_rad, 0)
         now = self.tick(node, 11.1)
         node._assisted_attitude(now, Quaternion(w=1), Candidate.SOURCE_CEILING)
@@ -115,7 +125,8 @@ class CeilingRcAssistTest(unittest.TestCase):
         node._assisted_attitude(now, Quaternion(w=1), Candidate.SOURCE_CEILING)
         self.assertGreater(node.rc_pitch_rad, 0)
         now = self.tick(node, 11.3)
-        node._assisted_attitude(now, Quaternion(w=1), Candidate.SOURCE_WALL)
+        node._assisted_attitude(now, Quaternion(w=1), Candidate.SOURCE_WALL,
+                                    self.wall_control(node, now))
         self.assertEqual((node.rc_roll_rad, node.rc_pitch_rad, node.rc_yaw_rad), (0, 0, 0))
 
     def test_px4_pitch_mapping_calibration_and_direction(self):

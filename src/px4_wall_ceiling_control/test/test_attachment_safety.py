@@ -158,6 +158,7 @@ class AttachmentSafetyTest(unittest.TestCase):
         node.detach_max_abs_vertical_speed_mps = 0.15
         node.detach_stable_hold_s = 0.5
         node.odom_twist_in_child_frame = False
+        node.odom_timeout_s = 0.50
         node._mode_requested = lambda _now: True
         node._safety_ok = lambda _now: True
         node._pin_triggered = lambda: False
@@ -165,6 +166,7 @@ class AttachmentSafetyTest(unittest.TestCase):
 
         def publish_attitude(at, quaternion):
             odom = Odometry()
+            odom.header.stamp = rospy.Time.from_sec(at)
             odom.pose.pose.orientation.x = quaternion[0]
             odom.pose.pose.orientation.y = quaternion[1]
             odom.pose.pose.orientation.z = quaternion[2]
@@ -635,7 +637,7 @@ class AttachmentSafetyTest(unittest.TestCase):
 
         node.state = WallPerchStatus.STATE_WALL_CAPTURE
         node._top_fresh = lambda _now: False
-        self.assertFalse(node._safety_ok(now))
+        self.assertTrue(node._safety_ok(now))
 
     def test_wall_status_does_not_flag_stale_front_after_flip(self):
         node = WallDecision.__new__(WallDecision)
@@ -1203,9 +1205,14 @@ class AttachmentSafetyTest(unittest.TestCase):
         node.wall_output_enabled = True
         node.wall_candidate_timeout_s = 0.20
         node.wall_candidate = AttachmentControlCandidate(
-            keep_ownership=True, valid=False
+            source=AttachmentControlCandidate.SOURCE_WALL,
+            keep_ownership=True, valid=False, phase_valid=True,
+            control_phase=WallPerchStatus.STATE_FLIP_TO_WALL,
+            maneuver_id="invalid-payload-existing-owner", control_sequence=2,
         )
+        node.wall_candidate.header.stamp = rospy.Time.from_sec(10.0)
         node.wall_candidate_at = rospy.Time.from_sec(10.0)
+        node.wall_candidate_snapshot = (node.wall_candidate, node.wall_candidate_at)
 
         node._update_owner(rospy.Time.from_sec(10.0))
 
@@ -1233,8 +1240,9 @@ class AttachmentSafetyTest(unittest.TestCase):
         authorized, _reason = node._authorized(rospy.Time.from_sec(10.0))
         self.assertFalse(authorized)
 
-    def test_wall_preflight_requires_top_sensor_health(self):
+    def test_wall_preflight_does_not_require_top_sensor_health(self):
         node = WallDecision.__new__(WallDecision)
+        node.state = WallPerchStatus.STATE_IDLE
         node.require_top_sensor_on_acquire = True
         node.sensor_health_timeout_s = 0.30
         node.sensor_health = SensorHealth(ceiling_valid=True)
@@ -1243,7 +1251,7 @@ class AttachmentSafetyTest(unittest.TestCase):
         self.assertTrue(node._top_preflight_ready(rospy.Time.from_sec(10.0)))
 
         node.sensor_health.ceiling_valid = False
-        self.assertFalse(node._top_preflight_ready(rospy.Time.from_sec(10.0)))
+        self.assertTrue(node._top_preflight_ready(rospy.Time.from_sec(10.0)))
 
 
 if __name__ == "__main__":

@@ -11,14 +11,14 @@ from px4_wall_ceiling_control.domain.horizontal_velocity import HorizontalVeloci
 from px4_wall_ceiling_control.domain.horizontal_equilibrium import HorizontalEquilibrium
 from px4_wall_ceiling_control.domain.flow_timestamps import FlowTimestampGuard
 from px4_wall_ceiling_control.domain.recovery_attitude_limits import attitude_from_axis_yaw
-from px4_wall_ceiling_control.freshness import is_fresh, is_fresh_receipt
+from px4_wall_ceiling_control.freshness import is_fresh, is_fresh_receipt, is_fresh_source
 from px4_wall_ceiling_control.msg import WallPerchStatus as W, AttachmentControlCandidate as C
 
 
 class WallHorizontalVelocityMixin:
     def _init_horizontal_velocity(self):
         self.horizontal_velocity_enabled = bool(rospy.get_param('~horizontal_velocity_enabled', False))
-        self.horizontal_approach_speed = float(rospy.get_param('~horizontal_approach_speed_mps', .05))
+        self.horizontal_approach_speed = float(rospy.get_param('~horizontal_approach_speed_mps', .10))
         self.horizontal_resume_tilt = math.radians(float(rospy.get_param('~horizontal_resume_tilt_deg', 10.)))
         self.horizontal_stable_speed = float(rospy.get_param('~horizontal_stable_speed_mps', .10))
         self.horizontal_stable_time = float(rospy.get_param('~horizontal_stable_time_s', 1.))
@@ -39,6 +39,21 @@ class WallHorizontalVelocityMixin:
             float(rospy.get_param('~horizontal_target_acceleration_mps2', .10)),
             float(rospy.get_param('~horizontal_velocity_ki', .30)),
             float(rospy.get_param('~horizontal_integral_limit_mps2', .20)))
+        self.recovery_horizontal_controller = HorizontalVelocityController(
+            self.horizontal_controller.kp, self.horizontal_controller.max_acceleration,
+            self.horizontal_controller.target_acceleration,
+            float(rospy.get_param('~recovery_horizontal_velocity_ki', .30)),
+            float(rospy.get_param('~recovery_horizontal_integral_limit_mps2', .20)))
+        self.departure_retreat_speed = float(rospy.get_param('~departure_retreat_speed_mps', .05))
+        self.departure_clearance_distance = float(rospy.get_param('~departure_clearance_distance_m', .30))
+        self.departure_clearance_hold = float(rospy.get_param('~departure_clearance_hold_s', .30))
+        self.departure_heading_tolerance = math.radians(float(rospy.get_param('~departure_heading_tolerance_deg', 10.)))
+        if not (0 < self.departure_retreat_speed <= .10
+                and .20 <= self.departure_clearance_distance <= 1.
+                and .20 <= self.departure_clearance_hold <= 2.
+                and 0 < self.departure_heading_tolerance <= math.radians(15.)):
+            raise ValueError('invalid wall departure clearance settings')
+        self._reset_recovery_horizontal('等待新的恢复动作', clear_departure=True)
         self.horizontal_equilibrium = HorizontalEquilibrium(window=self.horizontal_equilibrium_window)
         self.horizontal_output_owner = None
         self.horizontal_output_owner_at = None
@@ -75,6 +90,181 @@ class WallHorizontalVelocityMixin:
         self.horizontal_candidate_axis = None
         self.horizontal_applied_axis = None
         self.horizontal_integral_reason = reason
+
+    def _reset_recovery_horizontal(self, reason, clear_departure=False):
+        controller = getattr(self, 'recovery_horizontal_controller', None)
+        if controller is not None:
+            controller.reset()
+        self.recovery_integral_sample = None
+        self.recovery_candidate_axis = self.recovery_applied_axis = None
+        self.recovery_control_at = None
+        self.recovery_baseline_axis = None
+        self.recovery_integral_reason = reason
+        if clear_departure:
+            self.departure_active = False
+            self.departure_yaw = self.departure_started_at = None
+            self.departure_level_at = None
+            self.departure_clear_since = self.departure_clear_last_stamp = None
+            self.departure_clear_samples = 0
+            self.departure_clear_confirmed = False
+            self.departure_distance = math.nan
+            self.departure_feedback_valid = False
+            self.departure_clearance_reason = '未开始正常离墙'
+
+    def _begin_departure_clearance(self, now):
+        self._reset_recovery_horizontal('本次离墙使用独立恢复积分', clear_departure=True)
+        self.departure_active = not getattr(self, 'bench_wait_for_ranges', False)
+        self.departure_started_at = now
+        yaw = getattr(self, 'horizontal_takeover_yaw', None)
+        self.departure_yaw = yaw if yaw is not None and math.isfinite(yaw) else None
+        self.departure_clearance_reason = '等待实际回平后的前向测距与光流'
+
+    def _reset_departure_evidence(self, reason):
+        self.departure_clear_since = self.departure_clear_last_stamp = None
+        self.departure_clear_samples = 0
+        self.departure_clear_confirmed = False
+        self.departure_feedback_valid = False
+        self.departure_distance = math.nan
+        self.departure_clearance_reason = reason
+
+    def _update_departure_clearance(self, now):
+        if not getattr(self, 'departure_active', False):
+            return
+        reason = ''
+        attitude = self._current_quaternion() if self._odom_fresh(now) else None
+        yaw = getattr(self, 'departure_yaw', None)
+        if self.state not in (W.STATE_DETACH_ROTATE, W.STATE_RECOVER, W.STATE_EXIT):
+            reason = '离墙动作阶段无效'
+        elif not getattr(self, 'horizontal_velocity_enabled', False) or not self.horizontal_velocity_ready:
+            reason = '离墙等待新鲜有效光流和水平速度'
+        elif attitude is None or rotate_vector(attitude, (0.,0.,1.))[2] < math.cos(math.radians(5.)):
+            reason = '离墙等待实测总倾角≤5°'
+        elif yaw is None:
+            reason = '接管航向缺失，禁止猜测退墙方向'
+        else:
+            measured_yaw = euler_from_quaternion(attitude)[2]
+            if abs(math.atan2(math.sin(measured_yaw-yaw), math.cos(measured_yaw-yaw))) > self.departure_heading_tolerance:
+                reason = '机头偏离接管航向，前向测距不能确认原墙面'
+        if reason:
+            self.departure_level_at = None
+            self._reset_departure_evidence(reason)
+            return
+        if self.departure_level_at is None:
+            self.departure_level_at = now
+        front = getattr(self, 'front_range', None)
+        health = getattr(self, 'sensor_health', None)
+        if (front is None or not self._front_fresh(now)
+                or not self._sensor_health_fresh(now) or health is None or not health.front_valid
+                or front.header.stamp <= self.departure_level_at):
+            self._reset_departure_evidence('墙距未知：等待回平后的新鲜有效前向测距')
+            return
+        distance = float(front.range)
+        if not math.isfinite(distance) or distance <= 0.:
+            self._reset_departure_evidence('墙距无效，保持零速并等待')
+            return
+        self.departure_feedback_valid = True
+        self.departure_distance = distance
+        stamp = front.header.stamp
+        if distance < self.departure_clearance_distance:
+            self.departure_clear_since = self.departure_clear_last_stamp = None
+            self.departure_clear_samples = 0
+            self.departure_clear_confirmed = False
+            self.departure_clearance_reason = '沿冻结接管航向反向退墙，等待前距≥%.2fm' % self.departure_clearance_distance
+            return
+        previous = self.departure_clear_last_stamp
+        if previous is not None and (stamp-previous).to_sec() > self.sensor_timeout_s:
+            self.departure_clear_since = None
+            self.departure_clear_samples = 0
+        if previous is None or stamp > previous:
+            if self.departure_clear_since is None:
+                self.departure_clear_since = stamp
+            self.departure_clear_last_stamp = stamp
+            self.departure_clear_samples += 1
+        self.departure_clear_confirmed = bool(self.departure_clear_samples >= 2
+            and self.departure_clear_since is not None
+            and (self.departure_clear_last_stamp-self.departure_clear_since).to_sec() >= self.departure_clearance_hold)
+        self.departure_clearance_reason = ('离墙距离已确认，等待零速稳定'
+            if self.departure_clear_confirmed else '安全间隙测距连续确认中')
+
+    def _departure_clearance_ready(self, now):
+        if not getattr(self, 'departure_active', False):
+            return bool(getattr(self, 'bench_wait_for_ranges', False))
+        self._update_departure_clearance(now)
+        return bool(self.departure_feedback_valid and self.departure_clear_confirmed)
+
+    def _recovery_integral_interval(self, now):
+        controller = self.recovery_horizontal_controller
+        self.recovery_applied_axis = None
+        flight = getattr(self, 'flight_state', None)
+        reason = ''
+        if not (flight is not None and flight.connected and flight.armed and flight.mode.upper() == 'OFFBOARD'
+                and is_fresh_receipt(self.flight_state_received_at, self.state_timeout_s, now)
+                and self._flight_ready(now) and self.horizontal_equilibrium.frozen):
+            reason = '恢复未持有有效OFFBOARD状态'
+        elif not (self.horizontal_output_owner == C.SOURCE_WALL
+                and is_fresh_receipt(self.horizontal_output_owner_at, .3, now)):
+            reason = '恢复缺少侧吸输出权限'
+        elif not self.horizontal_velocity_ready or (getattr(self, 'departure_active', False)
+                and not self.departure_feedback_valid):
+            reason = '恢复反馈无效或墙距未知'
+        elif not is_fresh_receipt(self.horizontal_output_at, .3, now):
+            reason = '恢复最终输出过期'
+        output = self.horizontal_output
+        if not reason:
+            q = tuple(getattr(output.orientation, k) for k in 'xyzw') if output is not None else ()
+            if (len(q) != 4 or not all(math.isfinite(v) for v in q)
+                    or abs(sum(v*v for v in q)-1.) > .01
+                    or output.type_mask & AttitudeTarget.IGNORE_ATTITUDE
+                    or not is_fresh_source(output.header.stamp, .3, now, future_tolerance_s=0.)):
+                reason = '恢复最终姿态输出无效'
+        if reason:
+            controller.clear_integral()
+            self.recovery_integral_sample = None
+            self.recovery_candidate_axis = None
+            self.recovery_integral_reason = reason
+            return 0.
+        axis = rotate_vector(q, (0.,0.,1.))
+        self.recovery_applied_axis = axis
+        if (self.recovery_candidate_axis is None
+                or sum(a*b for a,b in zip(axis, self.recovery_candidate_axis)) < math.cos(math.radians(1.))):
+            self.recovery_integral_sample = None
+            controller.integral_active = False
+            self.recovery_integral_reason = '等待恢复候选推力轴被最终输出采用'
+            return 0.
+        stamp = self.odom.header.stamp
+        if not is_fresh_source(stamp, self.odom_timeout_s, now):
+            controller.clear_integral()
+            self.recovery_integral_sample = None
+            self.recovery_integral_reason = '恢复速度源时间戳无效'
+            return 0.
+        previous = self.recovery_integral_sample
+        controller.integral_active = False
+        if previous is not None and stamp <= previous:
+            self.recovery_integral_reason = '恢复等待新的速度样本'
+            return 0.
+        self.recovery_integral_sample = stamp
+        if previous is None or (stamp-previous).to_sec() > self.odom_timeout_s:
+            self.recovery_integral_reason = '恢复等待连续速度样本'
+            return 0.
+        self.recovery_integral_reason = '受限恢复积分生效'
+        return min(.05, (stamp-previous).to_sec())
+
+    def _recovery_baseline(self, now, dt):
+        desired = self.horizontal_equilibrium.axis
+        previous = self.recovery_baseline_axis
+        if previous is None:
+            previous = self.recovery_applied_axis
+            if previous is None:
+                previous = rotate_vector(self._current_quaternion(), (0.,0.,1.))
+        # The baseline itself approaches the frozen equilibrium at 10 degrees/s;
+        # the mux independently bounds the combined final attitude and thrust.
+        dot = max(-1., min(1., sum(a*b for a,b in zip(previous, desired))))
+        angle = math.acos(dot)
+        fraction = min(1., math.radians(10.)*dt/angle) if angle > 1.e-9 else 1.
+        mixed = tuple(a+(b-a)*fraction for a,b in zip(previous, desired))
+        norm = math.sqrt(sum(v*v for v in mixed))
+        self.recovery_baseline_axis = tuple(v/norm for v in mixed)
+        return self.recovery_baseline_axis
 
     def _horizontal_integral_interval(self, now):
         # Authority gates never use the manager's ACTIVE flag in place of an
@@ -130,8 +320,13 @@ class WallHorizontalVelocityMixin:
     def _on_horizontal_fcu_target(self, message):
         # OFFBOARD echoes our commands. Never learn equilibrium from that echo.
         flight=getattr(self,'flight_state',None)
-        if flight is not None and flight.mode.upper()=='POSCTL' and not self.horizontal_equilibrium.frozen:
-            self.horizontal_fcu_target,self.horizontal_fcu_target_at=message,rospy.Time.now()
+        if flight is not None and flight.mode.upper()=='POSCTL':
+            now = rospy.Time.now()
+            # Keep the latest thrust through ENTERING, even after the horizontal
+            # attitude baseline freezes. Capture it once on the OFFBOARD edge.
+            self.approach_takeover_source = (message, now)
+            if not self.horizontal_equilibrium.frozen:
+                self.horizontal_fcu_target,self.horizontal_fcu_target_at=message,now
 
     def _prepare_horizontal_equilibrium(self, now):
         if not getattr(self,'horizontal_velocity_enabled',False):return
@@ -219,16 +414,22 @@ class WallHorizontalVelocityMixin:
         self.horizontal_velocity_reason = reason
         self.horizontal_controller.reset()
         self._clear_horizontal_integral(reason)
+        self._reset_recovery_horizontal(reason)
+        if getattr(self, 'departure_active', False):
+            self.departure_level_at = None
+            self._reset_departure_evidence(reason)
 
     def _horizontal_phase_allowed(self, now):
         if self.state in (W.STATE_IDLE,W.STATE_FRONT_WALL_DETECT,W.STATE_STABILIZE_HOVER,
                           W.STATE_SLOW_APPROACH,W.STATE_RECOVER,W.STATE_EXIT,W.STATE_ABORT):
             return True
         if self.state == W.STATE_DETACH_ROTATE:
-            progress = min(1.,max(0.,self._state_age(now)/self.detach_time_s))
+            progress = self._detach_progress() if hasattr(self, '_detach_progress') else min(1.,max(0.,self._state_age(now)/self.detach_time_s))
             target = self._quat_slerp(self.q_detach_start,self.q_hover,self._smoothstep5(progress))
             # Resume braking only in the final near-level part of the original rotation.
-            return rotate_vector(target,(0.,0.,1.))[2] >= math.cos(math.radians(5.))
+            measured = self._current_quaternion() if self._odom_fresh(now) else None
+            return bool(measured is not None and rotate_vector(target,(0.,0.,1.))[2] >= math.cos(math.radians(5.))
+                and rotate_vector(measured,(0.,0.,1.))[2] >= math.cos(math.radians(5.)))
         return False
 
     def _prepare_horizontal_velocity(self, now):
@@ -269,6 +470,7 @@ class WallHorizontalVelocityMixin:
             self.horizontal_velocity_ready = False
             self.horizontal_velocity_reason = reason
             self._clear_horizontal_integral(reason)
+            self._reset_recovery_horizontal(reason)
         else:
             if self.horizontal_last_flow_sample != flow_at:
                 self.horizontal_last_flow_sample = flow_at
@@ -277,8 +479,13 @@ class WallHorizontalVelocityMixin:
             self.horizontal_velocity_ready = bool(self.horizontal_flow_samples >= 2 and self.horizontal_confirm_at is not None
                 and (now-self.horizontal_confirm_at).to_sec() >= self.horizontal_reacquire_time)
             self.horizontal_velocity_reason = '水平速度反馈有效' if self.horizontal_velocity_ready else '等待光流连续有效确认'
+        self._update_departure_clearance(now)
         recovery = self.state in (W.STATE_DETACH_ROTATE,W.STATE_RECOVER,W.STATE_EXIT,W.STATE_ABORT)
-        stable = bool(recovery and self.horizontal_velocity_ready and tilt <= math.radians(5.)
+        stopped = True
+        if getattr(self, 'departure_active', False):
+            stopped = bool(self.departure_clear_confirmed and self.departure_feedback_valid
+                and math.hypot(*self.recovery_horizontal_controller.target) <= 1.e-4)
+        stable = bool(recovery and stopped and self.horizontal_velocity_ready and tilt <= math.radians(5.)
                       and rate <= math.radians(10.) and math.hypot(*self.horizontal_measured) <= self.horizontal_stable_speed)
         if not stable:
             self.horizontal_stable_since = self.horizontal_stable_last_odom = None
@@ -293,7 +500,8 @@ class WallHorizontalVelocityMixin:
     def _horizontal_recovery_ready(self, now):
         if not getattr(self,'horizontal_velocity_enabled',False):return True
         self._prepare_horizontal_velocity(now)
-        return self.horizontal_velocity_stable
+        return bool(self.horizontal_velocity_stable and (not getattr(self, 'departure_active', False)
+            or self._departure_clearance_ready(now)))
 
     def _horizontal_attitude(self, now, quaternion):
         if not getattr(self,'horizontal_velocity_enabled',False):return quaternion
@@ -308,30 +516,63 @@ class WallHorizontalVelocityMixin:
         if not self.horizontal_velocity_ready:
             self._clear_horizontal_integral(self.horizontal_velocity_reason)
             self.horizontal_controller.reset()
-            return self._horizontal_baseline_attitude(yaw) or quaternion
+            self._reset_recovery_horizontal(self.horizontal_velocity_reason)
+            return (self._horizontal_baseline_attitude(yaw) or quaternion) if self.state == W.STATE_SLOW_APPROACH else quaternion
         if not self.horizontal_equilibrium.ready:
             self._clear_horizontal_integral('平衡基准无效')
             self.horizontal_controller.reset()
+            self._reset_recovery_horizontal('恢复平衡基准无效')
             return quaternion
-        forward = self.horizontal_approach_speed if self.state == W.STATE_SLOW_APPROACH and self._approach_motion_allowed(now) else 0.
-        desired = (forward*math.cos(yaw),forward*math.sin(yaw))
         approaching = self.state == W.STATE_SLOW_APPROACH
-        integral_dt = self._horizontal_integral_interval(now) if approaching else 0.
-        quaternion = self.horizontal_controller.attitude(
-            desired,self.horizontal_measured,yaw,self.control_dt,self.horizontal_equilibrium.axis,
-            integrate=integral_dt>0.,integral_dt=integral_dt,
-            max_tilt=math.radians(5.) if approaching else None,
-            applied_axis=self.horizontal_applied_axis if approaching else None)
-        self.horizontal_candidate_axis = rotate_vector(quaternion,(0.,0.,1.))
-        if integral_dt > 0.:
-            self.horizontal_integral_reason = ('受限积分生效' if self.horizontal_controller.integral_active
-                else '限幅阻止向外积分' if self.horizontal_controller.saturated else '速度误差为零')
+        if approaching:
+            self._reset_recovery_horizontal('接近阶段不继承恢复积分', clear_departure=True)
+            forward = self.horizontal_approach_speed if self._approach_motion_allowed(now) else 0.
+            controller = self.horizontal_controller
+            integral_dt = self._horizontal_integral_interval(now)
+            dt = self.control_dt
+            baseline = self.horizontal_equilibrium.axis
+            applied = self.horizontal_applied_axis
+        else:
+            controller = self.recovery_horizontal_controller
+            forward = 0.
+            if (self.state == W.STATE_RECOVER and getattr(self, 'departure_active', False)
+                    and self.departure_feedback_valid and not self.departure_clear_confirmed):
+                forward = -self.departure_retreat_speed
+                yaw = self.departure_yaw
+            previous = self.recovery_control_at
+            dt = min(.05, max(0., (now-previous).to_sec())) if previous is not None else min(.05, max(0., self.control_dt))
+            self.recovery_control_at = now
+            integral_dt = min(dt, self._recovery_integral_interval(now))
+            baseline = self._recovery_baseline(now, dt)
+            applied = self.recovery_applied_axis
+        desired = (forward*math.cos(yaw),forward*math.sin(yaw))
+        quaternion = controller.attitude(desired,self.horizontal_measured,yaw,dt,baseline,
+            integrate=integral_dt>0.,integral_dt=integral_dt,max_tilt=math.radians(5.),applied_axis=applied)
+        axis = rotate_vector(quaternion,(0.,0.,1.))
+        if approaching:
+            self.horizontal_candidate_axis = axis
+            if integral_dt > 0.:
+                self.horizontal_integral_reason = ('受限积分生效' if controller.integral_active
+                    else '限幅阻止向外积分' if controller.saturated else '速度误差为零')
+        else:
+            self.recovery_candidate_axis = axis
+            if integral_dt > 0. and not controller.integral_active:
+                self.recovery_integral_reason = '恢复限幅阻止向外积分' if controller.saturated else '恢复速度误差为零'
         self.horizontal_velocity_active = True
         self.horizontal_velocity_reason = ('水平速度接近：目标前向%.2f m/s、横向0' % forward
-            if self.state == W.STATE_SLOW_APPROACH else '恢复水平制动：等待水平速度和姿态持续稳定')
+            if approaching else ('恢复退墙：目标前向%.2f m/s；' % forward + self.departure_clearance_reason
+                if getattr(self, 'departure_active', False) else '恢复水平制动：等待水平速度和姿态持续稳定'))
         return quaternion
 
     def _fill_horizontal_status(self, status):
+        status.departure_clearance_ready = bool(getattr(self, 'departure_clear_confirmed', False)
+            and getattr(self, 'departure_feedback_valid', False))
+        status.departure_clearance_distance_m = getattr(self, 'departure_distance', math.nan)
+        status.departure_clearance_reason = getattr(self, 'departure_clearance_reason', '未开始正常离墙')
+        recovery_controller = getattr(self, 'recovery_horizontal_controller', None)
+        recovery_integral = recovery_controller.integral if recovery_controller is not None else (0., 0.)
+        status.recovery_horizontal_integral_x, status.recovery_horizontal_integral_y = recovery_integral
+        status.recovery_horizontal_integral_active = bool(recovery_controller and recovery_controller.integral_active)
         status.horizontal_velocity_enabled = getattr(self,'horizontal_velocity_enabled',False)
         if not status.horizontal_velocity_enabled:return
         self._prepare_horizontal_prestream(status.header.stamp)
@@ -351,13 +592,15 @@ class WallHorizontalVelocityMixin:
         status.horizontal_velocity_stable = self.horizontal_velocity_stable
         status.horizontal_velocity_reason = self.horizontal_velocity_reason
         status.horizontal_velocity_x_enu_mps,status.horizontal_velocity_y_enu_mps = self.horizontal_measured
-        status.horizontal_target_x_enu_mps,status.horizontal_target_y_enu_mps = self.horizontal_controller.target
-        status.horizontal_accel_x_enu_mps2,status.horizontal_accel_y_enu_mps2 = self.horizontal_controller.acceleration
+        recovery_phase = self.state in (W.STATE_DETACH_ROTATE, W.STATE_RECOVER, W.STATE_EXIT, W.STATE_ABORT)
+        active_controller = (recovery_controller or self.horizontal_controller) if recovery_phase else self.horizontal_controller
+        status.horizontal_target_x_enu_mps,status.horizontal_target_y_enu_mps = active_controller.target
+        status.horizontal_accel_x_enu_mps2,status.horizontal_accel_y_enu_mps2 = active_controller.acceleration
         forward = (math.cos(yaw),math.sin(yaw))
-        status.horizontal_forward_target_mps = sum(a*b for a,b in zip(forward,self.horizontal_controller.target))
+        status.horizontal_forward_target_mps = sum(a*b for a,b in zip(forward,active_controller.target))
         status.horizontal_forward_measured_mps = sum(a*b for a,b in zip(forward,self.horizontal_measured))
         status.horizontal_integral_x_enu_mps2,status.horizontal_integral_y_enu_mps2 = self.horizontal_controller.integral
         status.horizontal_integral_active = self.horizontal_controller.integral_active
         status.horizontal_integral_reason = self.horizontal_integral_reason
-        status.horizontal_control_saturated = self.horizontal_controller.saturated
+        status.horizontal_control_saturated = active_controller.saturated
         status.optical_flow_quality = self.horizontal_flow.quality if self.horizontal_flow is not None else 0

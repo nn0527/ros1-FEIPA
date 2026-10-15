@@ -10,7 +10,7 @@ from px4_wall_ceiling_control.msg import WallPerchStatus as S, AttachmentControl
 from px4_wall_ceiling_control.domain.geometry import euler_from_quaternion, rotate_vector
 from px4_wall_ceiling_control.domain.recovery_attitude_limits import axis_yaw
 from test_manual_wall_approach import ManualApproachTests
-from test_flight_handover import Manager, PreflipBiasTest, OutputMux
+from test_flight_handover import Manager, PreflipBiasTest, OutputMux, wall_control_fixture
 from test_attachment_safety import WallDecision
 from test_recovery_attitude_limits import q, tilt
 
@@ -28,12 +28,15 @@ class AutoManagerTests(unittest.TestCase):
         self.assertFalse(self.n.wall.flip_ready)
         self.n._request_mode.assert_called_once_with('OFFBOARD')
     def test_no_takeover_with_invalid_or_unconfirmed_front_gate(self):
-        for field in ('front_ready','front_range_fresh','top_range_fresh','sensor_health_fresh'):
+        self.n.selected_mode = OperatorCommand.MODE_WALL
+        for field in ('front_ready','front_range_fresh','sensor_health_fresh'):
             setattr(self.n.wall,field,False)
             self.assertFalse(self.n._wall_takeover_ready(self.fixture.now),field)
             setattr(self.n.wall,field,True)
         self.n.sensor.ceiling_valid = False
-        self.assertFalse(self.n._wall_takeover_ready(self.fixture.now))
+        self.n.wall.top_range_fresh = False
+        self.n.wall.top_preflight_ready = False
+        self.assertTrue(self.n._wall_takeover_ready(self.fixture.now))
     def test_range_bypass_enters_without_any_sensor_feedback(self):
         self.n.ignore_range_loss_during_attachment=True
         for field in ('front_ready','flip_ready','front_range_fresh','top_range_fresh',
@@ -83,6 +86,13 @@ class AutoManagerTests(unittest.TestCase):
         self.n.set_mode.assert_not_called()
 
 class AutoDecisionTests(unittest.TestCase):
+    @staticmethod
+    def range_sample(distance):
+        from sensor_msgs.msg import Range
+        sample = Range(range=distance, min_range=.03, max_range=40)
+        sample.header.stamp = rospy.Time.now()  # Distinct real sensor sample, not a zero-stamp replay.
+        return sample
+
     def node(self):
         n=WallDecision.__new__(WallDecision)
         n.auto_approach=True;n.manual_approach=False;n.state=S.STATE_SLOW_APPROACH
@@ -189,18 +199,18 @@ class AutoDecisionTests(unittest.TestCase):
         n._flip_ready=WallDecision._flip_ready.__get__(n)
         for t in [10.,10.1,10.2,10.3]:
             with mock.patch.object(rospy.Time,'now',return_value=rospy.Time.from_sec(t)):
-                n._on_front_range(Range(range=.5,min_range=.03,max_range=40))
+                n._on_front_range(self.range_sample(.5))
         self.assertFalse(n._front_ready(rospy.Time.from_sec(10.3)))
         with mock.patch.object(rospy.Time,'now',return_value=rospy.Time.from_sec(10.4)):
-            n._on_front_range(Range(range=.5,min_range=.03,max_range=40))
+            n._on_front_range(self.range_sample(.5))
         self.assertTrue(n._front_ready(rospy.Time.from_sec(10.4)))
         self.assertFalse(n._flip_ready(rospy.Time.from_sec(10.4)))
         for t in [10.5,10.6,10.7]:
             with mock.patch.object(rospy.Time,'now',return_value=rospy.Time.from_sec(t)):
-                n._on_front_range(Range(range=.2,min_range=.03,max_range=40))
+                n._on_front_range(self.range_sample(.2))
         self.assertFalse(n._flip_ready(rospy.Time.from_sec(10.7)))
         with mock.patch.object(rospy.Time,'now',return_value=rospy.Time.from_sec(10.8)):
-            n._on_front_range(Range(range=.2,min_range=.03,max_range=40))
+            n._on_front_range(self.range_sample(.2))
         self.assertTrue(n._flip_ready(rospy.Time.from_sec(10.8)))
         n._update_state_machine(rospy.Time.from_sec(10.8))
         self.assertEqual(n.state,S.STATE_FLIP_TO_WALL)
@@ -217,7 +227,7 @@ class AutoDecisionTests(unittest.TestCase):
         n._update_state_machine(rospy.Time.from_sec(10.1))
         n._auto_approach_ranges_ready=lambda *a:True
         with mock.patch.object(rospy.Time,'now',return_value=rospy.Time.from_sec(10.2)):
-            n._on_front_range(Range(range=.2,min_range=.03,max_range=40))
+            n._on_front_range(self.range_sample(.2))
         self.assertFalse(n._flip_ready(rospy.Time.from_sec(10.2)))
         self.assertEqual(n.flip_ready_since,rospy.Time.from_sec(10.2))
 
@@ -234,6 +244,10 @@ class AutoOutputTests(unittest.TestCase):
         n.approach_tilt_slew_deg_s=10;n.approach_yaw_slew_deg_s=20
         n.approach_target_publisher=mock.Mock();n.approach_previous_target=q();n.approach_previous_at=now
         n.wall_status.state=S.STATE_SLOW_APPROACH;n.odom=Odometry();n.odom.pose.pose.orientation.w=1
+        n.wall_output_enabled=True;n.wall_candidate_timeout_s=.2;n.owner=OutputMux.OWNER_NONE
+        with mock.patch.object(rospy.Time,'now',return_value=now):
+            n._on_wall_candidate(wall_control_fixture(S.STATE_SLOW_APPROACH,now))
+        self.assertTrue(n._wall_fresh(now))
         return n,now
     def test_sum_then_total_cone_limit_preserves_direction(self):
         n,now=self.node();n.preflip_bias_rad=math.radians(1.7)
@@ -260,6 +274,7 @@ class AutoOutputTests(unittest.TestCase):
         self.assertAlmostEqual(out.thrust,.47)
     def test_pause_clears_bias_and_slews_toward_level(self):
         n,now=self.node();n.preflip_bias_rad=math.radians(1.7);n.wall_status.approach_paused=True
+        n.wall_candidate.approach_paused=True
         v=n._preflip_bias_attitude(now,Quaternion(w=1),C.SOURCE_WALL)
         self.assertEqual(n.preflip_bias_rad,0);self.assertEqual(v.x,0)
         n.approach_previous_target=q(3.45,0)
@@ -269,6 +284,7 @@ class AutoOutputTests(unittest.TestCase):
     def test_limit_and_bias_excluded_from_protected_phases(self):
         for state in (S.STATE_FLIP_TO_WALL,S.STATE_WALL_CAPTURE,S.STATE_WALL_HOLD,S.STATE_DETACH_ROTATE,S.STATE_RECOVER,S.STATE_ABORT,S.STATE_EXIT):
             n,now=self.node();n.wall_status.state=state
+            n.wall_candidate.control_phase=state
             v=q(80,0);target=AttitudeTarget(orientation=Quaternion(x=v[0],y=v[1],z=v[2],w=v[3]),thrust=.7)
             out=n._limit_final_approach_target(now,target,C.SOURCE_WALL)
             self.assertAlmostEqual(tilt(tuple(getattr(out.orientation,k) for k in 'xyzw')),80)
@@ -285,10 +301,11 @@ class AutoOutputTests(unittest.TestCase):
         n,now=self.node();raw=q(12,45)
         n._assisted_attitude=mock.Mock(return_value=Quaternion(x=raw[0],y=raw[1],z=raw[2],w=raw[3]))
         n._attitude_target=lambda stamp,v,u:AttitudeTarget(orientation=v,thrust=u)
-        n._limit_final_recovery_target=lambda stamp,v,source:v
+        n._limit_final_recovery_target=lambda stamp,v,source,candidate=None:v
         n.attitude_publisher=mock.Mock()
-        candidate=C(kind=C.KIND_ATTITUDE_THRUST,source=C.SOURCE_WALL,thrust_normalized=.47)
-        n._publish_candidate(rospy.Time.from_sec(10.02),candidate)
+        candidate=n.wall_candidate
+        with mock.patch.object(rospy.Time,'now',return_value=rospy.Time.from_sec(10.02)):
+            n._publish_candidate(rospy.Time.from_sec(10.02),candidate)
         sent=n.attitude_publisher.publish.call_args[0][0]
         self.assertLessEqual(tilt(tuple(getattr(sent.orientation,k) for k in 'xyzw')),.2+1e-6)
 

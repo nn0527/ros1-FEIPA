@@ -130,6 +130,8 @@ class FlightModeManagerNode:
         self.recovery_seen = False
         self.completed = False
         self.fault_seen = False
+        self.wall_fault_return_ready = False
+        self.wall_failure_reason = ""
         self.ceiling_approach_timeout_returning = False
         self.wall_approach_timeout_returning = False
         self.wall_timeout_stable_since = self.wall_timeout_last_odom = None
@@ -354,8 +356,6 @@ class FlightModeManagerNode:
         if selected == OperatorCommand.MODE_CEILING:
             return None if self.sensor.ceiling_valid else "ceiling sensor invalid"
         if selected == OperatorCommand.MODE_WALL:
-            if not self.sensor.ceiling_valid:
-                return "ceiling sensor invalid"
             if not self.sensor.front_valid:
                 return "front sensor invalid"
             return None
@@ -422,10 +422,10 @@ class FlightModeManagerNode:
         # Do not manufacture front_ready: valid distance still gates the flip.
         if getattr(self, "ignore_range_loss_during_attachment", False):
             return True
-        return bool(wall.front_ready and wall.front_range_fresh and wall.top_range_fresh
-                    and wall.sensor_health_fresh and wall.top_preflight_ready
+        return bool(wall.front_ready and wall.front_range_fresh
+                    and wall.sensor_health_fresh
                     and self.sensor is not None and is_fresh(self.sensor_at, self.sensor_timeout_s, now)
-                    and self.sensor.front_valid and self.sensor.ceiling_valid)
+                    and self.sensor.front_valid)
 
     def _manual_wall_selected(self):
         return getattr(self, "wall_manual_approach", False) and self.selected_mode == OperatorCommand.MODE_WALL
@@ -434,11 +434,11 @@ class FlightModeManagerNode:
         wall = self.wall
         return bool(wall is not None and is_fresh(self.wall_at, self.status_timeout_s, now)
                     and wall.state == WallPerchStatus.STATE_IDLE
-                    and wall.flip_ready and wall.front_range_fresh and wall.top_range_fresh
+                    and wall.flip_ready and wall.front_range_fresh
                     and (not getattr(wall,"horizontal_equilibrium_enabled",False) or wall.horizontal_equilibrium_valid)
-                    and wall.top_preflight_ready and wall.entry_height_ready
+                    and wall.entry_height_ready
                     and self.sensor is not None and is_fresh(self.sensor_at, self.sensor_timeout_s, now)
-                    and self.sensor.front_valid and self.sensor.ceiling_valid)
+                    and self.sensor.front_valid)
 
     def _manual_wait_elapsed(self, monotonic_now):
         return monotonic_now - self.manual_wall_wait_started
@@ -598,7 +598,7 @@ class FlightModeManagerNode:
                     self._request_mode(self._pilot_mode())
             else:
                 self.cancel_entry_stable_since = None
-            self.phase_reason = "取消接管处理中：已检测到OFFBOARD，保持受限输出并等待安全交回" + self._pilot_mode()
+            self.phase_reason = "取消接管处理中：已检测到OFFBOARD，进行有界竖直闭环稳定，等待安全交回" + self._pilot_mode()
         elif flight_mode == self._pilot_mode():
             self.cancel_entry_stable_since = None
             # Two new FCU heartbeats, quiescent service worker and a full entry
@@ -617,18 +617,19 @@ class FlightModeManagerNode:
             self.phase_reason = "取消接管处理中：飞控为" + flight_mode + "；等待飞手回到" + self._pilot_mode()
 
     def _rc_fresh(self, now):
+        # Frame validity is independent of optional calibrated centering channels.
         channels = getattr(self, "rc_channels", None)
-        indices = (
-            self.rc_roll_channel_index,
-            self.rc_pitch_channel_index,
-            self.rc_throttle_channel_index,
-        )
-        return bool(
-            channels is not None
-            and is_fresh(getattr(self, "rc_at", None), self.rc_timeout_s, now)
-            and all(0 <= index < len(channels) for index in indices)
-            and all(800 <= channels[index] <= 2200 for index in indices)
-        )
+        if (channels is None
+                or not is_fresh(getattr(self, "rc_at", None), self.rc_timeout_s, now)):
+            return False
+        if not getattr(self, "require_rc_center", False):
+            return bool(len(channels) >= 4
+                        and all(800 <= value <= 2200 for value in channels[:4]))
+        indices = (self.rc_roll_channel_index, self.rc_pitch_channel_index,
+                   self.rc_throttle_channel_index)
+        return bool(len(set(indices)) == 3
+                    and all(0 <= index < len(channels) for index in indices)
+                    and all(800 <= channels[index] <= 2200 for index in indices))
 
     def _ceiling_baro_handover_ready(self, now):
         status = getattr(self, "ceiling", None)
@@ -663,7 +664,8 @@ class FlightModeManagerNode:
         recovered=bool(getattr(self,"wall_approach_timeout_returning",False)
             and self.selected_mode == OperatorCommand.MODE_WALL and wall is not None
             and is_fresh(self.wall_at,self.status_timeout_s,now)
-            and wall.state == WallPerchStatus.STATE_EXIT and wall.recovery_completed)
+            and wall.state == WallPerchStatus.STATE_EXIT
+            and getattr(wall, "fault_recovery_completed", False))
         if not self._wall_approach_timeout_requested(now) and not recovered:
             return "等待新鲜的接近超时/恢复完成状态"
         f=self.flight
@@ -773,10 +775,10 @@ class FlightModeManagerNode:
                 and abs(vertical_speed) > self.handover_max_vertical_speed_mps)
         ):
             return False
-        if not getattr(self, "require_rc_center", False):
-            return True
         if not self._rc_fresh(now):
             return False
+        if not getattr(self, "require_rc_center", False):
+            return True
         return all(
             abs(self.rc_channels[index] - self.rc_pwm_center)
             <= self.rc_center_tolerance_pwm
@@ -819,21 +821,35 @@ class FlightModeManagerNode:
             status, received_at = self.wall, self.wall_at
             if status is None or not is_fresh(received_at, self.status_timeout_s, now):
                 return
-            if status.state == WallPerchStatus.STATE_EXIT and getattr(status, "recovery_completed", False):
-                self.completed = True
-            if status.state == WallPerchStatus.STATE_ABORT:
+            if status.state == WallPerchStatus.STATE_ABORT or status.fault_detected:
                 self.fault_seen = True
+                self.wall_failure_reason = str(status.reason) or "侧吸故障"
+                self.completed = False
             if status.state == WallPerchStatus.STATE_DETACH_ROTATE:
                 self.detach_seen = True
             elif self.detach_seen and status.state == WallPerchStatus.STATE_RECOVER:
                 self.recovery_seen = True
-            elif (
-                self.recovery_seen
-                and status.state in (WallPerchStatus.STATE_EXIT, WallPerchStatus.STATE_IDLE)
-                and not status.fault_detected
-                and not self.fault_seen
-            ):
-                self.completed = True
+            if status.state == WallPerchStatus.STATE_EXIT:
+                if getattr(status, "fault_recovery_completed", False):
+                    # Safe leveling after ABORT authorizes a fault handback,
+                    # never a successful detach/recover result. Explicit flags
+                    # also cover a manager that missed intermediate samples.
+                    self.fault_seen = True
+                    self.completed = False
+                    self.wall_fault_return_ready = True
+                    if not getattr(self, "wall_failure_reason", ""):
+                        self.wall_failure_reason = str(status.reason) or "侧吸故障"
+                elif (getattr(status, "detach_completed", False)
+                      and getattr(status, "recovery_completed", False)
+                      and not status.fault_detected and not self.fault_seen):
+                    self.completed = True
+
+    def _wall_return_reason(self, confirmed=False):
+        if getattr(self, "wall_fault_return_ready", False):
+            result = "故障恢复后已安全交回" if confirmed else "故障恢复完成，准备安全交回"
+            return result + self._pilot_mode() + "；本次侧吸未正常完成：" + getattr(self, "wall_failure_reason", "侧吸故障")
+        result = "正常脱离及恢复完成，已交回" if confirmed else "正常脱离及恢复完成，准备交回"
+        return result + self._pilot_mode()
 
     def _wall_approach_aborted(self, now):
         return bool(self.selected_mode == OperatorCommand.MODE_WALL
@@ -951,6 +967,8 @@ class FlightModeManagerNode:
         self.recovery_seen = False
         self.completed = False
         self.fault_seen = False
+        self.wall_fault_return_ready = False
+        self.wall_failure_reason = ""
         self.lock_until_neutral = lock
         self.ceiling_approach_timeout_returning = False
         self._set_phase(self.LOCKED if lock else self.IDLE, reason=reason)
@@ -1133,10 +1151,13 @@ class FlightModeManagerNode:
                     self._set_phase(self.RETURNING, reason=self.ceiling.reason)
                     if self._handover_ready(now):
                         self._request_mode(self._pilot_mode())
-                elif (self.completed and self.owner_seen
+                elif ((self.completed or (self.selected_mode == OperatorCommand.MODE_WALL
+                                         and getattr(self, "wall_fault_return_ready", False)))
+                    and self.owner_seen
                     and (self.owner == 0 or (self.selected_mode == OperatorCommand.MODE_WALL and self.owner == 2))
                     and is_fresh(self.owner_at, self.output_timeout_s, now)):
-                    self._set_phase(self.RETURNING)
+                    self._set_phase(self.RETURNING, reason=(self._wall_return_reason()
+                        if self.selected_mode == OperatorCommand.MODE_WALL else None))
                 elif (
                     not self.owner_seen
                     and monotonic_now - self.phase_since > self.acquire_timeout_s
@@ -1158,7 +1179,10 @@ class FlightModeManagerNode:
             elif flight_fresh and self.flight.connected and flight_mode == self._pilot_mode():
                 self._reset(
                     lock=True,
-                    reason="returned to {}; release command before retry".format(self._pilot_mode()),
+                    reason=(self._wall_return_reason(confirmed=True) + "；释放请求后可重试"
+                        if self.selected_mode == OperatorCommand.MODE_WALL
+                        and (self.completed or getattr(self, "wall_fault_return_ready", False))
+                        else "returned to {}; release command before retry".format(self._pilot_mode())),
                 )
             elif flight_fresh and flight_mode == "OFFBOARD" and self._handover_ready(now):
                 self._request_mode(self._pilot_mode())
@@ -1169,7 +1193,10 @@ class FlightModeManagerNode:
                 elif getattr(self, "ceiling_approach_timeout_returning", False):
                     self.phase_reason = "吸顶接近超时：保持FAULT，等待有效遥控输入、飞控估计和连续输出后请求ALTCTL"
                 else:
-                    self.phase_reason = "等待水平速度、姿态持续稳定和新鲜有效估计后交回" + self._pilot_mode()
+                    prefix = (self._wall_return_reason() + "；"
+                        if getattr(self, "selected_mode", None) == OperatorCommand.MODE_WALL
+                        and (self.completed or getattr(self, "wall_fault_return_ready", False)) else "")
+                    self.phase_reason = prefix + "等待水平速度、姿态持续稳定和新鲜有效估计后交回" + self._pilot_mode()
             elif flight_fresh:
                 failure_reason = "unexpected flight mode during return: {}".format(
                     flight_mode or "unknown"
@@ -1191,5 +1218,7 @@ class FlightModeManagerNode:
 
 if __name__ == "__main__":
     rospy.init_node("flight_mode_manager_node")
+    from px4_wall_ceiling_control.adapters.async_logging import install_ros_async_logging
+    install_ros_async_logging(rospy)
     FlightModeManagerNode()
     rospy.spin()

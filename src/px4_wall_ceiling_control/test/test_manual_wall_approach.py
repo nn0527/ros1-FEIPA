@@ -185,7 +185,7 @@ class ManualApproachTests(unittest.TestCase):
         n.manual_approach = True
         n.cancel_requested = n.rearm_required = False
         n._mode_requested = n._entry_height_ready = n._safety_ok = lambda *args: True
-        n._flip_ready = n._top_fresh = n._sensor_health_fresh = lambda *_: True
+        n._flip_ready = n._front_fresh = n._top_fresh = n._sensor_health_fresh = lambda *_: True
         n.sensor_health = SensorHealth(front_valid=True, ceiling_valid=True)
         transitions = []
         def enter(state, *_):
@@ -254,6 +254,8 @@ class BenchRangeGraceTests(unittest.TestCase):
         n.bench_wait_for_ranges = True
         n.require_top_sensor_on_acquire = True
         n.top_range = Range(range=.04, min_range=.03, max_range=40)
+        n.top_range.header.stamp = rospy.Time.from_sec(10)
+        n.top_source_stamp = n.top_range.header.stamp
         n.top_filtered_m = .04
         n.top_received_at = rospy.Time.from_sec(10)
         n.sensor_timeout_s, n.sensor_health_timeout_s = .6, .3
@@ -277,12 +279,14 @@ class BenchRangeGraceTests(unittest.TestCase):
 
     def test_persistent_range_loss_still_stops_after_original_timeout(self):
         n = self.node()
+        n.state = WallPerchStatus.STATE_WALL_HOLD
         now = rospy.Time.from_sec(10.61)
         n.sensor_health_received_at = now
         self.assertFalse(n._safety_ok(now))
 
     def test_extended_bench_timeout_tolerates_1_1_seconds_but_not_1_21(self):
         n = self.node()
+        n.state = WallPerchStatus.STATE_WALL_HOLD
         n.sensor_timeout_s = 1.2
         for age, safe in [(1.1, True), (1.21, False)]:
             now = rospy.Time.from_sec(10 + age)
@@ -297,11 +301,14 @@ class BenchRangeGraceTests(unittest.TestCase):
 
     def test_sensor_manager_loss_still_stops_even_with_valid_range(self):
         n = self.node()
+        n.state = WallPerchStatus.STATE_WALL_HOLD
         n.top_received_at = rospy.Time.from_sec(10.4)
+        n.top_range.header.stamp = n.top_source_stamp = n.top_received_at
         self.assertFalse(n._safety_ok(rospy.Time.from_sec(10.4)))
 
     def test_normal_flight_keeps_instantaneous_health_requirement(self):
         n = self.node()
+        n.state = WallPerchStatus.STATE_WALL_HOLD
         n.bench_wait_for_ranges = False
         self.assertFalse(n._safety_ok(rospy.Time.from_sec(10.1)))
 
@@ -315,15 +322,23 @@ class BenchRangeGraceTests(unittest.TestCase):
 
     def test_invalid_sample_never_refreshes_distance_and_restarts_confirmation(self):
         n = self.node()
+        n.state = WallPerchStatus.STATE_WALL_HOLD
+        n.top_hold_filter_alpha = 1.0
+        n.top_capture_samples = []
+        n.top_capture_near_samples = 0
+        invalid = Range(range=float('nan'), min_range=.03, max_range=40)
+        invalid.header.stamp = rospy.Time.from_sec(10.2)
         with mock.patch.object(rospy.Time, 'now', return_value=rospy.Time.from_sec(10.2)):
-            n._on_top_range(Range(range=float('nan'), min_range=.03, max_range=40))
+            n._on_top_range(invalid)
         self.assertEqual(n.top_received_at, rospy.Time.from_sec(10))
         self.assertEqual(n.top_filtered_m, .04)
         self.assertFalse(n._top_contact_ready(rospy.Time.from_sec(10.2)))
         for t in [10.3, 10.5, 10.7, 10.9, 11.1, 11.3, 11.5]:
             now = rospy.Time.from_sec(t)
+            sample = Range(range=.04, min_range=.03, max_range=40)
+            sample.header.stamp = now
             with mock.patch.object(rospy.Time, 'now', return_value=now):
-                n._on_top_range(Range(range=.04, min_range=.03, max_range=40))
+                n._on_top_range(sample)
             if t < 11.3:
                 self.assertFalse(n._top_contact_ready(now))
         self.assertTrue(n._top_contact_ready(now))

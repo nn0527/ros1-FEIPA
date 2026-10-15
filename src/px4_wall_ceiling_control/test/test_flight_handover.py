@@ -23,6 +23,22 @@ from px4_wall_ceiling_control.msg import (
 from px4_wall_ceiling_control.domain.geometry import euler_from_quaternion
 
 
+def wall_control_fixture(state, now, paused=False):
+    """Atomic phase metadata for helpers; /wall/status is only telemetry now."""
+    candidate = AttachmentControlCandidate(
+        source=AttachmentControlCandidate.SOURCE_WALL,
+        kind=AttachmentControlCandidate.KIND_ATTITUDE_THRUST,
+        phase_valid=True, control_phase=state, maneuver_id="wall-output-fixture",
+        control_sequence=1, approach_paused=paused, valid=True,
+        acquire_request=state in (WallPerchStatus.STATE_FRONT_WALL_DETECT,
+                                 WallPerchStatus.STATE_SLOW_APPROACH,
+                                 WallPerchStatus.STATE_FLIP_TO_WALL),
+        keep_ownership=state != WallPerchStatus.STATE_IDLE,
+        attitude_setpoint=Quaternion(w=1), thrust_normalized=.47)
+    candidate.header.stamp = now
+    return candidate
+
+
 def load_script(name):
     path = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", "scripts", "operator", name + ".py")
@@ -121,6 +137,7 @@ class FlightHandoverTest(unittest.TestCase):
         output = node._assisted_attitude(
             rospy.Time.from_sec(10.01), orientation,
             AttachmentControlCandidate.SOURCE_WALL,
+            wall_control_fixture(WallPerchStatus.STATE_WALL_HOLD, rospy.Time.from_sec(10.01)),
         )
         roll = euler_from_quaternion((output.x, output.y, output.z, output.w))[0]
         self.assertLessEqual(math.degrees(roll), 2.001)
@@ -552,7 +569,8 @@ class FlightHandoverTest(unittest.TestCase):
             for i in range(1,21):
                 t=rospy.Time.from_sec(10+i*.1)
                 node.rc_at=node.flight_state_at=node.wall_status_at=t
-                out=node._assisted_attitude(t,base,AttachmentControlCandidate.SOURCE_WALL)
+                out=node._assisted_attitude(t,base,AttachmentControlCandidate.SOURCE_WALL,
+                    wall_control_fixture(state,t))
             roll,pitch,yaw=map(math.degrees,euler_from_quaternion((out.x,out.y,out.z,out.w)))
             self.assertAlmostEqual(roll,limits[0],places=4)
             self.assertAlmostEqual(pitch,30,places=4)
@@ -579,14 +597,16 @@ class FlightHandoverTest(unittest.TestCase):
         node.wall_status.state=WallPerchStatus.STATE_FLIP_TO_WALL
         node.rc_roll_rad=math.radians(5);node.rc_yaw_rad=math.radians(15)
         base=Quaternion(y=math.sin(math.radians(85)/2),w=math.cos(math.radians(85)/2))
-        out=node._assisted_attitude(rospy.Time.from_sec(10.1),base,AttachmentControlCandidate.SOURCE_WALL)
+        out=node._assisted_attitude(rospy.Time.from_sec(10.1),base,AttachmentControlCandidate.SOURCE_WALL,
+            wall_control_fixture(WallPerchStatus.STATE_FLIP_TO_WALL,rospy.Time.from_sec(10.1)))
         self.assertAlmostEqual(out.y,base.y);self.assertAlmostEqual(out.w,base.w)
         self.assertEqual(node.rc_roll_rad,0);self.assertEqual(node.rc_yaw_rad,0)
 
     def test_roll_yaw_slew_lost_rc_and_altctl_reset(self):
         node,now=self._roll_yaw_fixture()
         t=rospy.Time.from_sec(10.1)
-        out=node._assisted_attitude(t,Quaternion(w=1),AttachmentControlCandidate.SOURCE_WALL)
+        out=node._assisted_attitude(t,Quaternion(w=1),AttachmentControlCandidate.SOURCE_WALL,
+            wall_control_fixture(WallPerchStatus.STATE_RECOVER,t))
         self.assertAlmostEqual(math.degrees(node.rc_roll_rad),1)
         self.assertAlmostEqual(math.degrees(node.rc_yaw_rad),-2)
         node.rc_channels=(1500,9999,9999,1500)  # Pitch/throttle are not assist inputs.
@@ -594,11 +614,13 @@ class FlightHandoverTest(unittest.TestCase):
         self.assertTrue(node._rc_ready(t))
         node.rc_at=rospy.Time.from_sec(9)
         with mock.patch.object(rospy,"logwarn_throttle"):
-            node._assisted_attitude(rospy.Time.from_sec(10.2),Quaternion(w=1),AttachmentControlCandidate.SOURCE_WALL)
+            node._assisted_attitude(rospy.Time.from_sec(10.2),Quaternion(w=1),AttachmentControlCandidate.SOURCE_WALL,
+                wall_control_fixture(WallPerchStatus.STATE_RECOVER,rospy.Time.from_sec(10.2)))
         self.assertAlmostEqual(node.rc_roll_rad,0)
         self.assertAlmostEqual(node.rc_yaw_rad,0)
         node.rc_roll_rad=.1;node.rc_yaw_rad=.2;node.flight_state.mode="ALTCTL"
-        out=node._assisted_attitude(t,Quaternion(w=1),AttachmentControlCandidate.SOURCE_WALL)
+        out=node._assisted_attitude(t,Quaternion(w=1),AttachmentControlCandidate.SOURCE_WALL,
+            wall_control_fixture(WallPerchStatus.STATE_RECOVER,t))
         self.assertEqual(out,Quaternion(w=1))
         self.assertEqual(node.rc_roll_rad,0);self.assertEqual(node.rc_yaw_rad,0)
 
@@ -991,7 +1013,8 @@ class PreflipBiasTest(unittest.TestCase):
         for state in range(WallPerchStatus.STATE_ABORT+1):
             node.wall_status.state = state
             node.preflip_bias_rad = math.radians(1)
-            q = node._preflip_bias_attitude(now, Quaternion(w=1), AttachmentControlCandidate.SOURCE_WALL)
+            q = node._preflip_bias_attitude(now, Quaternion(w=1), AttachmentControlCandidate.SOURCE_WALL,
+                                           wall_control_fixture(state, now))
             roll = euler_from_quaternion((q.x,q.y,q.z,q.w))[0]
             if state <= WallPerchStatus.STATE_SLOW_APPROACH:
                 self.assertAlmostEqual(roll, math.radians(1))

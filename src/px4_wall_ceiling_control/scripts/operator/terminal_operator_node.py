@@ -226,5 +226,7 @@ class TerminalOperatorNode:
 
 if __name__ == "__main__":
     rospy.init_node("terminal_operator_node")
+    from px4_wall_ceiling_control.adapters.async_logging import install_ros_async_logging
+    install_ros_async_logging(rospy)
     TerminalOperatorNode()
     rospy.spin()

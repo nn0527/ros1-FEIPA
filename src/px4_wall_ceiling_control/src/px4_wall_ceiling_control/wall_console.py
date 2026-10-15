@@ -208,7 +208,7 @@ class ConsoleState:
                     request.update(state="ACTIVE",reason="PX4已确认OFFBOARD，吸顶流程执行中")
                 elif self.ceiling_request_seen and val("operator",{}).get("mode")==1 and val("phase") in ("IDLE","LOCKED"):
                     request.update(state="RELEASED",reason=val("reason") or "吸顶请求已释放，请核对急停和飞控状态")
-            return {"ceiling_request":request,"can_ceiling": not ceiling_blockers, "ceiling_blockers": ceiling_blockers,
+            return {"mavros_repair": dict(getattr(self, "mavros_repair", {"state": "IDLE", "reason": "尚未执行连接修复"})), "ceiling_request":request,"can_ceiling": not ceiling_blockers, "ceiling_blockers": ceiling_blockers,
                     "can_ceiling_detach": ceiling_detach_ok, "status": status, "checks": [{"id": i, "label": label, "ok": ok, "reason": reason}
                     for i, label, ok, reason in checks], "blockers": blockers, "can_wall": not blockers and not self.starting,
                     "success": bool(success), "starting": self.starting, "pending": pending,

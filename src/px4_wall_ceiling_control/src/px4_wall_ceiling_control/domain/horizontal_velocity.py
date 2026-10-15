@@ -88,7 +88,7 @@ class HorizontalVelocityController:
             limit = 9.80665*math.tan(max_tilt)
             self.saturated |= math.hypot(*horizontal) >= limit-1e-12
             horizontal = self._bounded(horizontal,limit)
-        # Recovery callers retain the original P controller and mux limits.
+        # Callers use separate controller instances for approach and recovery history.
         axis = (*horizontal,9.80665)
         norm = math.sqrt(sum(value*value for value in axis))
         return attitude_from_axis_yaw(tuple(value/norm for value in axis),yaw)

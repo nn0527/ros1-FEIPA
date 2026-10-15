@@ -1156,5 +1156,7 @@ class CeilingAttachmentDecisionNode:
 
 if __name__ == "__main__":
     rospy.init_node("ceiling_attachment_decision_node")
+    from px4_wall_ceiling_control.adapters.async_logging import install_ros_async_logging
+    install_ros_async_logging(rospy)
     CeilingAttachmentDecisionNode()
     rospy.spin()

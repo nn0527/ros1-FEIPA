@@ -32,6 +32,40 @@ def is_fresh_receipt(received_at, timeout_s, now=None):
     return is_fresh(received_at, timeout_s, current)
 
 
+def is_fresh_source(stamp, timeout_s, now=None, future_tolerance_s=0.1):
+    """Validate a *source* timestamp separately from local receipt freshness.
+
+    MAVROS maps FCU sample times into ROS time; a bounded mapping lead is
+    allowed, but missing/zero stamps never authorize feedback. Locally
+    generated commands must pass future_tolerance_s=0.0. This helper does not
+    prove clock synchronization or sample uniqueness; callers also reject
+    duplicate/out-of-order samples and retain independent receipt timeouts.
+    """
+    if stamp is None:
+        return False
+    try:
+        source = stamp.to_sec()
+        current = (now if now is not None else rospy.Time.now()).to_sec()
+        timeout = float(timeout_s)
+        future = float(future_tolerance_s)
+        if not all(math.isfinite(v) for v in (source, current, timeout, future)):
+            return False
+        if source <= 0.0 or timeout < 0.0 or future < 0.0:
+            return False
+        # A callback can deliver a sample during a timer whose 'now' was read
+        # slightly earlier. Compare against the live clock before declaring a
+        # future sample; do not extend the configured source-age limit.
+        if source > current:
+            try:
+                current = max(current, rospy.Time.now().to_sec())
+            except rospy.exceptions.ROSInitException:
+                pass
+        age = current - source
+        return math.isfinite(age) and -future <= age <= timeout
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return False
+
+
 def is_valid_range(message):
     """Validate a sensor_msgs/Range without treating +/-inf as a command."""
     if message is None or not math.isfinite(message.range):
@@ -43,4 +77,3 @@ def is_valid_range(message):
 
 def clamp(value, lower, upper):
     return max(lower, min(upper, value))
-
