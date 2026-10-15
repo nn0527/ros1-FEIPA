@@ -83,12 +83,14 @@ class EquilibriumHandoverTests(unittest.TestCase):
         for t in (10.,10.25,10.5,10.75,11.,11.25,11.5):self.sample(t)
         self.assertTrue(self.n.horizontal_equilibrium.ready)
         self.assertTrue(self.n.horizontal_velocity_ready)
-    def test_equilibrium_requires_full_second_below_three_centimetres_per_second(self):
-        for t in (10.,10.25,10.5,10.75,11.,11.25,11.5):self.sample(t,velocity=.031)
+    def test_equilibrium_requires_half_second_below_ten_centimetres_per_second(self):
+        self.assertAlmostEqual(self.n.horizontal_equilibrium_speed,.10)
+        self.assertAlmostEqual(self.n.horizontal_equilibrium.window,.5)
+        for t in (10.,10.25,10.5,10.75,11.,11.25,11.5):self.sample(t,velocity=.101)
         self.assertFalse(self.n.horizontal_equilibrium.ready)
-        for t in (11.75,12.,12.25,12.5):self.sample(t,velocity=.029)
+        for t in (11.75,12.):self.sample(t,velocity=.10)
         self.assertFalse(self.n.horizontal_equilibrium.ready)
-        self.sample(12.75,velocity=.029)
+        self.sample(12.25,velocity=.10)
         self.assertTrue(self.n.horizontal_equilibrium.ready)
 
     def test_no_entry_baseline_from_moving_or_untracked_attitude(self):

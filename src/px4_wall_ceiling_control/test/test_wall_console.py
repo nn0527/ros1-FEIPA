@@ -448,6 +448,18 @@ class ConsoleTests(unittest.TestCase):
             self.state.send_wall(self.publisher)
         self.publisher.assert_not_called()
 
+    def test_wall_range_faults_are_warnings_without_blocking_entry(self):
+        self.ready()
+        self.state.update('runtime',{'enabled':True,'wall_range_faults_diagnostic_only':True})
+        self.state.update('health',{'front_valid':False,'ceiling_valid':False})
+        snapshot=self.state.snapshot()
+        self.assertTrue(snapshot['can_wall'])
+        self.assertEqual(len(snapshot['sensor_warnings']),2)
+        self.state.samples['health']['at']=0
+        self.assertTrue(self.state.snapshot()['can_wall'])
+        self.state.update('odom',{'finite':False})
+        self.assertFalse(self.state.snapshot()['can_wall'])
+
     def test_restrained_bench_ignores_entry_height_and_sensor_not_flight_feedback(self):
         self.ready()
         self.state.config["test_profile"] = "restrained_bench"

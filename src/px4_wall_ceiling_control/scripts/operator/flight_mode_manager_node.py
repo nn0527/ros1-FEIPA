@@ -344,7 +344,7 @@ class FlightModeManagerNode:
             getattr(self, "wall_bench_wait_for_ranges", False)
             or getattr(self, "ignore_range_loss_during_attachment", False)
         ):
-            return None  # Range faults are diagnostic; valid ranges still gate initial takeover.
+            return None  # Range faults are diagnostic; automatic takeover does not require ranges.
         if selected == OperatorCommand.MODE_CEILING and getattr(self, "ceiling_distance_gate_enabled", False):
             return None  # Decision pauses on range loss; takeover still requires its valid gate.
         if self.sensor is None:
@@ -412,11 +412,18 @@ class FlightModeManagerNode:
         if not self._auto_wall_selected():
             return self._manual_wall_ready(now)
         wall = self.wall
-        return bool(wall is not None and is_fresh(self.wall_at, self.status_timeout_s, now)
-                    and wall.state == WallPerchStatus.STATE_IDLE and wall.front_ready
-                    and (not getattr(wall,"horizontal_equilibrium_enabled",False) or wall.horizontal_equilibrium_valid)
-                    and wall.front_range_fresh and wall.top_range_fresh and wall.sensor_health_fresh
-                    and wall.top_preflight_ready and wall.entry_height_ready
+        if not (wall is not None and is_fresh(self.wall_at, self.status_timeout_s, now)
+                and wall.state == WallPerchStatus.STATE_IDLE
+                and (not getattr(wall, "horizontal_equilibrium_enabled", False)
+                     or wall.horizontal_equilibrium_valid)
+                and wall.entry_height_ready):
+            return False
+        # This bypass applies before OFFBOARD as well as during attachment.
+        # Do not manufacture front_ready: valid distance still gates the flip.
+        if getattr(self, "ignore_range_loss_during_attachment", False):
+            return True
+        return bool(wall.front_ready and wall.front_range_fresh and wall.top_range_fresh
+                    and wall.sensor_health_fresh and wall.top_preflight_ready
                     and self.sensor is not None and is_fresh(self.sensor_at, self.sensor_timeout_s, now)
                     and self.sensor.front_valid and self.sensor.ceiling_valid)
 
@@ -442,6 +449,8 @@ class FlightModeManagerNode:
             wall=getattr(self,"wall",None)
             if wall is not None and getattr(wall,"horizontal_equilibrium_enabled",False) and not wall.horizontal_equilibrium_valid:
                 return "等待接管平衡基准：" + wall.horizontal_equilibrium_reason
+            if getattr(self, "ignore_range_loss_during_attachment", False):
+                return "等待自动接近接管：保持 {}；雷达仅告警，等待高度、平衡基准及预发送就绪，剩余 {:.0f} 秒".format(self._pilot_mode(), remaining)
             return "等待自动接近接管：保持 {}；前距≤0.50 m连续0.40 s且两路雷达有效，等待窗口剩余 {:.0f} 秒".format(self._pilot_mode(),remaining)
         return "等待飞手手动接近：保持 {}；需有效距离连续满足翻转阈值，等待窗口剩余 {:.0f} 秒".format(self._pilot_mode(),remaining)
 

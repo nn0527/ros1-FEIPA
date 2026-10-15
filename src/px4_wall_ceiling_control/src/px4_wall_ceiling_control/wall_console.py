@@ -117,6 +117,7 @@ class ConsoleState:
             kill = val("kill", {})
             kill_ok = kill.get("valid") is True and kill.get("active") is False
             bench = self.config["test_profile"] == "restrained_bench"
+            range_diagnostic_only = bool(runtime.get("wall_range_faults_diagnostic_only", False))
             height_reason = ("未建立起飞地面参考；请在未解锁时启动基础程序" if not wall.get("altitude_reference_valid")
                 else "相对起飞高度 {:.2f} m，需大于 {:.2f} m".format(
                     wall.get("height_above_takeoff_m", 0), wall.get("min_entry_height_m", 0.3)))
@@ -140,7 +141,7 @@ class ConsoleState:
                 ("odom", "里程计", bool(val("odom", {}).get("finite")), "里程计缺失、过期或数值无效"),
                 ("height", "高度门槛（台架关闭）" if bench else "相对起飞高度", bench or bool(wall.get("entry_height_ready")), height_reason),
                 ("estimator", "估计器", bool(estimator.get("attitude") and estimator.get("vertical_velocity")), "估计器状态缺失、过期或竖直速度无效"),
-                ("health", "雷达入口门槛（台架关闭）" if bench else "两路雷达", bench or bool(health.get("ceiling_valid") and health.get("front_valid")), "；".join(sensor_reasons) or "顶部或前向雷达无效／过期"),
+                ("health", "雷达仅告警（不阻止接管）" if range_diagnostic_only else "雷达入口门槛（台架关闭）" if bench else "两路雷达", range_diagnostic_only or bench or bool(health.get("ceiling_valid") and health.get("front_valid")), "；".join(sensor_reasons) or "顶部或前向雷达无效／过期"),
                 ("idle", "待命状态", val("phase") == "IDLE" and val("owner") == 0 and
                  val("operator", {}).get("mode") == 1 and not val("operator", {}).get("enabled", True), "已有动作请求，等待当前流程结束"),
             ]
@@ -165,7 +166,7 @@ class ConsoleState:
                 (kill_ok, "急停开关已生效，动作已禁用" if kill.get("active") else "急停反馈缺失／过期"),
                 (bool(flight.get("connected") and flight.get("armed") and flight.get("mode") == "OFFBOARD"), "离墙要求已连接、已解锁且处于 OFFBOARD"),
                 (bool(val("odom", {}).get("finite") and estimator.get("attitude") and estimator.get("vertical_velocity")), "里程计或估计器反馈无效／过期"),
-                (bool(health.get("ceiling_valid")), "顶部雷达反馈无效／过期"),
+                (range_diagnostic_only or bool(health.get("ceiling_valid")), "顶部雷达反馈无效／过期"),
                 (bool(wall.get("state_name") == "WALL_HOLD" and not wall.get("fault_detected")), "仅当前贴墙保持阶段允许离墙"),
                 (bool(val("phase") == "ACTIVE" and val("owner") == 2 and status["setpoint"]["fresh"] and
                     val("operator", {}).get("mode") == 3 and val("operator", {}).get("enabled")), "贴墙控制链路未就绪"),

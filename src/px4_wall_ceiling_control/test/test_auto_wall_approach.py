@@ -34,6 +34,32 @@ class AutoManagerTests(unittest.TestCase):
             setattr(self.n.wall,field,True)
         self.n.sensor.ceiling_valid = False
         self.assertFalse(self.n._wall_takeover_ready(self.fixture.now))
+    def test_range_bypass_enters_without_any_sensor_feedback(self):
+        self.n.ignore_range_loss_during_attachment=True
+        for field in ('front_ready','flip_ready','front_range_fresh','top_range_fresh',
+                      'sensor_health_fresh','top_preflight_ready'):
+            setattr(self.n.wall,field,False)
+        self.n.sensor=None
+        self.tick();self.tick();self.fixture.clock+=2;self.tick()
+        self.assertEqual(self.n.phase,Manager.ENTERING)
+        self.n._request_mode.assert_called_once_with('OFFBOARD')
+        self.assertFalse(self.n.wall.flip_ready)
+
+    def test_range_bypass_preserves_height_baseline_and_status_freshness(self):
+        self.n.selected_mode=OperatorCommand.MODE_WALL
+        self.n.ignore_range_loss_during_attachment=True
+        self.n.wall.horizontal_equilibrium_enabled=True
+        self.n.wall.horizontal_equilibrium_valid=True
+        self.assertTrue(self.n._wall_takeover_ready(self.fixture.now))
+        self.n.wall.horizontal_equilibrium_valid=False
+        self.assertFalse(self.n._wall_takeover_ready(self.fixture.now))
+        self.n.wall.horizontal_equilibrium_valid=True
+        self.n.wall.entry_height_ready=False
+        self.assertFalse(self.n._wall_takeover_ready(self.fixture.now))
+        self.n.wall.entry_height_ready=True
+        self.n.wall_at=rospy.Time.from_sec(1)
+        self.assertFalse(self.n._wall_takeover_ready(self.fixture.now))
+
     def test_confirmed_offboard_does_not_wait_for_flip_gate(self):
         self.n.selected_mode = OperatorCommand.MODE_WALL
         self.n.phase = Manager.ENTERING; self.n.flight.mode = 'OFFBOARD'

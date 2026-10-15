@@ -27,8 +27,8 @@ class WallHorizontalVelocityMixin:
             float(rospy.get_param('~horizontal_flow_future_tolerance_s', .10)))
         self.horizontal_flow_quality_min = int(rospy.get_param('~horizontal_flow_quality_min', 1))
         self.horizontal_reacquire_time = float(rospy.get_param('~horizontal_reacquire_time_s', .30))
-        self.horizontal_equilibrium_window = float(rospy.get_param('~horizontal_equilibrium_window_s', 1.))
-        self.horizontal_equilibrium_speed = float(rospy.get_param('~horizontal_equilibrium_speed_mps', .03))
+        self.horizontal_equilibrium_window = float(rospy.get_param('~horizontal_equilibrium_window_s', .5))
+        self.horizontal_equilibrium_speed = float(rospy.get_param('~horizontal_equilibrium_speed_mps', .10))
         values = (self.horizontal_equilibrium_window,self.horizontal_equilibrium_speed,self.horizontal_approach_speed,self.horizontal_resume_tilt,self.horizontal_stable_speed,
                   self.horizontal_stable_time,self.horizontal_flow_timeout,self.horizontal_reacquire_time)
         if any(not math.isfinite(v) or v <= 0 for v in values) or self.horizontal_approach_speed > .3 or not 1 <= self.horizontal_flow_quality_min <= 255:

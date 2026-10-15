@@ -285,7 +285,12 @@ class RemoteRuntime:
                     self.state.config = validate_config(migrate_legacy_ports(running))
                 except (ValueError, TypeError):
                     enabled = False
-        return {"wall_pilot_mode": self.ros.get_param("/flight_mode_manager_node/wall_pilot_mode","ALTCTL"), "front_sensor_masked": self.ros.get_param("/attachment/front_sensor_masked", False), "ceiling_distance_gate_enabled": self.ros.get_param("/flight_mode_manager_node/ceiling_distance_gate_enabled", False), "ceiling_enabled": "/ceiling_attachment_decision_node" in nodes,
+        return {"wall_range_faults_diagnostic_only": bool(
+                    self.ros.get_param("/wall_perch_decision_node/auto_approach", False)
+                    and self.ros.get_param("/flight_mode_manager_node/wall_auto_approach", False)
+                    and self.ros.get_param("/wall_perch_decision_node/ignore_range_loss_during_attachment", False)
+                    and self.ros.get_param("/flight_mode_manager_node/ignore_range_loss_during_attachment",
+                        self.ros.get_param("/wall_perch_decision_node/ignore_range_loss_during_attachment", False))), "wall_pilot_mode": self.ros.get_param("/flight_mode_manager_node/wall_pilot_mode","ALTCTL"), "front_sensor_masked": self.ros.get_param("/attachment/front_sensor_masked", False), "ceiling_distance_gate_enabled": self.ros.get_param("/flight_mode_manager_node/ceiling_distance_gate_enabled", False), "ceiling_enabled": "/ceiling_attachment_decision_node" in nodes,
                 "ceiling_activation_distance_m": self.ros.get_param("/ceiling_attachment_decision_node/activation_distance_m", .5),
                 "enabled": bool(enabled), "test_profile": profile, "nodes": sorted(nodes),
                 "missing": sorted(required - nodes), "logger": "/attachment_flight_logger" in nodes}
@@ -702,13 +707,14 @@ class SSHTransport:
                     item["age_s"] += age or 0
                     item["fresh"] = connected and item["age_s"] <= item["limit_s"]
             required_feedback = ("runtime", "state", "odom", "estimator", "operator", "phase", "owner", "wall", "kill")
-            if config["test_profile"] != "restrained_bench":
+            range_diagnostic_only = bool((runtime.get("value") or {}).get("wall_range_faults_diagnostic_only"))
+            if config["test_profile"] != "restrained_bench" and not range_diagnostic_only:
                 required_feedback += ("health",)
             stale = any(not result["status"][n]["fresh"] for n in required_feedback)
             check_sources = {"runtime": ("runtime",), "connected": ("state",), "armed": ("state",),
                              "mode": ("state",), "odom": ("odom",), "estimator": ("estimator",),
                              "kill": ("kill",),
-                             "health": () if config["test_profile"] == "restrained_bench" else ("health",),
+                             "health": () if range_diagnostic_only or config["test_profile"] == "restrained_bench" else ("health",),
                              "height": () if config["test_profile"] == "restrained_bench" else ("wall", "odom"), "idle": ("phase", "owner", "operator")}
             for check in result["checks"]:
                 if any(not result["status"][name]["fresh"] for name in check_sources.get(check["id"], ())):
@@ -726,7 +732,7 @@ class SSHTransport:
                     result["blockers"] = ["实时反馈已暂停，动作禁用" if not self.push_enabled else "SSH 反馈中断；历史数据不能用于判断贴墙成功"]
                     for check in result["checks"]:
                         check["ok"] = False
-            detach_sources = required_feedback + ("health", "setpoint")
+            detach_sources = required_feedback + (("setpoint",) if range_diagnostic_only else ("health", "setpoint"))
             if not connected or any(not result["status"][n]["fresh"] for n in detach_sources):
                 if not connected or result["can_detach"]:
                     result["detach_blockers"] = ["离墙所需实时反馈中断或过期"]

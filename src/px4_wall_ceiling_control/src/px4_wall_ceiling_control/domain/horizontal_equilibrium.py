@@ -4,7 +4,7 @@ from collections import deque
 from px4_wall_ceiling_control.domain.geometry import quaternion_normalize, rotate_vector
 
 class HorizontalEquilibrium:
-    def __init__(self, window=1.0, max_gap=.35, max_tilt_deg=5., max_spread_deg=1.5):
+    def __init__(self, window=.5, max_gap=.35, max_tilt_deg=5., max_spread_deg=1.5):
         self.window,self.max_gap=window,max_gap
         self.max_tilt=math.radians(max_tilt_deg);self.max_spread=math.radians(max_spread_deg)
         self.clear()
