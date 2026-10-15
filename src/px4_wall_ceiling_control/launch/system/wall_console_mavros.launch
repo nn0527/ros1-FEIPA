@@ -1,0 +1,12 @@
+<launch>
+  <arg name="fcu_url" default="/dev/serial/by-path/wall-fcu:230400" />
+  <include file="$(find mavros)/launch/node.launch">
+    <arg name="fcu_url" value="$(arg fcu_url)" />
+    <arg name="gcs_url" value="" />
+    <arg name="tgt_system" value="1" />
+    <arg name="tgt_component" value="1" />
+    <arg name="fcu_protocol" value="v2.0" />
+    <arg name="pluginlists_yaml" value="$(find px4_wall_ceiling_control)/config/mavros_wall_pluginlists.yaml" />
+    <arg name="config_yaml" value="$(find mavros)/launch/px4_config.yaml" />
+  </include>
+</launch>

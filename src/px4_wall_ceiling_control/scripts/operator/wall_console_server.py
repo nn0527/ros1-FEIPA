@@ -351,6 +351,7 @@ class RemoteRuntime:
                     raise ValueError("已运行 MAVROS 的串口配置与页面不一致")
                 flight = self.state.snapshot()["status"]["state"]
                 if flight["fresh"] and flight["value"].get("connected") and not flight["value"].get("armed"):
+                    self.require_mavros_task_isolation()
                     self.configure_telemetry()
                 self.state.launch_error = ""
                 return {"message": "基础程序已运行，无需重复启动"}
@@ -364,6 +365,11 @@ class RemoteRuntime:
             self.state.launch_error = ""
         threading.Thread(target=self.start_worker, daemon=True).start()
         return {"message": "开始启动 MAVROS 与贴墙基础程序"}
+
+    def require_mavros_task_isolation(self):
+        blacklist = self.ros.get_param("/mavros/plugin_blacklist", [])
+        if not isinstance(blacklist, list) or not {"waypoint", "geofence", "rallypoint"}.issubset(blacklist):
+            raise ValueError("MAVROS未停用任务同步插件；请在上锁后终止并重新启动基础程序")
 
     def start_worker(self):
         try:
@@ -396,7 +402,7 @@ class RemoteRuntime:
                 nodes.discard("/mavros")
                 self.state.event("检测到已退出的 MAVROS 残留注册；重新启动 MAVROS")
             if "/mavros" not in nodes:
-                self.spawn("mavros", ["roslaunch", "mavros", "px4.launch", "fcu_url:=" + url])
+                self.spawn("mavros", ["roslaunch", "px4_wall_ceiling_control", "wall_console_mavros.launch", "fcu_url:=" + url])
             elif not self.fcu_url_matches(url):
                 raise ValueError("已运行 MAVROS 的串口配置与页面不一致")
             else:
@@ -414,6 +420,7 @@ class RemoteRuntime:
                 if time.monotonic() > deadline:
                     raise ValueError("MAVROS 连接超时，检查飞控串口、波特率与心跳")
                 time.sleep(0.2)
+            self.require_mavros_task_isolation()
             self.configure_telemetry()
             self.prepare_lidars()
             # Starting sensors takes time; recheck before creating output nodes.
@@ -549,7 +556,7 @@ class RemoteRuntime:
                     args = item.read_bytes().split(b"\0")
                     text_args = [a.decode(errors="replace") for a in args if a]
                     is_launch = any("roslaunch" in a for a in text_args) and (
-                        "wall_console_flight.launch" in text_args or
+                        "wall_console_flight.launch" in text_args or "wall_console_mavros.launch" in text_args or
                         ("mavros" in text_args and "px4.launch" in text_args))
                     is_node = any(a.startswith(str(PACKAGE / "scripts") + "/") or
                                   a.startswith(str(PACKAGE.parents[1] / "devel/lib/px4_wall_ceiling_control") + "/")

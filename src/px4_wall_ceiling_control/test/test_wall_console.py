@@ -23,6 +23,22 @@ spec.loader.exec_module(server)
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_task_sync_plugins_are_isolated_in_project_launch(self):
+        import yaml
+        root=server_path.parents[2]
+        config=yaml.safe_load((root/'config/mavros_wall_pluginlists.yaml').read_text())
+        self.assertTrue({'waypoint','geofence','rallypoint'}.issubset(config['plugin_blacklist']))
+        self.assertNotIn('setpoint_raw',config['plugin_blacklist'])
+        launch=ET.parse(root/'launch/system/wall_console_mavros.launch')
+        args={n.attrib['name']:n.attrib['value'] for n in launch.findall('./include/arg')}
+        self.assertIn('mavros_wall_pluginlists.yaml',args['pluginlists_yaml'])
+    def test_existing_mavros_must_also_have_task_isolation(self):
+        runtime=object.__new__(server.RemoteRuntime);runtime.ros=mock.Mock()
+        runtime.ros.get_param.return_value=['waypoint','geofence']
+        with self.assertRaisesRegex(ValueError,'任务同步'):runtime.require_mavros_task_isolation()
+        runtime.ros.get_param.return_value=['waypoint','geofence','rallypoint']
+        runtime.require_mavros_task_isolation()
+
     def test_wall_wait_cancel_uses_configured_posctl_mode(self):
         state=ConsoleState()
         state.update("runtime",{"wall_pilot_mode":"POSCTL"})

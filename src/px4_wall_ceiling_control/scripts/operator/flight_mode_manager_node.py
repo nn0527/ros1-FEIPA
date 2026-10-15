@@ -55,6 +55,8 @@ class FlightModeManagerNode:
         self.cancel_entry_pilot_samples = 0
         self.cancel_entry_stable_since = None
         self.last_offboard_finished_at = None
+        self.offboard_exit_cleanup = False
+        self.pilot_intent_request_at = None
         self.acquire_timeout_s = max(2.0, float(rospy.get_param("~acquire_timeout_s", 6.0)))
         self.state_timeout_s = float(rospy.get_param("~state_timeout_s", 1.5))
         self.odom_timeout_s = float(rospy.get_param("~odom_timeout_s", 0.5))
@@ -164,11 +166,11 @@ class FlightModeManagerNode:
         rospy.Subscriber(
             "/mavros/local_position/odom", Odometry, self._on_odom, queue_size=10
         )
-        if self.require_rc_center:
-            rospy.Subscriber(
-                rospy.get_param("~rc_topic", "/mavros/rc/in"),
-                RCIn, self._on_rc, queue_size=1,
-            )
+        # Intent cleanup needs live pilot input even when stick centering is disabled.
+        rospy.Subscriber(
+            rospy.get_param("~rc_topic", "/mavros/rc/in"),
+            RCIn, self._on_rc, queue_size=1,
+        )
         rospy.Subscriber(
             "/mavros/estimator_status", EstimatorStatus,
             self._on_estimator, queue_size=10,
@@ -238,6 +240,9 @@ class FlightModeManagerNode:
                 self.cancel_entry_pilot_samples = getattr(self, "cancel_entry_pilot_samples", 0) + 1
             else:
                 self.cancel_entry_pilot_samples = 0
+                if getattr(self, "offboard_exit_cleanup", False):
+                    self.pilot_intent_request_at = None
+                    self.cancel_entry_stable_since = None
 
     def _on_odom(self, message):
         self.odom, self.odom_at = message, rospy.Time.now()
@@ -469,6 +474,73 @@ class FlightModeManagerNode:
         else:
             self.phase_reason = "取消接管处理中：" + reason
 
+    def _begin_offboard_exit(self, reason, monotonic_now):
+        self._begin_entry_cancel(reason, monotonic_now)
+        self.offboard_exit_cleanup = True
+        self.pilot_intent_request_at = None
+        self.last_request_at = None
+        self.phase_reason = "OFFBOARD异常退出清理：" + reason + "；禁止新动作"
+
+    def _offboard_exit_request_ready(self, now):
+        flight = self.flight
+        if (flight is None or not flight.connected
+                or not is_fresh(self.flight_at, self.state_timeout_s, now)):
+            return False
+        if flight.mode.upper() not in ("OFFBOARD", self._pilot_mode()):
+            return False  # Never override a third mode selected by the pilot/failsafe.
+        if not flight.armed:
+            return flight.mode.upper() == self._pilot_mode()  # Same-mode only.
+        channels = getattr(self, "rc_channels", None)
+        if (channels is None or len(channels) < 4
+                or not is_fresh(self.rc_at, self.rc_timeout_s, now)
+                or not all(800 <= v <= 2200 for v in channels[:4])):
+            return False
+        if flight.mode.upper() == "OFFBOARD":
+            return self._entry_cancel_handover_ready(now)
+        e = self.estimator
+        if (e is None or not is_fresh(self.estimator_at, self.estimator_timeout_s, now)
+                or not e.attitude_status_flag or not e.velocity_vert_status_flag):
+            return False
+        return self._pilot_mode() != "POSCTL" or bool(e.velocity_horiz_status_flag
+            and (e.pos_horiz_rel_status_flag or e.pos_horiz_abs_status_flag)
+            and not e.const_pos_mode_status_flag)
+
+    def _tick_offboard_exit(self, now, monotonic_now, flight_fresh, flight_mode):
+        pilot = self._pilot_mode()
+        if not flight_fresh or self.flight is None or not self.flight.connected:
+            self.phase_reason = "OFFBOARD异常退出清理：等待新鲜飞控反馈；禁止新动作"
+            return
+        if flight_mode not in (pilot, "OFFBOARD"):
+            self.phase_reason = "OFFBOARD异常退出清理：尊重当前" + flight_mode + "；等待飞手回到" + pilot
+            return
+        if flight_mode == "OFFBOARD":
+            self.cancel_entry_pilot_samples = 0
+            if self._offboard_exit_request_ready(now):
+                if self.cancel_entry_stable_since is None:
+                    self.cancel_entry_stable_since = monotonic_now
+                if monotonic_now - self.cancel_entry_stable_since >= .3:
+                    self._request_mode(pilot)
+            else:
+                self.cancel_entry_stable_since = None
+            self.phase_reason = "OFFBOARD异常退出清理：旧模式再次生效，等待安全交回" + pilot + "；禁止新动作"
+            return
+        self.cancel_entry_stable_since = None
+        submitted = getattr(self, "pilot_intent_request_at", None)
+        if submitted is None:
+            if self._offboard_exit_request_ready(now):
+                # A failsafe fallback reports POSCTL but may retain OFFBOARD intention.
+                self._request_mode(pilot)
+            self.phase_reason = "OFFBOARD异常退出清理：飞控为" + pilot + "，等待明确重申该模式以清除旧OFFBOARD意图"
+            return
+        anchor = max(submitted, self.cancel_entry_started,
+                     getattr(self, "last_offboard_finished_at", None) or self.cancel_entry_started)
+        if (not getattr(self, "request_in_flight", False)
+                and self.cancel_entry_pilot_samples >= 2
+                and monotonic_now - anchor >= self.enter_timeout_s):
+            self._reset(lock=True, reason="OFFBOARD退出清理完成：已明确请求并连续确认" + pilot + "；释放旧请求后可重试")
+        else:
+            self.phase_reason = "OFFBOARD异常退出清理：已请求" + pilot + "，等待后续连续模式反馈及在途请求结束；禁止新动作"
+
     def _entry_cancel_handover_ready(self, now):
         # If a behavior acquired ownership meanwhile, retain its full recovery gates.
         if self.owner != 0:
@@ -497,6 +569,8 @@ class FlightModeManagerNode:
             and all(abs(v) <= .3 for v in (angular.x, angular.y, angular.z)))
 
     def _tick_entry_cancel(self, now, monotonic_now, flight_fresh, flight_mode):
+        if getattr(self, "offboard_exit_cleanup", False):
+            return self._tick_offboard_exit(now, monotonic_now, flight_fresh, flight_mode)
         if not flight_fresh or self.flight is None or not self.flight.connected:
             self.phase_reason = "取消接管处理中：等待新鲜飞控模式反馈；禁止新动作"
             return
@@ -744,7 +818,10 @@ class FlightModeManagerNode:
                     return
             elif mode == self._pilot_mode():
                 if self.phase == self.CANCELING_ENTRY:
-                    if not self._entry_cancel_handover_ready(rospy.Time.now()):
+                    ready = (self._offboard_exit_request_ready(rospy.Time.now())
+                             if getattr(self, "offboard_exit_cleanup", False)
+                             else self._entry_cancel_handover_ready(rospy.Time.now()))
+                    if not ready:
                         return
                 elif self.phase != self.RETURNING or not self._handover_ready(rospy.Time.now()):
                     return
@@ -758,6 +835,12 @@ class FlightModeManagerNode:
             response = self.set_mode(request)
             if not response.mode_sent:
                 rospy.logwarn("PX4 did not accept %s mode request", mode)
+            elif (mode != "OFFBOARD" and self.phase == self.CANCELING_ENTRY
+                  and getattr(self, "offboard_exit_cleanup", False)
+                  and (attempt is None or attempt == self.takeover_attempt)):
+                # mode_sent means submitted, not confirmed. Require NEW heartbeats.
+                self.cancel_entry_pilot_samples = 0
+                self.pilot_intent_request_at = time.monotonic()
         except (rospy.ROSException, rospy.ServiceException) as exc:
             rospy.logwarn("MAVROS set_mode %s failed: %s", mode, exc)
         finally:
@@ -766,6 +849,8 @@ class FlightModeManagerNode:
             self.request_in_flight = False
 
     def _reset(self, lock=False, reason=None):
+        self.offboard_exit_cleanup = False
+        self.pilot_intent_request_at = None
         self.takeover_attempt = getattr(self, "takeover_attempt", 0) + 1
         self.offboard_request = None
         self.selected_mode = None
@@ -800,7 +885,7 @@ class FlightModeManagerNode:
         if (self.phase in (self.IDLE, self.LOCKED) and flight_fresh and flight_mode == "OFFBOARD"
                 and getattr(self, "canceled_entry_mode", None) is not None):
             self.selected_mode = self.canceled_entry_mode
-            self._begin_entry_cancel("检测到已取消请求的迟到OFFBOARD反馈", monotonic_now)
+            self._begin_offboard_exit("检测到已取消请求的迟到OFFBOARD反馈", monotonic_now)
         if self.phase == self.LOCKED and requested is None:
             self._reset(
                 lock=False,
@@ -932,7 +1017,7 @@ class FlightModeManagerNode:
                     flight_mode or "unknown mode"
                 )
                 rospy.logwarn("%s; automatic reentry inhibited", failure_reason)
-                self._reset(lock=True, reason=failure_reason)
+                self._begin_offboard_exit(failure_reason, monotonic_now)
             else:
                 self._observe_completion(now)
                 if self.selected_mode == OperatorCommand.MODE_CEILING and getattr(self, "ceiling", None) is not None and is_fresh(self.ceiling_at, self.status_timeout_s, now):
@@ -988,7 +1073,8 @@ class FlightModeManagerNode:
                 self._reset(lock=True, reason=failure_reason)
 
         self.prestream_pub.publish(
-            Bool(data=self.phase in (self.WAITING_WALL, self.PRESTREAM, self.ENTERING, self.CANCELING_ENTRY, self.ACTIVE, self.RETURNING))
+            Bool(data=self.phase in (self.WAITING_WALL, self.PRESTREAM, self.ENTERING, self.CANCELING_ENTRY, self.ACTIVE, self.RETURNING)
+                 and (not getattr(self, "offboard_exit_cleanup", False) or flight_mode == "OFFBOARD"))
         )
         self.phase_pub.publish(String(data=self.phase))
         phase_reason_pub = getattr(self, "phase_reason_pub", None)

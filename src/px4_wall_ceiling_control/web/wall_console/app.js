@@ -86,10 +86,11 @@ function paint(s){
   else if(phase==="ACTIVE"){
     title=fresh(s,"operator")?.mode===2 ? "吸顶："+(ceilingNames[ceilingStatus?.state_name]||"等待反馈") : wallNames[wall?.state_name] || "贴墙控制中";reason=fresh(s,"operator")?.mode===2 ? ceilingStatus?.reason || "等待吸顶状态反馈" : wall?.reason || "等待贴墙状态反馈";
     step=wall?.state_name==="WALL_HOLD"?5:["FLIP_TO_WALL","WALL_CAPTURE","WALL_PIN"].includes(wall?.state_name)?4:3;
-  } else if(phase==="LOCKED"){title="动作受阻";reason=fresh(s,"reason") || reason;}
+  } else if(phase==="CANCELING_ENTRY"){title="接管退出清理中";reason=fresh(s,"reason") || "等待飞控确认遥控模式，禁止新动作";}
+  else if(phase==="LOCKED"){title="动作受阻";reason=fresh(s,"reason") || reason;}
   else if(phase && phase!=="IDLE"){title=phase;reason=fresh(s,"reason") || reason;}
   else if(enabled){title=s.pending?"贴墙请求已发送":s.can_wall?"可以发送贴墙指令":"等待稳定飞行";}
-  if(wall?.state_name==="ABORT"){title=wallNames.ABORT;reason=wall.reason;}
+  if(wall?.state_name==="ABORT" && phase!=="CANCELING_ENTRY"){title=wallNames.ABORT;reason=wall.reason;}
   if(s.success){title="贴墙保持";reason="控制节点已确认接触，当前保持贴墙";step=5;}
   const history=s.status.wall?.value;
   const reached={SLOW_APPROACH:3,FLIP_TO_WALL:4,WALL_CAPTURE:4,WALL_HOLD:5,WALL_PIN:4,DETACH_ROTATE:6,RECOVER:7,EXIT:7};
