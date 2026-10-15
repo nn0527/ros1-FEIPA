@@ -99,6 +99,20 @@ class LoggerTests(unittest.TestCase):
             self.assertEqual(rows[2]["sent_error_deg"], "")
             self.assertEqual(rows[3]["sent_error_deg"], "")
 
+    def test_horizontal_pi_diagnostics_are_written_to_csv(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);summary=logger.SignalSummary(root,FakeRos(root),True)
+            summary.remember("/wall_perch/status",NS(state_name="SLOW_APPROACH",reason="test",fault_count=0,candidate_valid=True,
+                horizontal_forward_target_mps=.05,horizontal_forward_measured_mps=-.02,
+                horizontal_integral_x_enu_mps2=.1,horizontal_integral_y_enu_mps2=-.02,
+                horizontal_integral_active=True,horizontal_integral_reason="active",
+                horizontal_control_saturated=False))
+            summary.write();summary.close()
+            with (root/"signals.csv").open() as stream:row=next(csv.DictReader(stream))
+            self.assertEqual(row["wall_horizontal_integral_reason"],"active")
+            self.assertAlmostEqual(float(row["wall_horizontal_forward_measured_mps"]),-.02)
+            self.assertEqual(row["wall_horizontal_integral_active"],"True")
+
     def test_event_changes_and_repeated_state_are_distinguishable(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

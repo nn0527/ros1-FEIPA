@@ -98,6 +98,30 @@ class AutoDecisionTests(unittest.TestCase):
         n._update_state_machine(rospy.Time.from_sec(30))
         self.assertEqual(n.state,S.STATE_ABORT)
         self.assertIn('超时',n.last_reason)
+    def test_range_bypass_keeps_approaching_without_false_flip(self):
+        n=self.node();n.ignore_range_loss_during_attachment=True
+        n._auto_approach_ranges_ready=lambda *a:False
+        n._flip_ready=lambda *a:True  # A cached distance must not authorize flip.
+        now=rospy.Time.from_sec(15)
+        n._update_state_machine(now)
+        self.assertEqual(n.state,S.STATE_SLOW_APPROACH)
+        self.assertIsNone(n.flip_ready_since)
+        self.assertIn('继续自动接近',n.last_reason)
+        neutral,v,thrust,_=n._candidate(now)
+        self.assertFalse(neutral);self.assertAlmostEqual(tilt(v),3)
+        self.assertTrue(n._approach_motion_allowed(now))
+        self.assertEqual(n.state_entered_at,rospy.Time.from_sec(10))
+        n._update_state_machine(rospy.Time.from_sec(30))
+        self.assertEqual(n.state,S.STATE_ABORT)
+
+    def test_range_bypass_covers_detach_and_recovery(self):
+        n=self.node();n.ignore_range_loss_during_attachment=True
+        for state in (S.STATE_DETACH_ROTATE,S.STATE_RECOVER,S.STATE_ABORT,S.STATE_EXIT):
+            n.state=state
+            self.assertTrue(n._ignore_attachment_range_loss())
+            self.assertFalse(n._top_required())
+            self.assertTrue(n._top_preflight_ready(rospy.Time.from_sec(15)))
+
     def test_valid_recovery_restores_three_degree_forward(self):
         n=self.node();n._auto_approach_ranges_ready=lambda *a:False
         n._update_state_machine(rospy.Time.from_sec(15))

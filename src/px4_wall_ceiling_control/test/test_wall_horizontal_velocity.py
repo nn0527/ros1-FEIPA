@@ -62,7 +62,10 @@ class HorizontalFlightTests(unittest.TestCase):
         self.n._prepare_horizontal_velocity(now)
 
     def ready(self,start=10.):
-        for t in (start,start+.25,start+.5):self.feed(t)
+        for t in (start,start+.25,start+.5):
+            if self.n.horizontal_flow_at == rospy.Time.from_sec(t):
+                self.n._prepare_horizontal_velocity(rospy.Time.now())
+            else:self.feed(t)
         self.assertTrue(self.n.horizontal_velocity_ready)
 
     def test_new_continuous_samples_required_then_actual_velocity_feedback(self):
@@ -76,11 +79,12 @@ class HorizontalFlightTests(unittest.TestCase):
         axis=rotate_vector(q,(0,0,1));self.assertLess(axis[0],0);self.assertLess(axis[1],0)
 
     def test_bad_flow_estimate_and_stale_frames_remove_forward_command(self):
-        for fault in ('quality','const','stale'):
-            self.n._reset_horizontal_gate('test');self.ready(20.)
+        for index,fault in enumerate(('quality','const','stale')):
+            start=20.+index*3
+            self.n._reset_horizontal_gate('test');self.ready(start)
             self.n._horizontal_attitude(rospy.Time.now(),self.n.q_hover)
             self.assertTrue(self.n.horizontal_velocity_active)
-            self.feed(21.2,quality=0 if fault=='quality' else 80,const=fault=='const',flow=fault!='stale')
+            self.feed(start+1.2,quality=0 if fault=='quality' else 80,const=fault=='const',flow=fault!='stale')
             q=self.n._horizontal_attitude(rospy.Time.now(),self.n.q_hover)
             self.assertFalse(self.n.horizontal_velocity_ready)
             self.assertFalse(self.n.horizontal_velocity_active)

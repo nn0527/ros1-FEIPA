@@ -20,21 +20,21 @@ class EquilibriumMathTests(unittest.TestCase):
         c=HorizontalEquilibrium()
         c.observe(10.,pitch(2.5),True);c.observe(10.,pitch(2.5),True)
         self.assertFalse(c.ready)
-        for t in (10.25,10.5,10.75):c.observe(t,pitch(2.5),True)
+        for t in (10.25,10.5,10.75,11.):c.observe(t,pitch(2.5),True)
         self.assertTrue(c.ready);self.assertAlmostEqual(tilt(attitude_from_axis_yaw(c.axis,0)),2.5)
-        self.assertTrue(c.freeze(10.8))
-        c.observe(11.,pitch(-3),False)
+        self.assertTrue(c.freeze(11.05))
+        c.observe(11.25,pitch(-3),False)
         self.assertTrue(c.frozen);self.assertAlmostEqual(tilt(attitude_from_axis_yaw(c.axis,0)),2.5)
     def test_invalid_motion_gap_or_large_target_resets_window(self):
         for fault in ('motion','gap','tilt','spread'):
             c=HorizontalEquilibrium()
-            for t in (10.,10.25,10.5,10.75):c.observe(t,pitch(2.5),True)
+            for t in (10.,10.25,10.5,10.75,11.):c.observe(t,pitch(2.5),True)
             self.assertTrue(c.ready)
-            c.observe(11.5 if fault=='gap' else 11.,pitch(7 if fault=='tilt' else -2 if fault=='spread' else 2.5),fault!='motion')
+            c.observe(11.5 if fault=='gap' else 11.25,pitch(7 if fault=='tilt' else -2 if fault=='spread' else 2.5),fault!='motion')
             self.assertFalse(c.ready,fault)
     def test_stale_equilibrium_cannot_freeze_and_new_attempt_clears_bias(self):
         c=HorizontalEquilibrium()
-        for t in (10.,10.25,10.5,10.75):c.observe(t,pitch(2.5),True)
+        for t in (10.,10.25,10.5,10.75,11.):c.observe(t,pitch(2.5),True)
         self.assertFalse(c.freeze(12.));self.assertFalse(c.ready)
         c.clear();self.assertEqual(c.axis,(0.,0.,1.))
     def test_feedback_is_increment_not_absolute_one_point_seven_five_degree_cap(self):
@@ -73,14 +73,24 @@ class EquilibriumHandoverTests(unittest.TestCase):
         self.n.manager_phase='WAITING_WALL'
         self.n._on_state(State(connected=True,armed=True,mode='POSCTL'))
     def sample(self,t,velocity=0.,target=2.5,actual=None):
-        self.f.feed(t,vx=velocity,tilt=target if actual is None else actual)
+        # A fixture update at the same time must not replay the initial flow frame.
+        self.f.feed(t,vx=velocity,tilt=target if actual is None else actual,
+                    flow=self.n.horizontal_flow_at != rospy.Time.from_sec(t))
         self.n.flight_state_received_at=rospy.Time.now();self.n.manager_phase_received_at=rospy.Time.now()
         self.n._on_horizontal_fcu_target(AttitudeTarget(orientation=Quaternion(*pitch(target)),thrust=.50))
         self.n._prepare_horizontal_equilibrium(rospy.Time.now())
     def capture(self):
-        for t in (10.,10.25,10.5,10.75,11.,11.25):self.sample(t)
+        for t in (10.,10.25,10.5,10.75,11.,11.25,11.5):self.sample(t)
         self.assertTrue(self.n.horizontal_equilibrium.ready)
         self.assertTrue(self.n.horizontal_velocity_ready)
+    def test_equilibrium_requires_full_second_below_three_centimetres_per_second(self):
+        for t in (10.,10.25,10.5,10.75,11.,11.25,11.5):self.sample(t,velocity=.031)
+        self.assertFalse(self.n.horizontal_equilibrium.ready)
+        for t in (11.75,12.,12.25,12.5):self.sample(t,velocity=.029)
+        self.assertFalse(self.n.horizontal_equilibrium.ready)
+        self.sample(12.75,velocity=.029)
+        self.assertTrue(self.n.horizontal_equilibrium.ready)
+
     def test_no_entry_baseline_from_moving_or_untracked_attitude(self):
         for t in (10.,10.25,10.5,10.75,11.):self.sample(t,velocity=.2)
         self.assertFalse(self.n.horizontal_equilibrium.ready)
@@ -89,7 +99,7 @@ class EquilibriumHandoverTests(unittest.TestCase):
     def test_prestream_keeps_nonzero_balance_and_starts_feedback_before_active(self):
         self.capture();self.n._prepare_horizontal_prestream(rospy.Time.now())
         self.assertAlmostEqual(tilt(self.n.horizontal_prestream_attitude),2.5)
-        self.f.feed(11.5,vx=-.1,tilt=2.5)
+        self.f.feed(11.75,vx=-.1,tilt=2.5)
         self.n._prepare_horizontal_prestream(rospy.Time.now())
         self.assertGreater(tilt(self.n.horizontal_prestream_attitude),2.5)
         self.assertEqual(self.n.horizontal_controller.target,(0.,0.))
@@ -123,7 +133,7 @@ class EquilibriumHandoverTests(unittest.TestCase):
     def test_invalid_flow_falls_back_to_balance_not_euler_zero(self):
         self.capture();self.n.manager_phase='ENTERING';self.n._prepare_horizontal_equilibrium(rospy.Time.now())
         self.n.state=W.STATE_SLOW_APPROACH
-        self.f.feed(11.5,quality=0,tilt=2.5)
+        self.f.feed(11.75,quality=0,tilt=2.5)
         q=self.n._horizontal_attitude(rospy.Time.now(),(0.,0.,0.,1.))
         self.assertAlmostEqual(tilt(q),2.5)
         self.assertFalse(self.n.horizontal_velocity_active)

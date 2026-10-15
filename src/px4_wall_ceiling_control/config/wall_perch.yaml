@@ -83,10 +83,17 @@ wall_perch_decision_node:
   horizontal_velocity_enabled: false
   horizontal_approach_speed_mps: 0.05
   horizontal_velocity_kp: 1.5
+  # Approach-only ENU integral; recovery continues to use P control.
+  horizontal_velocity_ki: 0.30
+  horizontal_integral_limit_mps2: 0.20
+  horizontal_equilibrium_window_s: 1.0
+  horizontal_equilibrium_speed_mps: 0.03
   # Feedback increment around the frozen POSCTL equilibrium; final total cone remains 5deg.
   horizontal_max_acceleration_mps2: 0.30
   horizontal_target_acceleration_mps2: 0.10
   horizontal_flow_timeout_s: 0.60
+  # MAVROS clock mapping may lead ROS slightly; cap is enforced at 0.10 s.
+  horizontal_flow_future_tolerance_s: 0.10
   horizontal_flow_quality_min: 1
   horizontal_reacquire_time_s: 0.30
   horizontal_resume_tilt_deg: 10.0

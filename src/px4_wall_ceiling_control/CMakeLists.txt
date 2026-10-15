@@ -107,4 +107,8 @@ endif()
 
 if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_wall_horizontal_velocity.py)
+  catkin_add_nosetests(test/test_horizontal_equilibrium.py)
+  catkin_add_nosetests(test/test_horizontal_pi.py)
+  catkin_add_nosetests(test/test_flow_timestamps.py)
+  catkin_add_nosetests(test/test_wall_timeout_handover.py)
 endif()

@@ -795,6 +795,10 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
                 WallPerchStatus.STATE_WALL_CAPTURE,
                 WallPerchStatus.STATE_WALL_HOLD,
                 WallPerchStatus.STATE_WALL_PIN,
+                WallPerchStatus.STATE_DETACH_ROTATE,
+                WallPerchStatus.STATE_RECOVER,
+                WallPerchStatus.STATE_ABORT,
+                WallPerchStatus.STATE_EXIT,
             )
         )
 
@@ -929,6 +933,11 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         return bool(self.manager_phase == "ACTIVE" and received is not None
                     and 0.0 <= (now - received).to_sec() <= self.manager_phase_timeout_s)
 
+    def _approach_motion_allowed(self, now):
+        # Range validity gates contact transitions, not motion in bypass mode.
+        return bool(getattr(self, "ignore_range_loss_during_attachment", False)
+                    or self._auto_approach_ranges_ready(now))
+
     def _auto_approach_ranges_ready(self, now):
         # Strict measured-input gate; no error-code grace or retained valid bit.
         return self._bench_ranges_ready(now)
@@ -1047,7 +1056,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         if not self._flight_ready(now) or not self._odom_fresh(now):
             return False
         if getattr(self, "auto_approach", False) and self._approach_stage():
-            # Sensor loss pauses autonomous motion, while flight/odom/kill failures still abort.
+            # Range loss does not cancel flight/odom/kill protection.
             return self._rates_safe() and self._vertical_speed_safe()
         if not self._top_preflight_ready(now):
             return False
@@ -1193,6 +1202,8 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             self.recovery_completed = True
         old_state = self.state
         self.state = new_state
+        if getattr(self,"horizontal_velocity_enabled",False):
+            self._clear_horizontal_integral("阶段切换：清零接近积分")
         if getattr(self,"horizontal_velocity_enabled",False) and new_state in (WallPerchStatus.STATE_IDLE,WallPerchStatus.STATE_FLIP_TO_WALL):
             self._reset_horizontal_gate("阶段切换：重置水平控制历史")
         self.state_entered_at = now
@@ -1408,10 +1419,12 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
                     self._enter_state(WallPerchStatus.STATE_ABORT, now, "automatic approach flight or odometry failure")
                 elif self._state_age(now) >= self.approach_timeout_s:
                     self.fault_count += 1
-                    self._enter_state(WallPerchStatus.STATE_ABORT, now, "自动接近超时：总时限20秒，含测距暂停")
+                    self._enter_state(WallPerchStatus.STATE_ABORT, now, "自动接近超时：总时限20秒")
                 elif not self._auto_approach_ranges_ready(now):
                     self.flip_ready_since = self.flip_ready_last_sample_at = None
-                    self.last_reason = "自动接近暂停：雷达无效或过期，自主目标返回水平；总时限20秒"
+                    self.last_reason = ("雷达告警：无效或过期，继续自动接近；等待有效距离确认翻转"
+                                        if self._approach_motion_allowed(now) else
+                                        "自动接近暂停：雷达无效或过期，自主目标返回水平；总时限20秒")
                 elif getattr(self,"horizontal_velocity_enabled",False) and not self.horizontal_velocity_ready:
                     self.flip_ready_since = self.flip_ready_last_sample_at = None
                     self.last_reason = "自动接近暂停：" + self.horizontal_velocity_reason
@@ -1524,7 +1537,8 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
             if (
                 self._state_age(now) >= self.recover_time_s
                 and stable
-                and (getattr(self, "bench_wait_for_ranges", False) or self._top_clear_ready(now))
+                and (getattr(self, "bench_wait_for_ranges", False)
+                     or self._ignore_attachment_range_loss() or self._top_clear_ready(now))
                 and self._detach_height_settled()
                 and self._horizontal_recovery_ready(now)
             ):
@@ -1565,7 +1579,8 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
     def _candidate(self, now):
         if (self.state == WallPerchStatus.STATE_SLOW_APPROACH
                 and not getattr(self, "auto_approach", False)
-                and (self._bench_waiting() or self._ignore_attachment_range_loss())
+                and not getattr(self, "ignore_range_loss_during_attachment", False)
+                and self._bench_waiting()
                 and not self._bench_ranges_ready(now)):
             return True, None, math.nan, 0.0
         neutral = self.state in (
@@ -1578,7 +1593,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
 
         if self.state == WallPerchStatus.STATE_SLOW_APPROACH:
             angle = 0.0 if getattr(self,"horizontal_velocity_enabled",False) else self.approach_pitch_rad
-            if getattr(self, "auto_approach", False) and not self._auto_approach_ranges_ready(now):
+            if getattr(self, "auto_approach", False) and not self._approach_motion_allowed(now):
                 angle = 0.0
             pitch = (0.0, math.sin(angle * 0.5), 0.0, math.cos(angle * 0.5))
             quaternion = self._quat_normalize(self._quat_multiply(self.q_hover, pitch))
@@ -1695,7 +1710,7 @@ class WallPerchDecisionNode(WallHorizontalVelocityMixin):
         status.flight_state_fresh = self._flight_ready(now)
         status.auto_approach_enabled = getattr(self, "auto_approach", False)
         status.approach_paused = bool(status.auto_approach_enabled and self.state == WallPerchStatus.STATE_SLOW_APPROACH
-                                      and not self._auto_approach_ranges_ready(now))
+                                      and not self._approach_motion_allowed(now))
         status.front_ready = self._held_status(
             status.front_range_fresh
             and self.front_filtered_m <= self.front_ready_distance_m,

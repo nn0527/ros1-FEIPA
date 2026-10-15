@@ -90,3 +90,12 @@ string horizontal_equilibrium_reason
 geometry_msgs/Quaternion horizontal_equilibrium_attitude
 bool horizontal_prestream_valid
 geometry_msgs/Quaternion horizontal_prestream_attitude
+
+# Approach-only PI diagnostics in the frozen takeover heading / ENU frame.
+float32 horizontal_forward_target_mps
+float32 horizontal_forward_measured_mps
+float32 horizontal_integral_x_enu_mps2
+float32 horizontal_integral_y_enu_mps2
+bool horizontal_integral_active
+string horizontal_integral_reason
+bool horizontal_control_saturated
