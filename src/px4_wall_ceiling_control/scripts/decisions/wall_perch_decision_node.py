@@ -156,10 +156,13 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             0.01, float(rospy.get_param("~hold_entry_blend_s", 0.50))
         )
         self.detach_axis_error_rad = math.radians(
-            float(rospy.get_param("~detach_axis_error_deg", 5.0))
+            float(rospy.get_param("~detach_axis_error_deg", 15.0))
         )
         self.detach_max_rate_rps = float(
             rospy.get_param("~detach_max_rate_rps", math.radians(25.0))
+        )
+        self.detach_vertical_speed_check_enabled = bool(
+            rospy.get_param("~detach_vertical_speed_check_enabled", False)
         )
         self.detach_max_abs_vertical_speed_mps = float(
             rospy.get_param("~detach_max_abs_vertical_speed_mps", 0.20)
@@ -172,7 +175,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         )
         self.detach_request_timeout_s = float(rospy.get_param("~detach_request_timeout_s", 8.0))
         self.detach_duration_timeout_s = float(rospy.get_param("~detach_duration_timeout_s", 8.0))
-        self.detach_max_tracking_error_rad = math.radians(float(rospy.get_param("~detach_max_tracking_error_deg", 15.0)))
+        self.detach_max_tracking_error_rad = math.radians(float(rospy.get_param("~detach_max_tracking_error_deg", 40.0)))
         self.detach_recovered_tilt_rad = math.radians(float(rospy.get_param("~detach_recovered_tilt_deg", 5.0)))
         self.detach_recovered_rate_rps = math.radians(float(rospy.get_param("~detach_recovered_rate_deg_s", 10.0)))
         self.detach_recovered_hold_s = float(rospy.get_param("~detach_recovered_hold_s", .30))
@@ -873,6 +876,9 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             return False
         if not self._rates_safe(self.detach_max_rate_rps):
             return False
+        # Wall attachment can bias estimated velocity; admission may ignore its magnitude.
+        if not getattr(self, "detach_vertical_speed_check_enabled", False):
+            return True
         velocity_z = vertical_speed_enu_mps(
             self.odom, self.odom_twist_in_child_frame
         )
@@ -936,9 +942,12 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         if rate > self.detach_max_rate_rps:
             return "角速度 {:.2f} rad/s，需 ≤ {:.2f} rad/s".format(rate, self.detach_max_rate_rps)
         speed = vertical_speed_enu_mps(self.odom, self.odom_twist_in_child_frame)
-        if not getattr(self, "bench_wait_for_ranges", False) and abs(speed) > self.detach_max_abs_vertical_speed_mps:
+        if (getattr(self, "detach_vertical_speed_check_enabled", False)
+                and not getattr(self, "bench_wait_for_ranges", False)
+                and abs(speed) > self.detach_max_abs_vertical_speed_mps):
             return "竖直速度估算 {:+.2f} m/s，需 |v| ≤ {:.2f} m/s".format(speed, self.detach_max_abs_vertical_speed_mps)
-        return "等待姿态和速度连续稳定 {:.2f} 秒".format(self.detach_stable_hold_s)
+        subject = "姿态和速度" if self.detach_vertical_speed_check_enabled else "姿态和角速度（竖直速度准入已屏蔽）"
+        return "等待{}连续稳定 {:.2f} 秒".format(subject, self.detach_stable_hold_s)
 
     def _mode_requested(self, now):
         return bool(
@@ -1986,7 +1995,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         elapsed = self.detach_elapsed_s
         proposed = min(self.detach_time_s, elapsed + self.detach_step_dt)
         measured = self._current_quaternion() if self._odom_fresh(now) else None
-        limit = getattr(self, "detach_max_tracking_error_rad", math.radians(15.))
+        limit = getattr(self, "detach_max_tracking_error_rad", math.radians(40.))
         def error(seconds):
             target = self._quat_slerp(self.q_detach_start, self.q_hover,
                                      self._smoothstep5(seconds / self.detach_time_s))

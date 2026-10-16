@@ -52,8 +52,9 @@ wall_perch_decision_node:
   hold_entry_blend_s: 0.50
   # Detach admission requires stable measured pose and bounded vertical speed.
   # The trajectory starts from the last actual published attitude/thrust.
-  detach_axis_error_deg: 5.0
+  detach_axis_error_deg: 15.0
   detach_max_rate_rps: 0.436332313  # 25 deg/s
+  detach_vertical_speed_check_enabled: false  # Ignore speed magnitude for detach admission.
   detach_max_abs_vertical_speed_mps: 0.20
   detach_stable_hold_s: 0.50
   detach_request_timeout_s: 8.00
@@ -61,7 +62,7 @@ wall_perch_decision_node:
   # 90 deg over 3 s (quintic setpoint).
   detach_time_s: 3.00
   detach_duration_timeout_s: 8.00
-  detach_max_tracking_error_deg: 15.0
+  detach_max_tracking_error_deg: 40.0
   detach_recovered_tilt_deg: 5.0
   detach_recovered_rate_deg_s: 10.0
   detach_recovered_hold_s: 0.30

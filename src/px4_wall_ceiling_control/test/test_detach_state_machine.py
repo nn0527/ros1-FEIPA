@@ -95,14 +95,34 @@ class DetachStateMachineTests(unittest.TestCase):
         with mock.patch.object(rospy.Time, 'now', return_value=at(seconds)):
             n._on_top_range(r)
 
-    def test_default_admission_rejects_vz_which_would_immediately_abort(self):
-        n = self.node()
+    def test_enabled_admission_rejects_vz_which_would_immediately_abort(self):
+        n = self.node(**{"~detach_vertical_speed_check_enabled": True})
         self.assertEqual(n.detach_max_abs_vertical_speed_mps, .2)
         for t, vz, expected in ((10.1, -.9, False), (10.2, -.21, False), (10.3, .19, True)):
             self.feedback(n, t, vz=vz)
             self.assertEqual(n._detach_pose_valid(), expected)
         with self.assertRaises(ValueError):
             self.node(**{'~detach_max_abs_vertical_speed_mps': .9})
+
+    def test_disabled_speed_gate_allows_recorded_bias_and_relaxed_angle(self):
+        n = self.node()
+        self.assertFalse(n.detach_vertical_speed_check_enabled)
+        self.assertAlmostEqual(math.degrees(n.detach_axis_error_rad), 15.)
+        for t in (10.1, 10.3, 10.5, 10.7):
+            self.feedback(n, t, tilt=78., vz=-.32)
+            self.output(n, t, tilt=78.)
+        self.assertTrue(n._detach_start_ready(at(10.7)))
+        self.assertNotIn('竖直速度估算', n._detach_block_reason(at(10.7)))
+        n.detach_requested = True; n.detach_requested_at = at(10.)
+        self.tick(n, 10.7)
+        self.assertEqual(n.state, W.STATE_DETACH_ROTATE)
+
+    def test_relaxed_admission_still_rejects_large_angle_and_rate(self):
+        n = self.node()
+        self.feedback(n, 10.1, tilt=74., vz=-.32)
+        self.assertFalse(n._detach_pose_valid())
+        self.feedback(n, 10.2, tilt=90., vz=-.32, rate=26.)
+        self.assertFalse(n._detach_pose_valid())
 
     def test_repeated_request_does_not_restart_deadline_and_expiry_precedes_ready(self):
         n = self.node()
@@ -178,7 +198,8 @@ class DetachStateMachineTests(unittest.TestCase):
             n._advance_detach_progress(at(t))
         q = n._quat_slerp(n.q_detach_start, n.q_hover, n._smoothstep5(n._detach_progress()))
         self.assertTrue(n.detach_tracking_limited)
-        self.assertLessEqual(quaternion_angle(q, quaternion(90.)), math.radians(15.)+1e-8)
+        self.assertLessEqual(quaternion_angle(q, quaternion(90.)), math.radians(40.)+1e-8)
+        self.assertGreater(quaternion_angle(q, quaternion(90.)), math.radians(39.))
         progress = n._detach_progress()
         self.feedback(n, 12.02, tilt=75.)
         n._advance_detach_progress(at(12.02))

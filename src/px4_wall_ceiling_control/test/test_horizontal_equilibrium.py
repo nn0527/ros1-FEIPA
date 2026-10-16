@@ -72,10 +72,12 @@ class EquilibriumHandoverTests(unittest.TestCase):
         self.n._mode_requested=lambda now:True
         self.n.manager_phase='WAITING_WALL'
         self.n._on_state(State(connected=True,armed=True,mode='POSCTL'))
-    def sample(self,t,velocity=0.,target=2.5,actual=None):
+    def sample(self,t,velocity=0.,target=2.5,actual=None,rates=(0.,0.,0.)):
         # A fixture update at the same time must not replay the initial flow frame.
         self.f.feed(t,vx=velocity,tilt=target if actual is None else actual,
                     flow=self.n.horizontal_flow_at != rospy.Time.from_sec(t))
+        for axis,value in zip("xyz",rates):setattr(self.n.odom.twist.twist.angular,axis,math.radians(value))
+        self.n._prepare_horizontal_velocity(rospy.Time.now())
         self.n.flight_state_received_at=rospy.Time.now();self.n.manager_phase_received_at=rospy.Time.now()
         self.n._on_horizontal_fcu_target(AttitudeTarget(orientation=Quaternion(*pitch(target)),thrust=.50))
         self.n._prepare_horizontal_equilibrium(rospy.Time.now())
@@ -93,10 +95,25 @@ class EquilibriumHandoverTests(unittest.TestCase):
         self.sample(12.25,velocity=.10)
         self.assertTrue(self.n.horizontal_equilibrium.ready)
 
+    def test_entry_uses_only_pitch_rate_with_same_ten_degree_limit(self):
+        self.capture()
+        for i, (rate, expected) in enumerate(((10., True), (-10., True), (10.01, False), (-10.01, False), (float('nan'), False))):
+            with mock.patch.object(self.n.horizontal_equilibrium, 'observe') as observe:
+                self.sample(11.75+i*.25, rates=(60., rate, -60.))
+                self.assertEqual(observe.call_args[0][2], expected)
+            if expected:self.assertTrue(self.n.horizontal_velocity_ready)
+
+    def test_entry_tracking_accepts_below_five_degrees_and_rejects_above(self):
+        self.capture()
+        for i,(actual,expected) in enumerate(((-2.4,True),(-2.6,False))):
+            with mock.patch.object(self.n.horizontal_equilibrium,'observe') as observe:
+                self.sample(11.75+i*.25,target=2.5,actual=actual)
+                self.assertEqual(observe.call_args[0][2],expected)
+
     def test_no_entry_baseline_from_moving_or_untracked_attitude(self):
         for t in (10.,10.25,10.5,10.75,11.):self.sample(t,velocity=.2)
         self.assertFalse(self.n.horizontal_equilibrium.ready)
-        for t in (11.25,11.5,11.75,12.,12.25):self.sample(t,actual=0.)
+        for t in (11.25,11.5,11.75,12.,12.25):self.sample(t,actual=-3.)
         self.assertFalse(self.n.horizontal_equilibrium.ready)
     def test_prestream_keeps_nonzero_balance_and_starts_feedback_before_active(self):
         self.capture();self.n._prepare_horizontal_prestream(rospy.Time.now())

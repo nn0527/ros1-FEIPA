@@ -367,7 +367,7 @@ class WallHorizontalVelocityMixin:
             and is_fresh_receipt(self.horizontal_fcu_target_at,.35,now))
         if eligible:
             angular=self.odom.twist.twist.angular
-            eligible=(math.sqrt(angular.x**2+angular.y**2+angular.z**2)<=math.radians(10.)
+            eligible=(math.isfinite(angular.y) and abs(angular.y)<=math.radians(10.)
                 and rotate_vector(q,(0.,0.,1.))[2]>=math.cos(math.radians(5.)))
         if eligible:
             qtarget=tuple(getattr(target.orientation,k) for k in 'xyzw')
@@ -375,7 +375,7 @@ class WallHorizontalVelocityMixin:
                 and not target.type_mask & AttitudeTarget.IGNORE_ATTITUDE)
             if eligible:
                 measured_axis=rotate_vector(q,(0.,0.,1.));target_axis=rotate_vector(qtarget,(0.,0.,1.))
-                eligible=sum(a*b for a,b in zip(measured_axis,target_axis))>=math.cos(math.radians(1.))
+                eligible=sum(a*b for a,b in zip(measured_axis,target_axis))>=math.cos(math.radians(5.))
         else:qtarget=(0.,0.,0.,1.)
         tracker.observe(self.horizontal_fcu_target_at.to_sec() if self.horizontal_fcu_target_at is not None else 0.,qtarget,eligible)
         self.horizontal_equilibrium_reason=('稳定POSCTL平衡姿态已就绪' if tracker.ready
@@ -453,9 +453,11 @@ class WallHorizontalVelocityMixin:
         axis = rotate_vector(q,(0.,0.,1.))
         tilt = math.acos(max(-1.,min(1.,axis[2])))
         angular = self.odom.twist.twist.angular
-        rate = math.sqrt(angular.x**2+angular.y**2+angular.z**2)
+        # Before takeover, only pitch angular velocity qualifies entry.
+        entry_pitch_only = self.state == W.STATE_IDLE
+        rate = abs(angular.y) if entry_pitch_only else math.sqrt(angular.x**2+angular.y**2+angular.z**2)
         if not math.isfinite(rate) or tilt > self.horizontal_resume_tilt or rate > math.radians(45.):
-            self._reset_horizontal_gate('等待机体接近水平（≤10°）且角速度≤45°/s');return
+            self._reset_horizontal_gate('等待机体接近水平（≤10°）且' + ('俯仰角速度' if entry_pitch_only else '角速度') + '≤45°/s');return
         if self.horizontal_gate_at is None:self.horizontal_gate_at = now
         velocity = linear_velocity_parent_frame(self.odom,self.odom_twist_in_child_frame)
         self.horizontal_measured = velocity[:2]

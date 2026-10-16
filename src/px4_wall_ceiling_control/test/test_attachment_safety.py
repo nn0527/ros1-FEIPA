@@ -749,6 +749,7 @@ class AttachmentSafetyTest(unittest.TestCase):
 
     def test_bench_detach_ignores_finite_vertical_speed_but_keeps_angular_limits(self):
         node = WallDecision.__new__(WallDecision)
+        node.detach_vertical_speed_check_enabled = True
         node.odom = Odometry()
         node.odom.pose.pose.orientation.w = 1.0
         node.odom.twist.twist.linear.z = 0.4

@@ -33,6 +33,7 @@ class DetachCurrentAttitudeTest(unittest.TestCase):
 
     def test_axis_rate_and_velocity_gates_remain(self):
         n=self.node
+        n.detach_vertical_speed_check_enabled=True
         with mock.patch.object(module,'vertical_speed_enu_mps',return_value=0.):
             n._hold_follow_quaternion=lambda:n.q_contact
             self.assertFalse(n._detach_pose_valid())
