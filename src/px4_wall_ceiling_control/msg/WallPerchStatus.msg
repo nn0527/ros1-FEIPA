@@ -133,3 +133,8 @@ string departure_clearance_reason
 float32 recovery_horizontal_integral_x
 float32 recovery_horizontal_integral_y
 bool recovery_horizontal_integral_active
+
+# Post-detach bridge: RECOVER levels while holding its entry height, then ABORT.
+bool detach_abort_recovery
+# Rotation completion only; does not assert clearance or completed handover.
+bool detach_rotation_succeeded

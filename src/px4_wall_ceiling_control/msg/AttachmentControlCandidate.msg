@@ -38,3 +38,5 @@ bool approach_paused
 # bounded by the mux global cap; it is not a request to bypass hard limits.
 bool recovery_support_valid
 float32 recovery_thrust_limit
+# Atomic large-angle RECOVER bridge marker; never applies to other phases.
+bool detach_abort_recovery

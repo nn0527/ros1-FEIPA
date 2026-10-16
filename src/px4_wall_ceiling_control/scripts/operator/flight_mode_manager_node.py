@@ -623,6 +623,8 @@ class FlightModeManagerNode:
             self.phase_reason = "OFFBOARD异常退出清理：已请求" + pilot + "，等待后续连续模式反馈及在途请求结束；禁止新动作"
 
     def _entry_cancel_handover_ready(self, now):
+        if self._wall_detach_abort_recovery_active():
+            return False
         if (getattr(self, 'wall_level_handover_enabled', False)
                 and self.selected_mode == OperatorCommand.MODE_WALL):
             return self._wall_level_handover_ready(now)
@@ -809,14 +811,30 @@ class FlightModeManagerNode:
                     and wall.state in (WallPerchStatus.STATE_RECOVER,
                         WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT))
 
+    def _wall_detach_abort_recovery_active(self):
+        """A detach recovery bridge must reach ABORT before automatic handback.
+
+        A stale bridge status cannot authorize a fallback handback; the next
+        current phase and the normal freshness gates must release this block.
+        """
+        wall = getattr(self, 'wall', None)
+        return bool(getattr(self, 'selected_mode', None) == OperatorCommand.MODE_WALL
+                    and wall is not None and wall.state == WallPerchStatus.STATE_RECOVER
+                    and getattr(wall, 'detach_abort_recovery', False))
+
     def _wall_pilot_request_phase_ready(self, mode, now):
-        if (getattr(self, 'selected_mode', None) != OperatorCommand.MODE_WALL or mode != 'POSCTL'):
+        if getattr(self, 'selected_mode', None) != OperatorCommand.MODE_WALL:
             return True
         flight = getattr(self, 'flight', None)
-        if (flight is not None and flight.connected and flight.mode.upper() == 'POSCTL'
+        if (mode == self._pilot_mode() and flight is not None and flight.connected
+                and flight.mode.upper() == mode
                 and is_fresh(self.flight_at, self.state_timeout_s, now)):
             # Already in the pilot mode: clear a stale OFFBOARD intention. This
             # does not transfer control or override a different pilot mode.
+            return True
+        if mode == self._pilot_mode() and self._wall_detach_abort_recovery_active():
+            return False
+        if mode != 'POSCTL':
             return True
         wall = getattr(self, 'wall', None)
         # Never transfer out of a detach rotation, even with the optional
@@ -854,6 +872,8 @@ class FlightModeManagerNode:
         return reference if isinstance(reference, (int, float)) and math.isfinite(reference) else None
 
     def _wall_level_handover_failure(self, now, odom, received):
+        if self._wall_detach_abort_recovery_active():
+            return "脱离异常回平中：保持高度，等待进入ABORT后再确认交接"
         if not self._wall_level_handover_selected():return "仅RECOVER、ABORT、EXIT允许自动交回遥控器"
         if not kill_clear(self, now):return "急停生效或反馈无效"
         if (not is_fresh(self.wall_at, self.status_timeout_s, now)
@@ -954,6 +974,8 @@ class FlightModeManagerNode:
         text = ("已确认交回" if confirmed else "回平快速交接，等待PX4确认") + self._pilot_mode()
         if getattr(self, 'fault_seen', False):
             text += "；本次含ABORT/故障，未标记正常脱离完成"
+        elif getattr(getattr(self, 'wall', None), 'detach_rotation_succeeded', False):
+            text += "；脱离旋转已完成，按策略经ABORT交接，未等待完整离墙验收"
         else:
             text += "；高度和速度已收敛，未等待完整离墙验收"
         return text
@@ -969,6 +991,8 @@ class FlightModeManagerNode:
                         and not status.fault_detected and not getattr(self, "fault_seen", False)))
 
     def _handover_ready(self, now):
+        if self._wall_detach_abort_recovery_active():
+            return False
         if (getattr(self, 'wall_level_handover_enabled', False)
                 and getattr(self, 'selected_mode', None) == OperatorCommand.MODE_WALL):
             # All wall return paths, including approach timeout, use the same
@@ -1082,10 +1106,15 @@ class FlightModeManagerNode:
             if status is None or not is_fresh(received_at, self.status_timeout_s, now):
                 return
             if (status.state in (WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER)
+                    or getattr(status, "detach_rotation_succeeded", False)
                     or getattr(status, "recovery_completed", False)
                     or getattr(status, "fault_recovery_completed", False)):
                 self.wall_return_episode = True
-            if status.state == WallPerchStatus.STATE_ABORT or status.fault_detected:
+            planned_abort = (status.state == WallPerchStatus.STATE_ABORT
+                             and getattr(status, 'detach_rotation_succeeded', False)
+                             and not status.fault_detected)
+            if ((status.state == WallPerchStatus.STATE_ABORT and not planned_abort)
+                    or status.fault_detected):
                 self.fault_seen = True
                 if status.state == WallPerchStatus.STATE_ABORT or not getattr(self, "wall_failure_reason", ""):
                     self.wall_failure_reason = str(status.reason) or "侧吸故障"
@@ -1096,13 +1125,15 @@ class FlightModeManagerNode:
                 self.recovery_seen = True
             if status.state == WallPerchStatus.STATE_EXIT:
                 if getattr(status, "fault_recovery_completed", False):
-                    # Safe leveling after ABORT authorizes a fault handback,
-                    # never a successful detach/recover result. Explicit flags
-                    # also cover a manager that missed intermediate samples.
-                    self.fault_seen = True
+                    # ABORT is also the configured handback route after a
+                    # successful rotation. Neither path proves wall clearance.
+                    planned_rotation = bool(getattr(status, 'detach_rotation_succeeded', False)
+                                            and not status.fault_detected)
+                    if not planned_rotation:
+                        self.fault_seen = True
                     self.completed = False
                     self.wall_fault_return_ready = True
-                    if not getattr(self, "wall_failure_reason", ""):
+                    if self.fault_seen and not getattr(self, "wall_failure_reason", ""):
                         self.wall_failure_reason = str(status.reason) or "侧吸故障"
                 elif (getattr(status, "detach_completed", False)
                       and getattr(status, "recovery_completed", False)
@@ -1111,6 +1142,10 @@ class FlightModeManagerNode:
 
     def _wall_return_reason(self, confirmed=False):
         if getattr(self, "wall_fault_return_ready", False):
+            if (not getattr(self, 'fault_seen', False)
+                    and getattr(getattr(self, 'wall', None), 'detach_rotation_succeeded', False)):
+                result = "已确认交回" if confirmed else "准备交回"
+                return result + self._pilot_mode() + "；脱离旋转已完成，按策略经ABORT交接，未确认完整离墙验收"
             result = "故障恢复后已安全交回" if confirmed else "故障恢复完成，准备安全交回"
             return result + self._pilot_mode() + "；本次侧吸未正常完成：" + getattr(self, "wall_failure_reason", "侧吸故障")
         result = "正常脱离及恢复完成，已交回" if confirmed else "正常脱离及恢复完成，准备交回"
@@ -1292,6 +1327,13 @@ class FlightModeManagerNode:
         requested = self._requested_mode(now)
         flight_mode = self.flight.mode.upper() if self.flight else ""
         flight_fresh = is_fresh(self.flight_at, self.state_timeout_s, now)
+        if (self.phase == self.RETURNING and flight_mode == 'OFFBOARD'
+                and self._wall_detach_abort_recovery_active()):
+            # Revoke a queued automatic handback if a later decision sample
+            # requires the recovery bridge. The service worker also rechecks.
+            self.wall_level_returning = False
+            self.wall_level_window = None
+            self._set_phase(self.ACTIVE, reason="脱离异常回平中：等待进入ABORT后交接")
         if (self.phase == self.CANCELING_ENTRY and self.selected_mode == OperatorCommand.MODE_WALL
                 and getattr(self, 'wall_level_handover_enabled', False)
                 and flight_fresh and flight_mode == 'OFFBOARD'
@@ -1452,7 +1494,10 @@ class FlightModeManagerNode:
                         and is_fresh(self.wall_at, self.status_timeout_s, now)
                         and self.wall.state == WallPerchStatus.STATE_SLOW_APPROACH):
                     self.phase_reason = self.wall.reason
-                if self._wall_level_handover_selected() and self._wall_level_handover_ready(now):
+                if self._wall_detach_abort_recovery_active():
+                    self.wall_level_window = None
+                    self.phase_reason = "脱离异常回平中：保持高度，等待进入ABORT后再确认交接"
+                elif self._wall_level_handover_selected() and self._wall_level_handover_ready(now):
                     self.wall_level_returning = True
                     self._set_phase(self.RETURNING, reason=self._wall_level_return_reason())
                     self._request_mode(self._pilot_mode())

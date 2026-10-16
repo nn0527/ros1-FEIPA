@@ -96,6 +96,8 @@ class WallDetachVerticalMixin:
 
     def _fault_height_recovery(self):
         return (getattr(self, 'state', None) == W.STATE_ABORT or
+                (getattr(self, 'state', None) == W.STATE_RECOVER and
+                 getattr(self, 'detach_abort_recovery', False)) or
                 (getattr(self, 'state', None) == W.STATE_EXIT and
                  getattr(self, 'fault_recovery_completed', False)))
 
@@ -280,6 +282,11 @@ class WallDetachVerticalMixin:
             self.detach_vertical_fault = ''
             self.detach_altitude_m = self.recovery_altitude_m = height
             self.vertical_reference_source = 'fault_recovery_height'
+            if getattr(self, 'detach_abort_recovery', False):
+                # The two distinct consistent fault frames above authorize this
+                # reference. Do not capture a second height on the next tick.
+                self.detach_abort_height_pending = False
+                self.recovery_wait_for_level = False
             self.detach_vertical_last_feedback = (source, height, speed)
         old = self.detach_vertical_last_feedback
         if old is not None and source > old[0]:

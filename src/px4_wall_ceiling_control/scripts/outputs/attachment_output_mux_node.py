@@ -143,6 +143,7 @@ class AttachmentOutputMuxNode:
         self.rc_yaw_detach_deg = float(rospy.get_param("~rc_yaw_detach_deg", 5.0))
         self.rc_yaw_slew_deg_s = float(rospy.get_param("~rc_yaw_slew_deg_s", 20.0))
         self.recovery_attitude_limits_enabled = bool(rospy.get_param("~recovery_attitude_limits_enabled", False))
+        self.detach_abort_recovery_enabled = bool(rospy.get_param("~detach_abort_recovery_enabled", False))
         self.recovery_max_tilt_deg = float(rospy.get_param("~recovery_max_tilt_deg", 5.0))
         self.recovery_tilt_slew_deg_s = float(rospy.get_param("~recovery_tilt_slew_deg_s", 10.0))
         self.recovery_yaw_slew_deg_s = float(rospy.get_param("~recovery_yaw_slew_deg_s", 20.0))
@@ -431,6 +432,9 @@ class AttachmentOutputMuxNode:
                                getattr(self, "wall_candidate_timeout_s", .20),
                                now, future_tolerance_s=0.0):
             return "source_stamp_stale_zero_or_future"
+        if (getattr(message, "detach_abort_recovery", False)
+                and not self._detach_abort_recovery_active(message)):
+            return "invalid_detach_abort_recovery_marker"
         if getattr(message, "recovery_support_valid", False):
             cap = getattr(message, "recovery_thrust_limit", float("nan"))
             if (not math.isfinite(cap)
@@ -1286,6 +1290,14 @@ class AttachmentOutputMuxNode:
                              and control.horizontal_velocity_enabled
                              and control.horizontal_velocity_active)))
 
+    def _detach_abort_recovery_active(self, control):
+        """Only an explicit WALL/RECOVER bridge may bypass the level cone."""
+        return bool(getattr(self, "detach_abort_recovery_enabled", False)
+                    and control is not None
+                    and control.source == AttachmentControlCandidate.SOURCE_WALL
+                    and control.control_phase == WallPerchStatus.STATE_RECOVER
+                    and getattr(control, "detach_abort_recovery", False))
+
     def _limit_final_recovery_target(self, now, target, source, candidate=None):
         # Project only the desired axis here. Continuity is applied later from
         # the last actual publication, never from an unsent projected target.
@@ -1295,10 +1307,11 @@ class AttachmentOutputMuxNode:
                 or flight.mode.upper() != "OFFBOARD"
                 or not is_fresh(self.flight_state_at, self.state_timeout_s, now)):
             return target
-        q = tuple(getattr(target.orientation, k) for k in "xyzw")
-        q, _ = limit_recovery_attitude(q, None, 0.,
-            math.radians(self.recovery_max_tilt_deg), 0., 0.)
-        target.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
+        if not self._detach_abort_recovery_active(control):
+            q = tuple(getattr(target.orientation, k) for k in "xyzw")
+            q, _ = limit_recovery_attitude(q, None, 0.,
+                math.radians(self.recovery_max_tilt_deg), 0., 0.)
+            target.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
         cap = self.recovery_final_thrust_cap
         if getattr(control, "recovery_support_valid", False):
             # This per-maneuver allowance follows verified vertical support;
@@ -1432,13 +1445,26 @@ class AttachmentOutputMuxNode:
         self.wall_publication_slew = None
         phase = candidate.control_phase
         abort = phase == WallPerchStatus.STATE_ABORT
+        detach_recovery = self._detach_abort_recovery_active(candidate)
         returning = phase in (WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER,
                               WallPerchStatus.STATE_EXIT, WallPerchStatus.STATE_ABORT)
         if not returning and phase not in (
                 WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE,
                 WallPerchStatus.STATE_WALL_HOLD, WallPerchStatus.STATE_WALL_PIN):
             return target
-        previous = self._wall_publication_seed(now)
+        if detach_recovery:
+            # The bridge follows actual outputs from this action. An old action,
+            # pilot-mode seed or measured-pose fallback cannot create a sudden
+            # attitude step at the new RECOVER entry.
+            if not self._terminal_history_fresh(now, candidate):
+                self.wall_candidate_rejection = "detach_abort_recovery_history_stale"
+                return None
+            if not self._near_level_publication_authorized(now):
+                self.wall_candidate_rejection = "detach_abort_recovery_feedback_invalid"
+                return None
+            previous = self.last_published_control
+        else:
+            previous = self._wall_publication_seed(now)
         if previous is None:
             if abort:
                 # Lack of continuity history must not suppress a validated
@@ -1473,11 +1499,18 @@ class AttachmentOutputMuxNode:
         if terminal and not self._terminal_history_fresh(now, candidate):
             self.wall_candidate_rejection = 'terminal_level_publication_history_stale'
             return None
-        rate_mode = ('abort_immediate' if abort else 'detach_near_level' if near_level
+        rate_mode = ('abort_immediate' if abort else 'detach_abort_recovery' if detach_recovery
+                     else 'detach_near_level' if near_level
                      else 'detach_terminal' if terminal
                      else 'recovery' if phase in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT)
                      else 'detach_rotation' if returning else 'wall_rotation')
-        if near_level or phase in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT):
+        if detach_recovery:
+            # Keep the previous outer-cone axis intact and slew toward the
+            # bridge trajectory. Ordinary RECOVER still requires a 5 deg seed.
+            q, _ = limit_recovery_attitude(q, q_previous, dt, math.pi,
+                math.radians(min(10., self.recovery_tilt_slew_deg_s)),
+                math.radians(min(20., self.recovery_yaw_slew_deg_s)))
+        elif near_level or phase in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT):
             prev_axis, _ = axis_yaw(q_previous)
             if math.acos(max(-1., min(1., prev_axis[2]))) > math.radians(self.recovery_max_tilt_deg) + 1e-6:
                 # Normal RECOVER is admitted only after both measured and sent
@@ -1510,6 +1543,8 @@ class AttachmentOutputMuxNode:
         # follows actual support; loss of a soft allowance cannot cause a step.
         slew_rate = (getattr(self, "wall_return_thrust_slew_per_s", .50) if returning
                      else getattr(self, "wall_maneuver_thrust_slew_per_s", .50))
+        if detach_recovery:
+            slew_rate = min(.50, slew_rate)
         thrust_step = slew_rate * dt
         target.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
         target.thrust = max(self.min_thrust, min(self.max_thrust,
@@ -1531,6 +1566,7 @@ class AttachmentOutputMuxNode:
             "attitude_step_deg": math.degrees(quaternion_angle(q_previous, q)),
             "thrust_step": target.thrust-thrust_previous,
             "abort_level_immediate": abort,
+            "detach_abort_recovery": detach_recovery,
             "support_allowance_valid": bool(getattr(candidate, "recovery_support_valid", False)),
             "requested_thrust": requested_thrust,
             "limited": quaternion_angle(q, desired_q) > 1e-9
@@ -1578,6 +1614,12 @@ class AttachmentOutputMuxNode:
                 self.wall_candidate_rejection = "candidate_expired_before_publication"
                 return self.OUTPUT_NONE
             slew_info = getattr(self, 'wall_publication_slew', None) or {}
+            if slew_info.get('rate_mode') == 'detach_abort_recovery':
+                if (not self._detach_abort_recovery_active(candidate)
+                        or not self._near_level_publication_authorized(published_at)
+                        or not self._terminal_history_fresh(published_at, candidate)):
+                    self.wall_candidate_rejection = 'detach_abort_recovery_invalid_before_publication'
+                    return self.OUTPUT_NONE
             if slew_info.get('terminal_softening_active'):
                 if (not self._near_level_publication_authorized(published_at)
                         or not self._terminal_history_fresh(published_at, candidate)

@@ -86,6 +86,9 @@ install(FILES README.md
 )
 
 if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_detach_abort_recovery.py)
+  catkin_add_nosetests(test/test_detach_abort_mux.py)
+  catkin_add_nosetests(test/test_detach_abort_handover.py)
   catkin_add_nosetests(test/test_detach_vertical.py)
   catkin_add_nosetests(test/test_height_continuation.py)
   catkin_add_nosetests(test/test_bounded_detach_integration.py)

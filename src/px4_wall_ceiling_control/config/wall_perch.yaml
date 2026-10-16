@@ -65,8 +65,11 @@ wall_perch_decision_node:
   detach_duration_timeout_s: 8.00
   detach_max_tracking_error_deg: 40.0
   detach_recovered_tilt_deg: 5.0
-  detach_recovered_rate_deg_s: 10.0
+  detach_recovered_rate_deg_s: 20.0
   detach_recovered_hold_s: 0.30
+  # All post-detach outcomes use ABORT, admitted only by fresh Euler pitch.
+  detach_abort_route_enabled: true
+  detach_abort_max_pitch_deg: 20.0
   recover_time_s: 1.00
   recover_timeout_s: 15.00
   # Keep one departure height/base through DETACH, RECOVER and handover.

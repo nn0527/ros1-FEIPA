@@ -37,6 +37,7 @@ attachment_output_mux_node:
   # Independent final DETACH setpoint deceleration before the vehicle levels.
   # These constrain targets; actual overshoot must be verified in flight logs.
   detach_terminal_enabled: true
+  detach_abort_recovery_enabled: true
   detach_terminal_start_deg: 30.0
   detach_terminal_axis_rate_deg_s: 10.0
   detach_terminal_yaw_rate_deg_s: 20.0

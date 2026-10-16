@@ -42,9 +42,10 @@ from px4_wall_ceiling_control.msg import (
 
 from px4_wall_ceiling_control.adapters.wall_horizontal_velocity import WallHorizontalVelocityMixin
 from px4_wall_ceiling_control.adapters.wall_detach_vertical import WallDetachVerticalMixin
+from px4_wall_ceiling_control.adapters.wall_detach_abort import WallDetachAbortMixin
 
 
-class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin):
+class WallPerchDecisionNode(WallDetachAbortMixin, WallDetachVerticalMixin, WallHorizontalVelocityMixin):
     STATE_NAMES = {
         WallPerchStatus.STATE_IDLE: "IDLE",
         WallPerchStatus.STATE_FRONT_WALL_DETECT: "FRONT_WALL_DETECT",
@@ -495,6 +496,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         )
         self._init_horizontal_velocity()
         self._init_detach_vertical()
+        self._init_detach_abort()
         if not self.horizontal_velocity_enabled:
             # Flip and detach continuity need final output feedback even when
             # horizontal velocity control is disabled in a launch profile.
@@ -802,6 +804,14 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 or (previous_mode.upper() == "OFFBOARD" and message.mode.upper() != "OFFBOARD")):
             if hasattr(self, "_reset_recovery_horizontal"):
                 self._reset_recovery_horizontal("退出本次OFFBOARD：取消退墙动作", clear_departure=True)
+        if (getattr(self, 'detach_abort_recovery', False) and message.connected
+                and (not message.armed or (previous_mode.upper() == 'OFFBOARD'
+                                          and message.mode.upper() != 'OFFBOARD'))):
+            # A confirmed physical disarm/pilot mode exit retires the bridge.
+            # It is not an automatic mode request and does not bypass ABORT's
+            # pitch gate while this action still owns OFFBOARD.
+            self._enter_state(WallPerchStatus.STATE_IDLE, self.flight_state_received_at,
+                              'detach recovery control released by FCU; retire action')
         if not message.armed:
             self._reset_flip_vertical_support()
             self._reset_detach_vertical()
@@ -1530,6 +1540,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         self.q_detach_start = self.q_contact
 
     def _enter_state(self, new_state, now, reason):
+        new_state, reason = self._route_detach_abort(new_state, now, reason)
         if new_state == self.state:
             self.last_reason = reason
             return
@@ -1571,6 +1582,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             q = output.orientation
             self.q_detach_start = self._quat_normalize((q.x, q.y, q.z, q.w))
         if new_state in (WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_FRONT_WALL_DETECT):
+            self._reset_detach_abort()
             self.canceled_entry_recovery = False
             self.cancel_requested_at = None
             self.recovery_started_at = None
@@ -1683,6 +1695,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             self.top_clear_since = None
             self.top_clear_last_sample_at = None
         elif new_state == WallPerchStatus.STATE_DETACH_ROTATE:
+            self._reset_detach_abort()
             self.recovery_started_at = None
             self.detach_requested = False
             if getattr(self, "bench_wait_for_ranges", False):
@@ -1759,7 +1772,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             and not mode_requested
         )
 
-        if cancel and self.state not in (
+        if cancel and not getattr(self, 'detach_abort_recovery', False) and self.state not in (
             WallPerchStatus.STATE_IDLE,
             WallPerchStatus.STATE_EXIT,
             WallPerchStatus.STATE_ABORT,
@@ -1955,6 +1968,9 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 self._enter_state(WallPerchStatus.STATE_RECOVER, now, "detach measured and published attitude recovered")
 
         elif self.state == WallPerchStatus.STATE_RECOVER:
+            if getattr(self, 'detach_abort_recovery', False):
+                self._update_detach_abort_recovery(now)
+                return
             if getattr(self, "detach_vertical_fault", ""):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, self.detach_vertical_fault)
@@ -2332,11 +2348,15 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             quaternion = self._quat_slerp(self.q_detach_start, self.q_hover, self._smoothstep5(progress))
             thrust = self._detach_vertical_thrust(now, self.detach_step_dt)
         elif self.state in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT, WallPerchStatus.STATE_ABORT):
-            quaternion = self.q_hover
+            quaternion = (self._detach_abort_recovery_attitude(now)
+                          if getattr(self, 'detach_abort_recovery', False) else self.q_hover)
             thrust = (self._detach_vertical_thrust(now, min(.05, max(0., self.control_dt)))
                       if getattr(self, "detach_vertical_active", False) else self._recovery_height_thrust())
 
-        quaternion = self._horizontal_attitude(now, quaternion)
+        if not getattr(self, 'detach_abort_recovery', False):
+            quaternion = self._horizontal_attitude(now, quaternion)
+        else:
+            self.horizontal_velocity_active = False
         if quaternion is not None and math.isfinite(thrust):
             if (getattr(self, "bench_wait_for_ranges", False) and getattr(self, "detach_altitude_m", None) is not None
                     and hasattr(self, "bench_detach_thrust_at") and math.isfinite(thrust)):
@@ -2361,6 +2381,9 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         status.header.stamp = now
         status.state = self.state
         status.state_name = self.STATE_NAMES[self.state]
+        status.detach_abort_recovery = bool(getattr(self, 'detach_abort_recovery', False)
+                                           and self.state == WallPerchStatus.STATE_RECOVER)
+        status.detach_rotation_succeeded = getattr(self, 'detach_rotation_succeeded', False)
         if getattr(self, "canceled_entry_recovery", False):
             # ABORT describes the canceled side-attachment attempt; owner NONE's
             # already-running output controller remains the sole producer.
@@ -2430,7 +2453,9 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             self.top_clear_hold_s,
         )
         status.fault_detected = bool(
-            self.state == WallPerchStatus.STATE_ABORT
+            (self.state == WallPerchStatus.STATE_ABORT and not status.detach_rotation_succeeded)
+            or status.detach_abort_recovery
+            or bool(getattr(self, 'detach_vertical_fault', ''))
             or not status.odom_fresh
             or not status.flight_state_fresh
             or (status.enabled and self._front_required() and not status.front_range_fresh)
@@ -2524,6 +2549,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         candidate.approach_paused = status.approach_paused
         candidate.recovery_support_valid = status.recovery_support_valid
         candidate.recovery_thrust_limit = status.recovery_thrust_limit
+        candidate.detach_abort_recovery = status.detach_abort_recovery
         candidate.source = AttachmentControlCandidate.SOURCE_WALL
         candidate.acquire_request = status.acquire_request
         candidate.keep_ownership = status.keep_ownership
