@@ -10,6 +10,7 @@ from px4_wall_ceiling_control.domain.geometry import rotate_vector
 from px4_wall_ceiling_control.domain.recovery_attitude_limits import (
     axis_yaw, attitude_from_axis_yaw, limit_recovery_attitude)
 from test_flight_handover import OutputMux
+import test_candidate_latency as latency_fixture
 
 
 def q(tilt=0, direction=0, yaw=0):
@@ -66,20 +67,15 @@ class GeometryLimitsTest(unittest.TestCase):
 
 class FinalTargetLimitsTest(unittest.TestCase):
     def node(self):
-        n=OutputMux.__new__(OutputMux)
-        n.recovery_attitude_limits_enabled=True
-        n.recovery_max_tilt_deg=5;n.recovery_tilt_slew_deg_s=10;n.recovery_yaw_slew_deg_s=20
-        n.recovery_final_thrust_cap=.6
-        n.recovery_previous_target=None;n.recovery_previous_at=None
-        n.wall_status=WallPerchStatus(state=WallPerchStatus.STATE_RECOVER)
-        n.wall_status_at=n.flight_state_at=rospy.Time.from_sec(10)
-        n.status_timeout_s=.3;n.state_timeout_s=1
-        n.flight_state=State(mode="OFFBOARD",connected=True)
-        n.recovery_target_publisher=mock.Mock();n.recovery_horizontal_publisher=mock.Mock()
-        return n
+        fixture = latency_fixture.CandidateLatencyTest()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.fx = fixture
+        fixture.accept(fixture.candidate())
+        fixture.seed_publication(angle=0, thrust=.60, age=.02)
+        return fixture.node
 
     def control(self, state, seconds=10., sequence=1):
-        # Owned wall limits consume the phase from this exact control frame.
         candidate = AttachmentControlCandidate(
             source=AttachmentControlCandidate.SOURCE_WALL,
             phase_valid=True, control_phase=state,
@@ -91,24 +87,41 @@ class FinalTargetLimitsTest(unittest.TestCase):
         x,y,z,w=q(12,45,30)
         return AttitudeTarget(orientation=Quaternion(x=x,y=y,z=z,w=w),thrust=.85)
 
+    def publish(self, state, sequence=2):
+        self.fx.advance()
+        candidate=self.fx.candidate(phase=state, sequence=sequence, acquire=False)
+        candidate.attitude_setpoint=self.target().orientation
+        candidate.thrust_normalized=.85
+        self.fx.accept(candidate)
+        n=self.fx.node
+        self.assertEqual(n._publish_candidate(self.fx.now,candidate),n.OUTPUT_ATTITUDE_THRUST)
+        return n.attitude_publisher.publish.call_args.args[0]
+
     def test_recover_abort_final_thrust_and_horizontal_proxy(self):
         for state in (WallPerchStatus.STATE_RECOVER,WallPerchStatus.STATE_ABORT):
-            n=self.node();n.wall_status.state=state
-            t=n._limit_final_recovery_target(rospy.Time.from_sec(10),self.target(),AttachmentControlCandidate.SOURCE_WALL,
-                self.control(n.wall_status.state))
+            n=self.node()
+            t=self.publish(state)
             self.assertAlmostEqual(t.thrust,.6,places=6)
-            self.assertAlmostEqual(tilt(tuple(getattr(t.orientation,k) for k in "xyzw")),5)
+            final_tilt=tilt(tuple(getattr(t.orientation,k) for k in "xyzw"))
+            self.assertLessEqual(final_tilt,5.000001)
             value=n.recovery_horizontal_publisher.publish.call_args[0][0].data
-            self.assertLessEqual(value,.6*math.sin(math.radians(5))+1e-7)
+            self.assertAlmostEqual(value,t.thrust*math.sin(math.radians(final_tilt)))
+            self.assertEqual(n.recovery_previous_at,self.fx.now)
 
-    def test_protected_states_are_unchanged(self):
+    def test_flip_hold_and_rotation_before_horizontal_resume_are_unchanged_by_recovery_projection(self):
         for state in (WallPerchStatus.STATE_FLIP_TO_WALL,WallPerchStatus.STATE_WALL_CAPTURE,
-                      WallPerchStatus.STATE_WALL_HOLD,WallPerchStatus.STATE_DETACH_ROTATE,WallPerchStatus.STATE_EXIT):
+                      WallPerchStatus.STATE_WALL_HOLD,WallPerchStatus.STATE_DETACH_ROTATE):
             n=self.node();n.wall_status.state=state;t=self.target();before=t.orientation
             result=n._limit_final_recovery_target(rospy.Time.from_sec(10),t,AttachmentControlCandidate.SOURCE_WALL,
                 self.control(state))
             self.assertEqual(result.orientation,before);self.assertAlmostEqual(result.thrust,.85,places=6)
             n.recovery_target_publisher.publish.assert_not_called()
+
+    def test_exit_uses_recovery_cone_and_actual_publication_history(self):
+        n=self.node()
+        t=self.publish(WallPerchStatus.STATE_EXIT)
+        self.assertLessEqual(tilt(tuple(getattr(t.orientation,k) for k in "xyzw")),.4+1e-6)
+        self.assertAlmostEqual(t.thrust,.6)
 
     def test_altctl_and_ceiling_outputs_are_unchanged(self):
         for mode,source in [("ALTCTL",AttachmentControlCandidate.SOURCE_WALL),("OFFBOARD",AttachmentControlCandidate.SOURCE_CEILING)]:
@@ -117,13 +130,14 @@ class FinalTargetLimitsTest(unittest.TestCase):
                 self.control(WallPerchStatus.STATE_RECOVER))
             self.assertAlmostEqual(t.thrust,.85,places=6)
 
-    def test_recover_to_abort_keeps_slew_history(self):
-        n=self.node();n.recovery_previous_target=q();n.recovery_previous_at=rospy.Time.from_sec(9.98)
-        t=n._limit_final_recovery_target(rospy.Time.from_sec(10),self.target(),AttachmentControlCandidate.SOURCE_WALL,
-                self.control(n.wall_status.state))
-        n.wall_status.state=WallPerchStatus.STATE_ABORT
-        t=n._limit_final_recovery_target(rospy.Time.from_sec(10.02),self.target(),AttachmentControlCandidate.SOURCE_WALL,
-            self.control(WallPerchStatus.STATE_ABORT, 10.02, 2))
-        self.assertLessEqual(tilt(tuple(getattr(t.orientation,k) for k in "xyzw")),.4+1e-6)
+    def test_recover_to_abort_retains_thrust_history_without_delaying_safe_level_projection(self):
+        n=self.node()
+        first=self.publish(WallPerchStatus.STATE_RECOVER)
+        before=n.last_published_control
+        t=self.publish(WallPerchStatus.STATE_ABORT,3)
+        self.assertAlmostEqual(tilt(tuple(getattr(t.orientation,k) for k in "xyzw")),5.)
+        self.assertLessEqual(abs(t.thrust-before[1]),.010001)
+        self.assertEqual(n.last_published_control[2],self.fx.now)
+        self.assertLess(tilt(tuple(getattr(first.orientation,k) for k in "xyzw")),5.)
 
 if __name__=="__main__": unittest.main()

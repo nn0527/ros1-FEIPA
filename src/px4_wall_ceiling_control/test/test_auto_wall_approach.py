@@ -295,7 +295,11 @@ class AutoOutputTests(unittest.TestCase):
         corrected=n._preflip_bias_attitude(now,Quaternion(w=1),C.SOURCE_NONE)
         self.assertEqual(corrected.x,0)
         n.approach_previous_target=None
-        n._limit_final_approach_target(now,AttitudeTarget(orientation=corrected,thrust=.48),C.SOURCE_NONE)
+        target=n._limit_final_approach_target(now,AttitudeTarget(orientation=corrected,thrust=.48),C.SOURCE_NONE)
+        self.assertIsNone(n.approach_previous_target)
+        n.attitude_publisher=mock.Mock()
+        n.attitude_publisher.publish(target)
+        n._remember_publication(target,C.SOURCE_NONE,now)
         self.assertEqual(n.approach_previous_target,(0,0,0,1))
     def test_publish_path_applies_limits_after_rc(self):
         n,now=self.node();raw=q(12,45)

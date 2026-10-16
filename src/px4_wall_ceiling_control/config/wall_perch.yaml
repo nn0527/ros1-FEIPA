@@ -81,7 +81,8 @@ wall_perch_decision_node:
   departure_clearance_distance_m: 0.30
   departure_clearance_hold_s: 0.30
   departure_heading_tolerance_deg: 10.0
-  # Applied only in RECOVER and ABORT. ENU up is positive.
+  # Vertical target-speed limits; ENU up is positive. Normal departure uses
+  # its captured support base and independent PI through handover.
   recovery_max_up_speed_mps: 0.10
   recovery_max_down_speed_mps: 0.15
   recovery_height_to_speed_kp: 0.50
@@ -106,13 +107,14 @@ wall_perch_decision_node:
   wall_angle_deg: 90.0
   # 慢速接近一开始就向墙倾斜3°，不再先做翻转前悬停稳定阶段。
   approach_pitch_deg: 3.0
-  # Optional fused-velocity feedback: console launch enables it, legacy launches keep it off.
+  # Console launch enables fused velocity. Normal departure requires its frozen
+  # equilibrium/heading; legacy bench departure retains its separate path.
   horizontal_velocity_enabled: false
   horizontal_approach_speed_mps: 0.10
   # Approach retains the actual POSCTL collective at takeover; recovery keeps its own base.
   approach_use_takeover_thrust: true
   horizontal_velocity_kp: 1.5
-  # Approach-only ENU integral; recovery continues to use P control.
+  # Approach ENU integral. Recovery uses its own separately reset PI instance.
   horizontal_velocity_ki: 0.30
   horizontal_integral_limit_mps2: 0.20
   horizontal_equilibrium_window_s: 0.5

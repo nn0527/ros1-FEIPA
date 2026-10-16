@@ -104,13 +104,15 @@ if rospy is not None:
 
         def tick(self,t,owner=2,output=True,offset=0.,mode='OFFBOARD',manager='ACTIVE',quality=80,stamp=None):
             self.f.feed(t,vx=-.03,quality=quality)
+            self.n.horizontal_estimator.velocity_vert_status_flag = True
+            self.n.horizontal_estimator.pos_vert_abs_status_flag = True
             now=rospy.Time.now();self.n.odom.header.stamp=now if stamp is None else rospy.Time.from_sec(stamp)
             self.n._on_state(State(connected=True,armed=True,mode=mode))
             self.n.manager_phase=manager;self.n.manager_phase_received_at=now
             self.n._on_horizontal_output_owner(UInt8(data=owner))
             if output:
                 q=self.q if not offset else (0.,math.sin(math.radians(offset)/2),0.,math.cos(math.radians(offset)/2))
-                msg=AttitudeTarget(orientation=Quaternion(*q));msg.header.stamp=now
+                msg=AttitudeTarget(orientation=Quaternion(*q),thrust=.49);msg.header.stamp=now
                 self.n._on_horizontal_output(msg)
             self.q=self.n._horizontal_attitude(now,self.n.q_hover)
             return self.n.horizontal_controller.integral

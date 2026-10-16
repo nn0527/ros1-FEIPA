@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Exercise the actual mocked MAVROS publication boundary, without ROS output."""
 import math
+import struct
 import unittest
 from unittest import mock
 
 import rospy
-from mavros_msgs.msg import EstimatorStatus, State
+from mavros_msgs.msg import AttitudeTarget, EstimatorStatus, State
 from nav_msgs.msg import Odometry
 from px4_wall_ceiling_control.msg import OperatorCommand, WallPerchStatus as Wall
 import test_candidate_latency as fixture
@@ -151,6 +152,54 @@ class DetachOutputContinuityTest(unittest.TestCase):
         self.assertIs(self.node.last_published_control, before)
         self.assertEqual((self.node.recovery_previous_target, self.node.recovery_previous_at), (previous_q, previous_at))
 
+    def test_offboard_fcu_callback_resumes_actual_output_without_relearning_handover(self):
+        n = self.node
+        pilot_target = AttitudeTarget(orientation=fixture.tilted(1.), thrust=.52)
+        pilot_target.header.stamp = self.fx.now
+        n.fcu_attitude_target, n.fcu_attitude_target_at = pilot_target, self.fx.now
+        self.fx.seed_publication(angle=30., thrust=.75)
+        self.fx.advance(.6)
+        n.odom.header.stamp = n.odom_at = self.fx.now
+        n.odom.pose.pose.orientation = fixture.tilted(4.)
+        echo = AttitudeTarget(orientation=fixture.tilted(5.), thrust=.64)
+        echo.header.stamp = self.fx.now
+        n._on_fcu_attitude_target(echo)
+        self.assertIs(n.fcu_attitude_target, pilot_target)
+        self.assertEqual(n.fcu_attitude_target_at, rospy.Time.from_sec(10.))
+        target = self.publish(self.command(Wall.STATE_DETACH_ROTATE, angle=0., thrust=.72))
+        self.assertAlmostEqual(target.thrust, .64)
+        self.assertAlmostEqual(fixture.tilt(target), 4.)
+        self.fx.advance()
+        target = self.publish(self.command(Wall.STATE_DETACH_ROTATE, angle=0., thrust=.72))
+        self.assertAlmostEqual(target.thrust, .65)
+        self.assertEqual(n.last_published_control[2], self.fx.now)
+
+    def test_fresh_receipt_cannot_revive_stale_offboard_echo(self):
+        n = self.node
+        self.fx.seed_publication(angle=0., thrust=.75)
+        self.fx.advance(.6)
+        n.odom.header.stamp = n.odom_at = self.fx.now
+        echo = AttitudeTarget(orientation=fixture.tilted(0.), thrust=.64)
+        echo.header.stamp = rospy.Time.from_sec(10.)
+        n._on_fcu_attitude_target(echo)
+        candidate = self.command(Wall.STATE_DETACH_ROTATE)
+        self.assertEqual(n._publish_candidate(self.fx.now, candidate), fixture.Mux.OUTPUT_NONE)
+        self.assertEqual(n.wall_candidate_rejection, 'final_slew_seed_unavailable')
+        n.attitude_publisher.publish.assert_not_called()
+
+    def test_serialized_maximum_echo_is_clamped_and_retired_on_mode_exit(self):
+        n = self.node
+        self.fx.advance(.02)
+        n.odom.header.stamp = n.odom_at = self.fx.now
+        echo = AttitudeTarget(orientation=fixture.tilted(0.),
+                              thrust=struct.unpack('f', struct.pack('f', .85))[0])
+        echo.header.stamp = self.fx.now
+        n._on_fcu_attitude_target(echo)
+        target = self.publish(self.command(Wall.STATE_DETACH_ROTATE, thrust=.85))
+        self.assertEqual(target.thrust, n.max_thrust)
+        n._on_state(State(connected=True, armed=True, mode='POSCTL'))
+        self.assertIsNone(n.wall_continuity_fcu_snapshot)
+
 
 class WallReturnOutcomeTest(unittest.TestCase):
     def setUp(self):
@@ -203,6 +252,36 @@ class WallReturnOutcomeTest(unittest.TestCase):
         self.assertTrue(n.wall_fault_return_ready)
         self.assertFalse(n.completed)
 
+    def test_fault_return_keeps_stream_until_posctl_confirmation_and_preserves_result(self):
+        n = self.node
+        n.phase = n.ACTIVE
+        n.flight = State(mode='OFFBOARD', armed=True, connected=True)
+        n.flight_at = self.now
+        n.state_timeout_s = 1.5
+        n.wall.state = Wall.STATE_EXIT
+        n.wall.fault_recovery_completed = True
+        n.wall.reason = '脱离超时后故障回平'
+        n._requested_mode = mock.Mock(return_value=OperatorCommand.MODE_WALL)
+        n._handover_ready = mock.Mock(return_value=True)
+        n._request_mode = mock.Mock()
+        n.prestream_pub = mock.Mock()
+        n.phase_pub = mock.Mock()
+        n.phase_reason_pub = mock.Mock()
+        with mock.patch.object(rospy.Time, 'now', return_value=self.now), mock.patch.object(rospy, 'loginfo'):
+            n._on_timer(None)
+            self.assertEqual(n.phase, n.RETURNING)
+            self.assertFalse(n.completed)
+            self.assertIn('故障', n.phase_reason)
+            n._on_timer(None)
+            n._request_mode.assert_called_once_with('POSCTL')
+            self.assertTrue(n.prestream_pub.publish.call_args.args[0].data)
+            n.flight.mode = 'POSCTL'
+            n._on_timer(None)
+        self.assertEqual(n.phase, n.LOCKED)
+        self.assertIn('故障', n.phase_reason)
+        self.assertIn('已安全交回POSCTL', n.phase_reason)
+        self.assertFalse(n.prestream_pub.publish.call_args.args[0].data)
+
     def test_centering_disabled_still_requires_fresh_valid_rc(self):
         n = self.node
         n.output_mode = 2
@@ -224,6 +303,125 @@ class WallReturnOutcomeTest(unittest.TestCase):
         n.rc_at = self.now
         n.rc_channels = (1500, 1500, 0, 1500)
         self.assertFalse(n._handover_ready(self.now))
+
+    def test_revoked_exit_blocks_timer_and_service_until_new_valid_exit(self):
+        n = self.node
+        n.phase = n.ACTIVE
+        n.flight = State(mode='OFFBOARD', armed=True, connected=True)
+        n.flight_at = self.now
+        n.state_timeout_s = 1.5
+        n.wall.state = Wall.STATE_EXIT
+        n.wall.detach_completed = n.wall.recovery_completed = True
+        n._requested_mode = mock.Mock(return_value=OperatorCommand.MODE_WALL)
+        n._request_mode = mock.Mock()
+        n.set_mode = mock.Mock()
+        n.prestream_pub = mock.Mock()
+        n.phase_pub = mock.Mock()
+        n.phase_reason_pub = mock.Mock()
+        n.output_mode = 2
+        n.output_at = n.estimator_at = n.odom_at = self.now
+        n.estimator_timeout_s = n.odom_timeout_s = .5
+        n.estimator = EstimatorStatus(attitude_status_flag=True, velocity_vert_status_flag=True)
+        n.odom = Odometry(); n.odom.pose.pose.orientation.w = 1.
+        n.odom_twist_in_child_frame = True
+        n.handover_max_tilt_deg = 10.
+        n.handover_max_vertical_speed_mps = .2
+        n.require_rc_center = False
+        n.rc_timeout_s = .2
+        n.rc_at = self.now
+        n.rc_channels = (1500, 1500, 1500, 1500)
+        n._wall_horizontal_ready = mock.Mock(return_value=True)
+        with mock.patch.object(rospy.Time, 'now', return_value=self.now), mock.patch.object(rospy, 'loginfo'):
+            n._on_timer(None)
+            self.assertEqual(n.phase, n.RETURNING)
+            self.assertTrue(n.completed)
+            n.wall.state = Wall.STATE_RECOVER
+            n.wall.detach_completed = n.wall.recovery_completed = False
+            # A callback may revoke EXIT after scheduling but before the mode
+            # service worker runs, before the next manager timer observes it.
+            with mock.patch.object(rospy, 'wait_for_service'):
+                n._send_mode_request('POSCTL')
+            n.set_mode.assert_not_called()
+            n._on_timer(None)
+            self.assertFalse(n.completed)
+            self.assertEqual(n.phase, n.RETURNING)
+            n._request_mode.assert_not_called()
+            self.assertTrue(n.prestream_pub.publish.call_args.args[0].data)
+            n.wall.state = Wall.STATE_EXIT
+            n.wall.detach_completed = n.wall.recovery_completed = True
+            n.wall_at = rospy.Time.from_sec(9.)
+            n._on_timer(None)
+            n._request_mode.assert_not_called()
+            n.wall_at = self.now
+            n._on_timer(None)
+            n._request_mode.assert_called_once_with('POSCTL')
+            self.assertTrue(n.completed)
+            self.assertTrue(n.prestream_pub.publish.call_args.args[0].data)
+
+    def _prepare_return_worker(self, fault=False):
+        n = self.node
+        n.phase = n.RETURNING
+        n.flight = State(mode='OFFBOARD', armed=True, connected=True)
+        n.flight_at = self.now
+        n.state_timeout_s = 1.5
+        n.wall.state = Wall.STATE_EXIT
+        n.wall.detach_completed = n.wall.recovery_completed = not fault
+        n.wall.fault_recovery_completed = fault
+        n._observe_completion(self.now)
+        n._handover_ready = mock.Mock(return_value=True)
+        n.set_mode = mock.Mock()
+        n.takeover_attempt = 3
+        return n
+
+    def test_queued_return_cannot_override_flight_callback_mode_change(self):
+        for fault in (False, True):
+            for mode in ('ALTCTL', 'POSCTL', 'AUTO.LAND'):
+                with self.subTest(fault=fault, mode=mode):
+                    n = self._prepare_return_worker(fault)
+                    def flight_callback(*_args, **_kwargs):
+                        n._on_flight(State(mode=mode, armed=True, connected=True))
+                    with mock.patch.object(rospy.Time, 'now', return_value=self.now), \
+                            mock.patch.object(rospy, 'wait_for_service', side_effect=flight_callback):
+                        n._send_mode_request('POSCTL', attempt=3)
+                    n.set_mode.assert_not_called()
+                    self.assertEqual(n.phase, n.RETURNING)  # No timer reset hid the race.
+
+    def test_queued_return_requires_fresh_connected_armed_offboard(self):
+        for fault in (False, True):
+            for problem in ('disconnected', 'disarmed', 'stale'):
+                with self.subTest(fault=fault, problem=problem):
+                    n = self._prepare_return_worker(fault)
+                    def invalidate_flight(*_args, **_kwargs):
+                        if problem == 'stale':
+                            n.flight_at = rospy.Time.from_sec(8.)
+                        else:
+                            n._on_flight(State(mode='OFFBOARD', connected=problem != 'disconnected',
+                                               armed=problem != 'disarmed'))
+                    with mock.patch.object(rospy.Time, 'now', return_value=self.now), \
+                            mock.patch.object(rospy, 'wait_for_service', side_effect=invalidate_flight):
+                        n._send_mode_request('POSCTL', attempt=3)
+                    n.set_mode.assert_not_called()
+
+    def test_normal_and_fault_return_send_when_live_offboard_is_still_valid(self):
+        for fault in (False, True):
+            with self.subTest(fault=fault):
+                n = self._prepare_return_worker(fault)
+                with mock.patch.object(rospy.Time, 'now', return_value=self.now), \
+                        mock.patch.object(rospy, 'wait_for_service'):
+                    n._send_mode_request('POSCTL', attempt=3)
+                n.set_mode.assert_called_once()
+                self.assertEqual(n.set_mode.call_args.args[0].custom_mode, 'POSCTL')
+
+    def test_entry_cancel_keeps_its_separate_cleanup_gate(self):
+        n = self._prepare_return_worker()
+        n.phase = n.CANCELING_ENTRY
+        n.flight.mode = 'POSCTL'
+        n._entry_cancel_handover_ready = mock.Mock(return_value=True)
+        with mock.patch.object(rospy.Time, 'now', return_value=self.now), \
+                mock.patch.object(rospy, 'wait_for_service'):
+            n._send_mode_request('POSCTL', attempt=3)
+        n._entry_cancel_handover_ready.assert_called_once_with(self.now)
+        n.set_mode.assert_called_once()
 
 
 if __name__ == '__main__':

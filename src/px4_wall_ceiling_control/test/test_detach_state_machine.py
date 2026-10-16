@@ -1,5 +1,6 @@
 """Normal wall departure: bounded trajectory, measured completion and deadlines."""
 import math
+import struct
 import unittest
 from unittest import mock
 
@@ -8,7 +9,7 @@ from mavros_msgs.msg import AttitudeTarget, EstimatorStatus, State
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Range
 from std_msgs.msg import Bool
-from px4_wall_ceiling_control.msg import AttachmentControlCandidate as C, WallPerchStatus as W
+from px4_wall_ceiling_control.msg import AttachmentControlCandidate as C, WallPerchStatus as W, SensorHealth
 from px4_wall_ceiling_control.domain.geometry import quaternion_angle
 import test_attachment_safety as fixtures
 
@@ -24,7 +25,7 @@ def quaternion(degrees):
 
 class DetachStateMachineTests(unittest.TestCase):
     def node(self, **extra):
-        values = {'~auto_approach': True, '~horizontal_velocity_enabled': False,
+        values = {'~auto_approach': True, '~horizontal_velocity_enabled': True,
                   '~hover_thrust': .48, '~detach_time_s': 3., '~recover_time_s': 1.,
                   '~top_clear_hold_s': .5, '~ignore_range_loss_during_attachment': True,
                   '~ignore_range_loss_during_hold': True, '~ignore_down_velocity_during_hold': True}
@@ -39,6 +40,10 @@ class DetachStateMachineTests(unittest.TestCase):
         n.hold_entry_blend_s = .5
         n.top_hold_filter_alpha = 1.
         n.approach_base_vertical_thrust = .518
+        # This fixture represents an acquisition with its POSCTL equilibrium
+        # and heading already captured, before the vehicle turned to the wall.
+        n.horizontal_equilibrium.ready = n.horizontal_equilibrium.frozen = True
+        n.horizontal_takeover_yaw = 0.
         n.flight_state = State(connected=True, armed=True, mode='OFFBOARD')
         n.flight_state_received_at = at(10.)
         n.horizontal_estimator = EstimatorStatus(attitude_status_flag=True,
@@ -290,6 +295,157 @@ class DetachStateMachineTests(unittest.TestCase):
         self.assertEqual(n.state, W.STATE_ABORT)
         self.assertIn('clock reversed', n.last_reason)
         self.assertEqual(n.recovery_altitude_m, 2.4)
+
+    def test_fault_exit_waits_for_fresh_published_target_inside_recovery_cone(self):
+        n = self.node(); self.enter(n, W.STATE_ABORT, 10.)
+        n.recovery_altitude_m = 2.4
+        n.recovery_wait_for_level = False
+        self.feedback(n, 11., tilt=0.)
+        self.output(n, 11., tilt=15.)
+        self.tick(n, 11.)
+        self.assertEqual(n.state, W.STATE_ABORT)
+        self.output(n, 11., tilt=0.)
+        self.tick(n, 11.)
+        self.assertEqual(n.state, W.STATE_EXIT)
+        self.assertTrue(n.fault_recovery_completed)
+        self.assertFalse(n.recovery_completed)
+
+    def test_start_readiness_includes_final_output_and_vertical_estimator(self):
+        n = self.node()
+        self.assertTrue(n._detach_start_ready(at(10.)))
+        n.horizontal_output = None
+        self.assertFalse(n._detach_start_ready(at(10.)))
+        self.assertIn('最终', n._detach_block_reason(at(10.)))
+        self.output(n, 10.)
+        n.horizontal_estimator.velocity_vert_status_flag = False
+        self.assertFalse(n._detach_start_ready(at(10.)))
+        self.assertIn('竖直', n._detach_block_reason(at(10.)))
+        self.assertFalse(n.detach_vertical_active)
+
+    def test_float32_maximum_output_roundtrip_is_accepted_without_raising_cap(self):
+        n = self.node()
+        value = struct.unpack('f', struct.pack('f', .85))[0]
+        self.assertGreater(value, n.max_thrust)
+        self.output(n, 10., thrust=value)
+        self.assertIs(n._valid_wall_output(at(10.)), n.horizontal_output)
+        self.assertTrue(n._detach_start_ready(at(10.)))
+        self.output(n, 10., thrust=n.max_thrust + 2.e-6)
+        self.assertIsNone(n._valid_wall_output(at(10.)))
+
+    def test_detach_requires_frozen_horizontal_reference_but_not_wall_facing_flow(self):
+        for field, value in (('horizontal_velocity_enabled', False),
+                             ('horizontal_takeover_yaw', None),
+                             ('horizontal_takeover_yaw', math.nan)):
+            n = self.node(); setattr(n, field, value)
+            self.assertFalse(n._detach_start_ready(at(10.)))
+            self.assertIn('退墙', n._detach_block_reason(at(10.)))
+            self.enter(n, W.STATE_DETACH_ROTATE, 10.)
+            self.assertEqual(n.state, W.STATE_WALL_HOLD)
+        n = self.node(); n.horizontal_equilibrium.frozen = False
+        self.assertFalse(n._detach_start_ready(at(10.)))
+        n.horizontal_equilibrium.frozen = True
+        n.horizontal_velocity_active = False
+        n.horizontal_flow = None
+        self.assertTrue(n._detach_start_ready(at(10.)))
+        n.bench_wait_for_ranges = True
+        n.horizontal_velocity_enabled = False
+        n.horizontal_takeover_yaw = None
+        self.assertTrue(n._detach_start_ready(at(10.)))
+
+    def normal_exit(self):
+        n = self.node()
+        self.enter(n, W.STATE_DETACH_ROTATE, 10.)
+        self.enter(n, W.STATE_RECOVER, 13.)
+        self.enter(n, W.STATE_EXIT, 15.)
+        return n
+
+    def front_clearance(self, n, seconds, distance):
+        # Use the real front-facing evidence gate for the EXIT reentry case.
+        n.departure_active = True
+        n.departure_yaw = 0.
+        n.departure_level_at = at(14.)
+        n.horizontal_velocity_ready = True
+        n._departure_clearance_ready = lambda now: fixtures.WallDecision._departure_clearance_ready(n, now)
+        self.feedback(n, seconds, tilt=0., height=2.2)
+        r = Range(range=distance, min_range=.03, max_range=40.)
+        r.header.stamp = at(seconds)
+        with mock.patch.object(rospy.Time, 'now', return_value=at(seconds)):
+            n._on_front_range(r)
+            n._on_sensor_health(SensorHealth(front_valid=True))
+
+    def test_normal_exit_distance_point_two_nine_resumes_existing_recovery(self):
+        n = self.normal_exit()
+        vertical = n.detach_vertical_controller
+        horizontal = n.recovery_horizontal_controller
+        vertical.integral = .02
+        horizontal.integral = (.03, -.01)
+        n._reset_recovery_horizontal.reset_mock()
+        self.front_clearance(n, 15.02, .29)
+        self.tick(n, 15.02)
+        self.assertEqual(n.state, W.STATE_RECOVER)
+        self.assertFalse(n.detach_completed or n.recovery_completed)
+        self.assertFalse(n.fault_recovery_completed)
+        self.assertEqual(n.recovery_started_at, at(13.))
+        self.assertEqual(n.recovery_altitude_m, 2.4)
+        self.assertIs(n.detach_vertical_controller, vertical)
+        self.assertEqual(vertical.reference, 2.4)
+        self.assertAlmostEqual(vertical.base, .518)
+        self.assertAlmostEqual(vertical.integral, .02)
+        self.assertIs(n.recovery_horizontal_controller, horizontal)
+        self.assertEqual(horizontal.integral, (.03, -.01))
+        n._begin_departure_clearance.assert_called_once()
+        n._reset_recovery_horizontal.assert_not_called()
+
+    def test_reentry_does_not_restart_total_recovery_deadline(self):
+        n = self.normal_exit()
+        n._departure_clearance_ready = lambda now: False
+        self.tick(n, 27.9)
+        self.assertEqual(n.state, W.STATE_RECOVER)
+        self.assertEqual(n.state_entered_at, at(27.9))
+        self.assertEqual(n.recovery_started_at, at(13.))
+        self.tick(n, 28.)
+        self.assertEqual(n.state, W.STATE_ABORT)
+        self.assertIn('recovery timeout', n.last_reason)
+        self.assertFalse(n.detach_completed or n.recovery_completed)
+        self.assertEqual(n.recovery_altitude_m, 2.4)
+
+    def test_expired_exit_with_lost_clearance_aborts_without_reentry(self):
+        n = self.normal_exit()
+        n._departure_clearance_ready = lambda now: False
+        self.tick(n, 28.)
+        self.assertEqual(n.state, W.STATE_ABORT)
+        self.assertIn('timeout after departure clearance lost', n.last_reason)
+        self.assertFalse(n.detach_completed or n.recovery_completed)
+        self.assertEqual(n.recovery_started_at, at(13.))
+
+    def test_fault_and_bench_exit_do_not_restart_normal_retreat(self):
+        n = self.node()
+        self.enter(n, W.STATE_ABORT, 10.)
+        self.enter(n, W.STATE_EXIT, 11.)
+        n._departure_clearance_ready = mock.Mock(return_value=False)
+        self.tick(n, 30.)
+        self.assertEqual(n.state, W.STATE_EXIT)
+        self.assertTrue(n.fault_recovery_completed)
+        n._departure_clearance_ready.assert_not_called()
+        n = self.normal_exit()
+        n.bench_wait_for_ranges = True
+        n._departure_clearance_ready = mock.Mock(return_value=False)
+        self.tick(n, 30.)
+        self.assertEqual(n.state, W.STATE_EXIT)
+        n._departure_clearance_ready.assert_not_called()
+
+    def test_new_detach_and_idle_clear_total_recovery_deadline(self):
+        n = self.normal_exit()
+        self.enter(n, W.STATE_WALL_HOLD, 20.)
+        self.feedback(n, 20.)
+        self.output(n, 20.)
+        self.enter(n, W.STATE_DETACH_ROTATE, 20.)
+        self.assertEqual(n.state, W.STATE_DETACH_ROTATE)
+        self.assertIsNone(n.recovery_started_at)
+        self.enter(n, W.STATE_RECOVER, 23.)
+        self.assertEqual(n.recovery_started_at, at(23.))
+        self.enter(n, W.STATE_IDLE, 24.)
+        self.assertIsNone(n.recovery_started_at)
 
 
 if __name__ == '__main__':

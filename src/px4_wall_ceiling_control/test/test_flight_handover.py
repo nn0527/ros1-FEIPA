@@ -742,7 +742,8 @@ class FlightHandoverTest(unittest.TestCase):
             node.wall.state = state
             node._observe_completion(now)
             self.assertFalse(node.completed)
-        node.wall.state = WallPerchStatus.STATE_IDLE
+        node.wall.state = WallPerchStatus.STATE_EXIT
+        node.wall.detach_completed = node.wall.recovery_completed = True
         node._observe_completion(now)
         self.assertTrue(node.completed)
         self.assertTrue(node.owner_seen)
@@ -775,6 +776,9 @@ class FlightHandoverTest(unittest.TestCase):
         node.handover_max_vertical_speed_mps = 0.2
         node.odom_twist_in_child_frame = True
         node.require_rc_center = False
+        node.rc_channels = (1500, 1500, 1500, 1500)
+        node.rc_at = now
+        node.rc_timeout_s = .2
         node.completed = False
         node._requested_mode = lambda _now: OperatorCommand.MODE_CEILING
         node._observe_completion = lambda _now: setattr(node, "completed", True)
@@ -865,9 +869,10 @@ class FlightHandoverTest(unittest.TestCase):
         node.fault_seen = True
         node.detach_seen = node.recovery_seen = True
         node.wall_at = now
-        node.wall = WallPerchStatus(state=WallPerchStatus.STATE_EXIT, fault_detected=True, recovery_completed=True)
+        node.wall = WallPerchStatus(state=WallPerchStatus.STATE_EXIT, fault_detected=True, fault_recovery_completed=True)
         node._observe_completion(now)
-        self.assertTrue(node.completed)
+        self.assertFalse(node.completed)
+        self.assertTrue(node.wall_fault_return_ready)
         self.assertTrue(node.owner_seen)
         self.assertTrue(node.fault_seen)
 
@@ -934,6 +939,10 @@ class FlightHandoverTest(unittest.TestCase):
         node.odom_twist_in_child_frame = False
         node.handover_max_tilt_deg = 10.0
         node.handover_max_vertical_speed_mps = 0.2
+        node.require_rc_center = False
+        node.rc_channels = (1500, 1500, 1500, 1500)
+        node.rc_at = now
+        node.rc_timeout_s = .2
         self.assertFalse(node._handover_ready(now))
         node.wall_bench_wait_for_ranges = True
         self.assertTrue(node._handover_ready(now))

@@ -414,6 +414,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         self.reached_state = WallPerchStatus.STATE_IDLE
         self.detach_completed = False
         self.fault_recovery_completed = False
+        self.recovery_started_at = None
         self.detach_stable_since = None
         self.detach_stable_last_stamp = None
         self.detach_stable_samples = 0
@@ -893,6 +894,24 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             and self._detach_pose_valid()
         )
 
+    def _detach_start_ready(self, now):
+        if not self._detach_pose_ready(now):
+            return False
+        if getattr(self, "bench_wait_for_ranges", False):
+            return True
+        return (self._detach_horizontal_reference_ready()
+                and self._valid_wall_output(now) is not None
+                and self._detach_vertical_feedback_ok(now))
+
+    def _detach_horizontal_reference_ready(self):
+        # Vertical wall flight can temporarily lose optical flow. Admission
+        # needs the frozen takeover frame, not a currently level flow solution.
+        equilibrium = getattr(self, "horizontal_equilibrium", None)
+        yaw = getattr(self, "horizontal_takeover_yaw", None)
+        return bool(getattr(self, "horizontal_velocity_enabled", False)
+                    and equilibrium is not None and equilibrium.ready and equilibrium.frozen
+                    and yaw is not None and math.isfinite(yaw))
+
     def _state_age(self, now):
         return max(0.0, (now - self.state_entered_at).to_sec())
 
@@ -902,6 +921,13 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         q = self._current_quaternion()
         if q is None:
             return "离墙姿态反馈无效"
+        if not getattr(self, "bench_wait_for_ranges", False):
+            if not self._detach_horizontal_reference_ready():
+                return "无法正常退墙：水平闭环未启用或本次接管平衡姿态／航向未锁定"
+            if self._valid_wall_output(now) is None:
+                return "等待新鲜有效的侧吸最终姿态／推力输出"
+            if not self._detach_vertical_feedback_ok(now):
+                return self.detach_vertical_reason
         axis = math.degrees(quaternion_angle(q, self._hold_follow_quaternion()))
         if axis > math.degrees(self.detach_axis_error_rad):
             return "离墙旋转轴偏差 {:.1f}°，需 ≤ {:.1f}°".format(axis, math.degrees(self.detach_axis_error_rad))
@@ -1460,6 +1486,9 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "flip vertical support source missing or stale")
                 return
         if new_state == WallPerchStatus.STATE_DETACH_ROTATE and not getattr(self, "bench_wait_for_ranges", False):
+            if not self._detach_horizontal_reference_ready():
+                self.last_reason = "离墙等待：水平闭环未启用或本次接管平衡姿态／航向未锁定"
+                return
             output = self._valid_wall_output(now)
             if output is None or not self._begin_detach_vertical(now, output):
                 self.last_reason = "离墙等待：" + (getattr(self, "detach_vertical_reason", "")
@@ -1468,6 +1497,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             q = output.orientation
             self.q_detach_start = self._quat_normalize((q.x, q.y, q.z, q.w))
         if new_state in (WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_FRONT_WALL_DETECT):
+            self.recovery_started_at = None
             self._reset_flip_vertical_support()
             self._reset_detach_vertical()
             if hasattr(self, "_reset_recovery_horizontal"):
@@ -1571,9 +1601,13 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             self.detach_stable_last_stamp = None
             self.detach_stable_samples = 0
         elif new_state == WallPerchStatus.STATE_RECOVER:
+            if getattr(self, "recovery_started_at", None) is None:
+                self.recovery_started_at = now
+            self.detach_completed = self.recovery_completed = False
             self.top_clear_since = None
             self.top_clear_last_sample_at = None
         elif new_state == WallPerchStatus.STATE_DETACH_ROTATE:
+            self.recovery_started_at = None
             self.detach_requested = False
             if getattr(self, "bench_wait_for_ranges", False):
                 self.recovery_altitude_m = None
@@ -1810,7 +1844,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                         getattr(self, "detach_request_timeout_s", 8.)):
                     self.detach_requested = False
                     self.last_reason = "离墙等待超时，请求已取消；" + self._detach_block_reason(now)
-                elif self._detach_pose_ready(now):
+                elif self._detach_start_ready(now):
                     self._enter_state(WallPerchStatus.STATE_DETACH_ROTATE, now, "detach requested")
                 elif self.detach_requested:
                     self.last_reason = "离墙请求已接收；" + self._detach_block_reason(now)
@@ -1845,7 +1879,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, self.detach_vertical_fault)
                 return
             if (not getattr(self, "bench_wait_for_ranges", False)
-                    and self._state_age(now) >= getattr(self, "recover_timeout_s", 15.)):
+                    and self._recovery_total_age(now) >= getattr(self, "recover_timeout_s", 15.)):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "recovery timeout; normal detach incomplete")
                 return
@@ -1875,6 +1909,22 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             # Keep a bounded level target until fresh FCU feedback confirms
             # OFFBOARD has ended. Owner release alone is not RC handover.
             if self._flight_ready(now):
+                if (not getattr(self, "fault_recovery_completed", False)
+                        and not getattr(self, "bench_wait_for_ranges", False)
+                        and self.flight_state is not None and self.flight_state.mode.upper() == "OFFBOARD"
+                        and not self._departure_clearance_ready(now)):
+                    # EXIT is provisional until the FCU leaves OFFBOARD. A
+                    # revoked distance gate resumes the existing controllers
+                    # without resetting their height reference or time budget.
+                    self.detach_completed = self.recovery_completed = False
+                    if self._recovery_total_age(now) >= getattr(self, "recover_timeout_s", 15.):
+                        self.fault_count += 1
+                        self._enter_state(WallPerchStatus.STATE_ABORT, now,
+                            "recovery timeout after departure clearance lost; normal detach incomplete")
+                    else:
+                        self._enter_state(WallPerchStatus.STATE_RECOVER, now,
+                            "departure clearance lost before pilot mode handover; resume recovery")
+                    return
                 self.last_reason = ("fault recovery complete; waiting for pilot mode handover"
                     if getattr(self, "fault_recovery_completed", False)
                     else "recovery complete; waiting for pilot mode handover")
@@ -1889,8 +1939,15 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 and self._vertical_speed_safe()
                 and self._detach_height_settled()
             )
-            if self._state_age(now) >= self.recover_time_s and stable and self._horizontal_recovery_ready(now):
-                self._enter_state(WallPerchStatus.STATE_EXIT, now, "abort recovery complete")
+            if (self._state_age(now) >= self.recover_time_s and stable
+                    and self._horizontal_recovery_ready(now)
+                    and (getattr(self, "bench_wait_for_ranges", False)
+                         or self._published_recovery_target_ready(now))):
+                self._enter_state(WallPerchStatus.STATE_EXIT, now, "fault recovery complete; normal detach incomplete")
+
+    def _recovery_total_age(self, now):
+        started = getattr(self, "recovery_started_at", None)
+        return max(0., (now-started).to_sec()) if started is not None else self._state_age(now)
 
     def _valid_wall_output(self, now):
         """Return only the last fresh, actually published WALL attitude/thrust."""
@@ -1900,7 +1957,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 or not is_fresh_source(output.header.stamp, .20, now, future_tolerance_s=0.)
                 or getattr(self, "horizontal_output_owner", None) != AttachmentControlCandidate.SOURCE_WALL
                 or not is_fresh(getattr(self, "horizontal_output_owner_at", None), .30, now)
-                or not math.isfinite(output.thrust) or not .1 <= output.thrust <= self.max_thrust):
+                or not math.isfinite(output.thrust) or not .1 <= output.thrust <= self.max_thrust + 1.e-6):
             return None
         q = output.orientation
         values = (q.x, q.y, q.z, q.w)
@@ -1971,6 +2028,9 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 or (self.detach_recovered_last_stamp - self.detach_recovered_since).to_sec()
                    < getattr(self, "detach_recovered_hold_s", .30)):
             return False
+        return self._published_recovery_target_ready(now)
+
+    def _published_recovery_target_ready(self, now):
         output = self._valid_wall_output(now)
         if output is None:
             return False
@@ -1978,7 +2038,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         tilt = math.acos(clamp(rotate_vector((q.x, q.y, q.z, q.w), (0., 0., 1.))[2], -1., 1.))
         # RECOVER's five-degree cone must not force a discontinuous projection
         # of a previous command which is still outside that cone.
-        return tilt <= getattr(self, "detach_recovered_tilt_rad", math.radians(5.))
+        return tilt <= getattr(self, "detach_recovered_tilt_rad", math.radians(5.)) + 1.e-9
 
     def _flip_entry_quaternion(self, now):
         output = getattr(self, "horizontal_output", None)
@@ -2193,10 +2253,10 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         status.recovery_completed = getattr(self, "recovery_completed", False)
         status.fault_recovery_completed = getattr(self, "fault_recovery_completed", False)
         status.detach_pending = bool(getattr(self, "detach_requested", False) and self.state == WallPerchStatus.STATE_WALL_HOLD)
-        status.detach_block_reason = self._detach_block_reason(now) if self.state == WallPerchStatus.STATE_WALL_HOLD and not self._detach_pose_ready(now) else ""
+        status.detach_block_reason = self._detach_block_reason(now) if self.state == WallPerchStatus.STATE_WALL_HOLD and not self._detach_start_ready(now) else ""
         status.detach_ready = bool(self.state == WallPerchStatus.STATE_WALL_HOLD
-            and self._safety_ok(now) and self._detach_pose_ready(now)
-            and self.top_filtered_m is not None and self.top_filtered_m <= self.top_clear_distance_m)
+            and self._safety_ok(now) and self._detach_start_ready(now)
+            and not self._top_clear_ready(now))
         status.flight_state_fresh = self._flight_ready(now)
         status.auto_approach_enabled = getattr(self, "auto_approach", False)
         status.approach_paused = bool(status.auto_approach_enabled and self.state == WallPerchStatus.STATE_SLOW_APPROACH

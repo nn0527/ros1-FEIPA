@@ -248,6 +248,7 @@ class AttachmentOutputMuxNode:
         self.prestream_timeout_s = float(rospy.get_param("~prestream_timeout_s", 0.30))
         self.fcu_attitude_target = None
         self.fcu_attitude_target_at = None
+        self.wall_continuity_fcu_snapshot = None
         self.handover_start_thrust = None
         self.handover_started_at = None
         self.manager_phase = ""
@@ -418,6 +419,7 @@ class AttachmentOutputMuxNode:
         self.wall_candidate_snapshot = None
         self.wall_candidate = self.wall_candidate_at = None
         self.last_published_control = None
+        self.wall_continuity_fcu_snapshot = None
 
     def _on_wall_candidate(self, message):
         now = rospy.Time.now()
@@ -517,8 +519,10 @@ class AttachmentOutputMuxNode:
 
     def _on_fcu_attitude_target(self, message):
         # Once OFFBOARD is active this topic reflects the external command.
-        # Keep the last ALTCTL value instead of feeding our output back as input.
+        # Keep that echo separate from the pilot-mode handover baseline. It is
+        # used only to resume bounded publication after an output interruption.
         if self.flight_state is not None and self.flight_state.mode.upper() == "OFFBOARD":
+            self.wall_continuity_fcu_snapshot = (message, rospy.Time.now())
             return
         self.fcu_attitude_target = message
         self.fcu_attitude_target_at = rospy.Time.now()
@@ -1233,7 +1237,10 @@ class AttachmentOutputMuxNode:
         # Project only the desired axis here. Continuity is applied later from
         # the last actual publication, never from an unsent projected target.
         control = self._wall_control(now, candidate) if source == AttachmentControlCandidate.SOURCE_WALL else None
-        if not self._recovery_output_active(control):
+        flight = getattr(self, "flight_state", None)
+        if (not self._recovery_output_active(control) or flight is None
+                or flight.mode.upper() != "OFFBOARD"
+                or not is_fresh(self.flight_state_at, self.state_timeout_s, now)):
             return target
         q = tuple(getattr(target.orientation, k) for k in "xyzw")
         q, _ = limit_recovery_attitude(q, None, 0.,
@@ -1280,18 +1287,28 @@ class AttachmentOutputMuxNode:
             return previous
         # A fresh measured attitude plus a fresh FCU thrust command is the
         # only fallback. Never seed from a nominal hover/pressure guess.
-        fcu = getattr(self, "fcu_attitude_target", None)
-        fcu_received = getattr(self, "fcu_attitude_target_at", None)
-        timeout = getattr(self, "fcu_target_timeout_s", .20)
+        echo = getattr(self, "wall_continuity_fcu_snapshot", None)
+        flight = getattr(self, "flight_state", None)
+        if echo is not None and flight is not None and flight.mode.upper() == "OFFBOARD":
+            fcu, fcu_received = echo
+            timeout = .35  # Match the departure controller's echo continuation window.
+        else:
+            # At the initial OFFBOARD edge, a still-fresh pilot-mode sample is
+            # also valid; it remains the original handover value, not an echo.
+            fcu = getattr(self, "fcu_attitude_target", None)
+            fcu_received = getattr(self, "fcu_attitude_target_at", None)
+            timeout = getattr(self, "fcu_target_timeout_s", .20)
         if (not self._odom_fresh(now)
                 or not is_fresh_source(self.odom.header.stamp, self.odom_timeout_s, now)
                 or fcu is None or not is_fresh(fcu_received, timeout, now)
                 or not is_fresh_source(fcu.header.stamp, timeout, now)
                 or fcu.type_mask & AttitudeTarget.IGNORE_THRUST
-                or not math.isfinite(fcu.thrust) or not self.min_thrust <= fcu.thrust <= self.max_thrust):
+                or not math.isfinite(fcu.thrust)
+                or not self.min_thrust-1e-6 <= fcu.thrust <= self.max_thrust+1e-6):
             return None
         q = self.odom.pose.pose.orientation
-        return (quaternion_normalize((q.x, q.y, q.z, q.w)), float(fcu.thrust), now,
+        thrust = max(self.min_thrust, min(self.max_thrust, float(fcu.thrust)))
+        return (quaternion_normalize((q.x, q.y, q.z, q.w)), thrust, now,
                 AttachmentControlCandidate.SOURCE_NONE)
 
     def _limit_wall_publication(self, now, target, candidate):
@@ -1401,7 +1418,7 @@ class AttachmentOutputMuxNode:
             # MAVROS header remains the transport publication time. The original
             # generation time is retained separately with the same sequence.
             target.header.stamp = published_at
-            self.last_wall_command = {
+            command_diagnostic = {
                 "maneuver_id": candidate.maneuver_id,
                 "control_sequence": candidate.control_sequence,
                 "control_phase": candidate.control_phase,
@@ -1417,6 +1434,7 @@ class AttachmentOutputMuxNode:
         self.attitude_publisher.publish(target)
         self._remember_publication(target, candidate.source, published_at if wall else now)
         if wall:
+            self.last_wall_command = command_diagnostic
             self._publish_recovery_preview(published_at, target, candidate)
         return self.OUTPUT_ATTITUDE_THRUST
 

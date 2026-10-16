@@ -694,6 +694,9 @@ class AttachmentSafetyTest(unittest.TestCase):
         node.top_contact_distance_m = 0.05
         node.top_clear_distance_m = 0.10
         node.top_filtered_m = 0.05
+        node._top_fresh = lambda now: True
+        node.top_clear_hold_s = .5
+        node.top_clear_since = node.top_clear_last_sample_at = None
         node.hold_time_s = 1.0
         node._mode_requested = lambda _now: True
         node._safety_ok = lambda _now: True
@@ -710,7 +713,11 @@ class AttachmentSafetyTest(unittest.TestCase):
         self.assertEqual(node.state, WallPerchStatus.STATE_WALL_HOLD)
 
         node.top_filtered_m = 0.101
+        node.top_clear_since = node.top_clear_last_sample_at = rospy.Time.from_sec(1.3)
         node._update_state_machine(rospy.Time.from_sec(1.3))
+        self.assertEqual(node.state, WallPerchStatus.STATE_WALL_HOLD)
+        node.top_clear_last_sample_at = rospy.Time.from_sec(1.8)
+        node._update_state_machine(rospy.Time.from_sec(1.8))
         self.assertEqual(node.state, WallPerchStatus.STATE_ABORT)
         self.assertEqual(node.fault_count, 1)
 
@@ -751,6 +758,7 @@ class AttachmentSafetyTest(unittest.TestCase):
         node.detach_axis_error_rad = math.radians(5)
         node.detach_max_rate_rps = 0.15
         node.detach_max_abs_vertical_speed_mps = 0.15
+        node.max_down_velocity_mps = .8
         self.assertFalse(node._detach_pose_valid())
         node.bench_wait_for_ranges = True
         self.assertTrue(node._detach_pose_valid())
@@ -768,6 +776,9 @@ class AttachmentSafetyTest(unittest.TestCase):
         node.detach_requested_at = rospy.Time.from_sec(1)
         node.top_filtered_m = 0.04
         node.top_clear_distance_m = 0.10
+        node._top_fresh = lambda now: False
+        node.top_clear_hold_s = .5
+        node.top_clear_since = node.top_clear_last_sample_at = None
         node.hold_time_s = 0
         node._mode_requested = node._safety_ok = lambda now: True
         node._pin_triggered = lambda: False
@@ -793,19 +804,20 @@ class AttachmentSafetyTest(unittest.TestCase):
         node.wall_pressure_tolerance_m = 0.01
         node.control_dt = 1.0
         node.top_filtered_m = 0.08
+        node._top_fresh = lambda now: True
         node.wall_pressure_thrust_command = node._wall_pressure_start_thrust()
 
-        increased = node._wall_pressure_thrust()
+        increased = node._wall_pressure_thrust(rospy.Time.from_sec(10.))
         self.assertAlmostEqual(increased, 0.6375)
 
         for _ in range(10):
-            capped = node._wall_pressure_thrust()
+            capped = node._wall_pressure_thrust(rospy.Time.from_sec(10.))
         self.assertAlmostEqual(capped, 0.75)
 
         node.top_filtered_m = 0.05
-        returned = node._wall_pressure_thrust()
+        returned = node._wall_pressure_thrust(rospy.Time.from_sec(10.))
         self.assertAlmostEqual(returned, 0.70)
-        returned = node._wall_pressure_thrust()
+        returned = node._wall_pressure_thrust(rospy.Time.from_sec(10.))
         self.assertAlmostEqual(returned, 0.675)
 
     def test_wall_detach_uses_height_and_tilt_feedback(self):
@@ -888,11 +900,11 @@ class AttachmentSafetyTest(unittest.TestCase):
         self.assertEqual(node.state, WallPerchStatus.STATE_ABORT)
         self.assertEqual(node.fault_count, 1)
 
-    def test_wall_recovery_waits_for_first_level_height(self):
+    def test_wall_recovery_waits_for_captured_height_speed_and_clearance(self):
         node = WallDecision.__new__(WallDecision)
         node.state = WallPerchStatus.STATE_RECOVER
         node.state_entered_at = rospy.Time.from_sec(1.0)
-        node.detach_altitude_m = 2.0
+        node.detach_altitude_m = 1.0
         node.recovery_altitude_m = 1.0
         node.detach_altitude_tolerance_m = 0.10
         node.detach_vertical_speed_tolerance_mps = 0.20
@@ -909,6 +921,7 @@ class AttachmentSafetyTest(unittest.TestCase):
         node._rates_safe = lambda _limit=None: True
         node._vertical_speed_safe = lambda: True
         node._top_clear_ready = lambda _now: True
+        node._departure_clearance_ready = lambda _now: False
         node._enter_state = lambda new_state, _now, _reason: setattr(node, "state", new_state)
 
         node._update_state_machine(rospy.Time.from_sec(2.0))
@@ -919,6 +932,9 @@ class AttachmentSafetyTest(unittest.TestCase):
         self.assertEqual(node.state, WallPerchStatus.STATE_RECOVER)
         node.odom.twist.twist.linear.z = -0.05
         node._update_state_machine(rospy.Time.from_sec(2.2))
+        self.assertEqual(node.state, WallPerchStatus.STATE_RECOVER)
+        node._departure_clearance_ready = lambda _now: True
+        node._update_state_machine(rospy.Time.from_sec(2.3))
         self.assertEqual(node.state, WallPerchStatus.STATE_EXIT)
 
     def test_bench_recovery_ignores_radar_and_height_drift(self):
@@ -979,12 +995,15 @@ class AttachmentSafetyTest(unittest.TestCase):
         self.assertIsNone(node.flip_ready_since)
 
     def test_exit_holds_output_until_fcu_leaves_offboard(self):
+        from mavros_msgs.msg import State
         node = WallDecision.__new__(WallDecision)
         now = rospy.Time.from_sec(10.0)
         node.state = WallPerchStatus.STATE_EXIT
         node.cancel_requested = False
         node._mode_requested = lambda _now: False
         node._flight_ready = lambda _now: True
+        node.flight_state = State(connected=True, armed=True, mode='OFFBOARD')
+        node._departure_clearance_ready = lambda _now: True
         node._enter_state = mock.Mock()
         node._update_state_machine(now)
         node._enter_state.assert_not_called()
@@ -995,6 +1014,7 @@ class AttachmentSafetyTest(unittest.TestCase):
         node._recovery_height_thrust = mock.Mock(return_value=0.45)
         self.assertEqual(node._candidate(now)[1:3], (node.q_hover, 0.45))
         node._flight_ready = lambda _now: False
+        node.flight_state.mode = 'POSCTL'
         node.flight_state_received_at = now
         node.state_timeout_s = 1.5
         node._update_state_machine(now)

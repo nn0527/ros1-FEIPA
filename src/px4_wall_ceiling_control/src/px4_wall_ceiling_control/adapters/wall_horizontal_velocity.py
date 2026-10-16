@@ -98,6 +98,7 @@ class WallHorizontalVelocityMixin:
         self.recovery_integral_sample = None
         self.recovery_candidate_axis = self.recovery_applied_axis = None
         self.recovery_control_at = None
+        self.recovery_integral_budget = 0.
         self.recovery_baseline_axis = None
         self.recovery_integral_reason = reason
         if clear_departure:
@@ -220,6 +221,7 @@ class WallHorizontalVelocityMixin:
         if reason:
             controller.clear_integral()
             self.recovery_integral_sample = None
+            self.recovery_integral_budget = 0.
             self.recovery_candidate_axis = None
             self.recovery_integral_reason = reason
             return 0.
@@ -228,6 +230,7 @@ class WallHorizontalVelocityMixin:
         if (self.recovery_candidate_axis is None
                 or sum(a*b for a,b in zip(axis, self.recovery_candidate_axis)) < math.cos(math.radians(1.))):
             self.recovery_integral_sample = None
+            self.recovery_integral_budget = 0.
             controller.integral_active = False
             self.recovery_integral_reason = '等待恢复候选推力轴被最终输出采用'
             return 0.
@@ -235,6 +238,7 @@ class WallHorizontalVelocityMixin:
         if not is_fresh_source(stamp, self.odom_timeout_s, now):
             controller.clear_integral()
             self.recovery_integral_sample = None
+            self.recovery_integral_budget = 0.
             self.recovery_integral_reason = '恢复速度源时间戳无效'
             return 0.
         previous = self.recovery_integral_sample
@@ -244,6 +248,7 @@ class WallHorizontalVelocityMixin:
             return 0.
         self.recovery_integral_sample = stamp
         if previous is None or (stamp-previous).to_sec() > self.odom_timeout_s:
+            self.recovery_integral_budget = 0.
             self.recovery_integral_reason = '恢复等待连续速度样本'
             return 0.
         self.recovery_integral_reason = '受限恢复积分生效'
@@ -318,6 +323,9 @@ class WallHorizontalVelocityMixin:
         return min(.10,stamp-previous)
 
     def _on_horizontal_fcu_target(self, message):
+        # Keep a separate echo for bounded departure reseeding. It must never
+        # be fed into the frozen POSCTL equilibrium estimator below.
+        self.detach_fcu_target, self.detach_fcu_target_at = message, rospy.Time.now()
         # OFFBOARD echoes our commands. Never learn equilibrium from that echo.
         flight=getattr(self,'flight_state',None)
         if flight is not None and flight.mode.upper()=='POSCTL':
@@ -424,7 +432,9 @@ class WallHorizontalVelocityMixin:
                           W.STATE_SLOW_APPROACH,W.STATE_RECOVER,W.STATE_EXIT,W.STATE_ABORT):
             return True
         if self.state == W.STATE_DETACH_ROTATE:
-            progress = self._detach_progress() if hasattr(self, '_detach_progress') else min(1.,max(0.,self._state_age(now)/self.detach_time_s))
+            progress = (self._detach_progress() if hasattr(self, '_detach_progress')
+                and not getattr(self, 'bench_wait_for_ranges', False)
+                else min(1.,max(0.,self._state_age(now)/self.detach_time_s)))
             target = self._quat_slerp(self.q_detach_start,self.q_hover,self._smoothstep5(progress))
             # Resume braking only in the final near-level part of the original rotation.
             measured = self._current_quaternion() if self._odom_fresh(now) else None
@@ -542,7 +552,10 @@ class WallHorizontalVelocityMixin:
             previous = self.recovery_control_at
             dt = min(.05, max(0., (now-previous).to_sec())) if previous is not None else min(.05, max(0., self.control_dt))
             self.recovery_control_at = now
-            integral_dt = min(dt, self._recovery_integral_interval(now))
+            self.recovery_integral_budget = min(.05, self.recovery_integral_budget+dt)
+            interval = self._recovery_integral_interval(now)
+            integral_dt = min(self.recovery_integral_budget, interval)
+            self.recovery_integral_budget = max(0., self.recovery_integral_budget-integral_dt)
             baseline = self._recovery_baseline(now, dt)
             applied = self.recovery_applied_axis
         desired = (forward*math.cos(yaw),forward*math.sin(yaw))

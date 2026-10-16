@@ -40,6 +40,26 @@ class DepartureHeightTests(unittest.TestCase):
             c.update(2.5, -.05, 1., 10.02+.02*index, 10.02, .56)
         self.assertEqual(c.integral, 0.)
 
+    def test_twenty_hz_feedback_uses_elapsed_budget_without_underintegration(self):
+        results = []
+        for source_period in (.02, .05):
+            c = self.controller(seed=.545)
+            for index in range(1, 501):
+                now = 10.+index*.002
+                source = 10.+math.floor((index*.002+1.e-9)/source_period)*source_period
+                actual = .545+c.integral
+                c.update(2.6, -.05, 1., now, source, actual)
+            results.append(c.integral)
+        self.assertAlmostEqual(results[0], .006, delta=.00031)
+        self.assertAlmostEqual(results[0], results[1], delta=.00031)
+
+    def test_queued_source_burst_cannot_integrate_more_than_wall_time(self):
+        c = self.controller(seed=.545)
+        c.update(2.6, -.05, 1., 10.02, 9.8, .545)
+        for i in range(1, 11):
+            c.update(2.6, -.05, 1., 10.02+i*.001, 9.8+i*.02, .545+c.integral)
+        self.assertLessEqual(c.integral, .12*.05*.01+1.e-9)
+
     def test_no_integral_while_wall_or_output_saturated(self):
         c = self.controller(seed=.75)
         for index in range(100):

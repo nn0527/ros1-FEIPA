@@ -108,11 +108,14 @@ class HorizontalFlightTests(unittest.TestCase):
         self.n.state=W.STATE_DETACH_ROTATE
         self.n.q_detach_start=(0.,math.sin(math.pi/4),0.,math.cos(math.pi/4))
         self.n.detach_time_s=3.;self.n.state_entered_at=rospy.Time.from_sec(10.)
+        self.n.detach_elapsed_s=2.
         self.feed(12.,tilt=20.)
         self.assertFalse(self.n.horizontal_velocity_ready)
+        self.n.detach_elapsed_s=2.8
         self.feed(12.8,tilt=9.)
         self.assertFalse(self.n.horizontal_velocity_ready)
-        self.feed(13.05,tilt=4.);self.feed(13.3,tilt=3.)
+        self.n.detach_elapsed_s=3.
+        self.feed(13.05,tilt=4.);self.feed(13.3,tilt=3.);self.feed(13.55,tilt=3.)
         self.n._horizontal_attitude(rospy.Time.now(),self.n.q_hover)
         self.assertTrue(self.n.horizontal_velocity_active)
         self.assertEqual(self.n.horizontal_controller.target,(0.,0.))
@@ -162,6 +165,8 @@ class PilotModeTests(unittest.TestCase):
         self.assertEqual(manager._pilot_mode(),'POSCTL')
         self.assertEqual(manager._pilot_mode(OperatorCommand.MODE_CEILING),'ALTCTL')
         manager.phase=Manager.RETURNING;manager.set_mode=mock.Mock();manager.request_in_flight=True
+        manager.flight=State(connected=True,armed=True,mode='OFFBOARD')
+        manager.flight_at=rospy.Time.now();manager.state_timeout_s=1.5
         manager._handover_ready=lambda now:True
         with mock.patch.object(rospy,'wait_for_service'),mock.patch.dict(Manager._send_mode_request.__globals__,kill_clear=lambda *args:True):
             manager._send_mode_request('POSCTL')

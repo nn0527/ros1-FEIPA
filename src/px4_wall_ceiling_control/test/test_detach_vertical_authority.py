@@ -92,6 +92,51 @@ class DepartureAuthorityTests(unittest.TestCase):
         now = self.refresh(n, 10.04)
         self.assertTrue(math.isnan(n._detach_vertical_thrust(now, .02)))
 
+    def test_short_echo_gap_continues_without_integral_then_recovers(self):
+        n = self.node(); n._begin_detach_vertical(rospy.Time.from_sec(10), n.horizontal_output)
+        n.detach_vertical_controller.integral = .04
+        now = self.refresh(n, 10.22)
+        n.horizontal_output.header.stamp = n.horizontal_output_at = rospy.Time.from_sec(10.)
+        value = n._detach_vertical_thrust(now, .02)
+        self.assertTrue(math.isfinite(value))
+        self.assertTrue(n.detach_vertical_output_degraded)
+        self.assertEqual(n.detach_vertical_controller.integral, 0.)
+        self.assertLessEqual(abs(value-.75), .02500001)
+        now = self.refresh(n, 10.24, value)
+        self.assertTrue(math.isfinite(n._detach_vertical_thrust(now, .02)))
+        self.assertFalse(n.detach_vertical_output_degraded)
+
+    def test_fresh_fcu_echo_can_reseed_but_stale_or_wrong_owner_cannot(self):
+        n = self.node(); n._begin_detach_vertical(rospy.Time.from_sec(10), n.horizontal_output)
+        now = self.refresh(n, 10.6)
+        n.horizontal_output.header.stamp = n.horizontal_output_at = rospy.Time.from_sec(10.)
+        self.assertTrue(math.isnan(n._detach_vertical_thrust(now, .02)))
+        n.detach_fcu_target = AttitudeTarget(thrust=.64)
+        n.detach_fcu_target.orientation.w = 1.
+        n.detach_fcu_target.header.stamp = n.detach_fcu_target_at = now
+        value = n._detach_vertical_thrust(now, .02)
+        self.assertTrue(math.isfinite(value))
+        self.assertLessEqual(abs(value-.64), .02500001)
+        self.assertEqual(n.detach_vertical_controller.integral, 0.)
+        n.horizontal_output_owner = 0
+        self.assertTrue(math.isnan(n._detach_vertical_thrust(now, .02)))
+
+    def test_coordinate_reset_abort_reseeds_only_after_consistent_new_frame(self):
+        n = self.node(); n._begin_detach_vertical(rospy.Time.from_sec(10), n.horizontal_output)
+        n.odom.pose.pose.position.z = 1.
+        now = self.refresh(n, 10.02)
+        self.assertTrue(math.isnan(n._detach_vertical_thrust(now, .02)))
+        n.state = WallPerchStatus.STATE_ABORT
+        self.assertTrue(math.isnan(n._detach_vertical_thrust(now, .02)))
+        now = self.refresh(n, 10.04)
+        value = n._detach_vertical_thrust(now, .02)
+        self.assertTrue(math.isfinite(value))
+        self.assertEqual(value, .75)
+        self.assertEqual(n.detach_vertical_controller.reference, 1.)
+        self.assertEqual(n.detach_vertical_controller.integral, 0.)
+        self.assertEqual(n.vertical_reference_source, 'fault_recovery_height')
+        self.assertEqual(n.detach_vertical_fault, '')
+
     def test_status_carries_original_height_and_bounded_cap(self):
         n = self.node(); n._begin_detach_vertical(rospy.Time.from_sec(10), n.horizontal_output)
         status = WallPerchStatus()

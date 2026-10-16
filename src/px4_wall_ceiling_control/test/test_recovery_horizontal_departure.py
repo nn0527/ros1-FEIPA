@@ -11,6 +11,7 @@ from std_msgs.msg import UInt8
 
 import test_wall_horizontal_velocity as fixtures
 from px4_wall_ceiling_control.domain.geometry import rotate_vector
+from px4_wall_ceiling_control.domain.horizontal_velocity import HorizontalVelocityController
 from px4_wall_ceiling_control.domain.recovery_attitude_limits import attitude_from_axis_yaw
 from px4_wall_ceiling_control.msg import SensorHealth, WallPerchStatus as W
 
@@ -49,7 +50,7 @@ class RecoveryHorizontalDepartureTests(unittest.TestCase):
             self.n._on_horizontal_flow(msg)
         self.n._on_horizontal_estimator(EstimatorStatus(
             attitude_status_flag=True, velocity_horiz_status_flag=True))
-        self.n._on_sensor_health(SensorHealth(front_valid=True, top_valid=False))
+        self.n._on_sensor_health(SensorHealth(front_valid=True, ceiling_valid=False))
         if distance is not None:
             msg = Range(range=distance, min_range=.01, max_range=4.)
             msg.header.stamp = now if front_stamp is None else rospy.Time.from_sec(front_stamp)
@@ -247,6 +248,23 @@ class RecoveryHorizontalDepartureTests(unittest.TestCase):
         self.assertAlmostEqual(status.departure_clearance_distance_m, .2, places=6)
         self.assertFalse(status.departure_clearance_ready)
         self.assertTrue(status.departure_clearance_reason)
+
+
+class RecoveryBiasModelTests(unittest.TestCase):
+    def test_zero_velocity_bias_rejection_bounded_in_simplified_plant(self):
+        # This mathematical plant checks the controller; it is no flight claim.
+        for bias_deg in (-1., -.5, .5, 1.):
+            control = HorizontalVelocityController()
+            speed = 0.
+            disturbance = 9.80665 * math.tan(math.radians(bias_deg))
+            for _ in range(750):
+                q = control.attitude((0., 0.), (speed, 0.), 0., .02,
+                    integrate=True, integral_dt=.02, max_tilt=math.radians(5.))
+                speed += (control.acceleration[0]-disturbance)*.02
+                self.assertLessEqual(math.hypot(*control.integral), .20000001)
+                self.assertLessEqual(math.hypot(*control.acceleration), .30000001)
+                self.assertGreaterEqual(rotate_vector(q, (0., 0., 1.))[2], math.cos(math.radians(5.))-1.e-9)
+            self.assertLess(abs(speed), .005)
 
 
 if __name__ == '__main__':

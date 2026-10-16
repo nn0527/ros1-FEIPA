@@ -20,6 +20,7 @@ class DetachCurrentAttitudeTest(unittest.TestCase):
         n.detach_reference_angle_rad=math.radians(10)
         n.detach_axis_error_rad=math.radians(5);n.detach_max_rate_rps=.15
         n.detach_max_abs_vertical_speed_mps=1.;n.bench_wait_for_ranges=False
+        n.max_down_velocity_mps=.8
         n.detach_stable_hold_s=.5
         n.odom_twist_in_child_frame=True
         from types import SimpleNamespace
@@ -42,11 +43,14 @@ class DetachCurrentAttitudeTest(unittest.TestCase):
         with mock.patch.object(module,'vertical_speed_enu_mps',return_value=1.1):
             self.assertFalse(n._detach_pose_valid())
 
-    def test_detach_captures_current_attitude(self):
-        n=self.node;n.state=WallPerchStatus.STATE_WALL_HOLD;n.reached_state=n.state
-        with mock.patch.object(module.rospy,'loginfo'):
-            n._enter_state(WallPerchStatus.STATE_DETACH_ROTATE,rospy.Time.from_sec(10),'detach requested')
-        self.assertEqual(n.q_detach_start,self.current)
-        self.assertEqual(n.detach_altitude_m,1.)
+    def test_detach_captures_final_output_instead_of_stale_hold_reference(self):
+        import test_detach_state_machine as departure
+        f = departure.DetachStateMachineTests()
+        n = f.node()
+        f.output(n, 10., tilt=88.)
+        f.enter(n, WallPerchStatus.STATE_DETACH_ROTATE, 10.)
+        self.assertEqual(n.state, WallPerchStatus.STATE_DETACH_ROTATE)
+        self.assertLess(module.quaternion_angle(n.q_detach_start, departure.quaternion(88.)), 1.e-7)
+        self.assertEqual(n.detach_altitude_m,2.4)
 
 if __name__=='__main__':unittest.main()

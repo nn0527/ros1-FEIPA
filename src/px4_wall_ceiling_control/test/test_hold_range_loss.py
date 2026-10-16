@@ -60,6 +60,10 @@ class HoldRangeLossTest(unittest.TestCase):
         self.node._mode_requested = lambda now: True
         entered = []
         self.node._enter_state = lambda state, now, reason: entered.append((state, reason))
+        self.node.top_clear_hold_s = .5
+        self.node.top_clear_since = rospy.Time.from_sec(9.5)
+        self.node.top_clear_last_sample_at = self.now
+        self.node._top_fresh = lambda now: True
         self.node._update_state_machine(self.now)
         self.assertEqual(entered, [(WallPerchStatus.STATE_ABORT, 'wall contact or safety lost')])
 

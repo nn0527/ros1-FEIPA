@@ -106,7 +106,7 @@ class WallTimeoutHandoverTests(unittest.TestCase):
     def test_recovery_exit_does_not_lose_latched_timeout_return(self):
         self.start();self.tick(.15)
         self.n.wall.state=W.STATE_EXIT;self.n.wall.reason='abort recovery complete'
-        self.n.wall.recovery_completed=True
+        self.n.wall.fault_recovery_completed=True
         self.tick(.31);self.n._request_mode.assert_called_once_with('POSCTL')
     def test_odometry_gap_requires_new_short_safe_history(self):
         self.start();self.tick(.15);self.tick(.8)

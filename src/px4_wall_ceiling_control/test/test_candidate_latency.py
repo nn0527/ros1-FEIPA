@@ -162,6 +162,7 @@ class CandidateLatencyTest(unittest.TestCase):
         candidate = self.candidate(phase=Wall.STATE_RECOVER, sequence=2, acquire=False, angle=60)
         self.accept(candidate)
         self.node.wall_status.state = Wall.STATE_FLIP_TO_WALL
+        self.seed_publication(angle=4, thrust=.60, age=.02)
         self.assertEqual(self.node._publish_candidate(self.now, candidate), Mux.OUTPUT_ATTITUDE_THRUST)
         target = self.node.attitude_publisher.publish.call_args.args[0]
         self.assertLessEqual(tilt(target), 5.000001)
@@ -175,6 +176,7 @@ class CandidateLatencyTest(unittest.TestCase):
         self.accept(candidate)
         self.node.wall_status.horizontal_velocity_active = False
         self.node.wall_status.state = Wall.STATE_FLIP_TO_WALL
+        self.seed_publication(angle=4, thrust=.60, age=.02)
         self.node._publish_candidate(self.now, candidate)
         self.assertLessEqual(tilt(self.node.attitude_publisher.publish.call_args.args[0]), 5.000001)
 
@@ -293,7 +295,19 @@ class CandidateLatencyTest(unittest.TestCase):
         self.node._publish_candidate(self.now, candidate)
         target = self.node.attitude_publisher.publish.call_args.args[0]
         self.assertLessEqual(tilt(target), 5.000001)
-        self.assertLessEqual(target.thrust, .60)
+        self.assertAlmostEqual(target.thrust, .69)
+        # The soft cap is approached continuously, not abandoned or applied as
+        # a discontinuous pressure cut on the first safe-level command.
+        for sequence in range(candidate.control_sequence+1, candidate.control_sequence+12):
+            self.advance()
+            next_candidate = self.candidate(phase=Wall.STATE_ABORT, sequence=sequence, acquire=False, angle=60)
+            self.accept(next_candidate)
+            previous = target.thrust
+            self.node._publish_candidate(self.now, next_candidate)
+            target = self.node.attitude_publisher.publish.call_args.args[0]
+            self.assertLessEqual(tilt(target), 5.000001)
+            self.assertLessEqual(previous-target.thrust, .010001)
+        self.assertAlmostEqual(target.thrust, .60)
 
     def test_no_valid_initial_slew_seed_inhibits_flip(self):
         candidate = self.candidate(phase=Wall.STATE_FLIP_TO_WALL, angle=50)

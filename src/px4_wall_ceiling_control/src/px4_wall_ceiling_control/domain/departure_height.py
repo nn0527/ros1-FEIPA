@@ -39,14 +39,15 @@ class DepartureHeightController:
         self.integral = 0.
         self.integral_active = False
         self.last_source_stamp = None
+        self.integral_budget = 0.
 
     def begin(self, height, base, actual_thrust, now):
         if not all(math.isfinite(v) for v in (height, base, actual_thrust, now)):
             raise ValueError('nonfinite departure seed')
-        if not .1 <= base < self.max_thrust or not .1 <= actual_thrust <= self.max_thrust:
+        if not .1 <= base < self.max_thrust or not .1-1e-6 <= actual_thrust <= self.max_thrust+1e-6:
             raise ValueError('departure seed outside collective bounds')
         self.reference, self.base = height, base
-        self.wall_pressure = self.value = actual_thrust
+        self.wall_pressure = self.value = bounded(actual_thrust, .1, self.max_thrust)
         self.at = now
         self.active = True
         self.clear_integral()
@@ -73,8 +74,9 @@ class DepartureHeightController:
         values = (height, velocity, vertical_fraction, now, source_stamp, actual_thrust)
         if not all(math.isfinite(v) for v in values) or source_stamp <= 0:
             raise ValueError('invalid departure feedback')
-        if not .1 <= actual_thrust <= self.max_thrust:
+        if not .1-1e-6 <= actual_thrust <= self.max_thrust+1e-6:
             raise ValueError('actual collective outside departure bounds')
+        actual_thrust = bounded(actual_thrust, .1, self.max_thrust)
         if now < self.at:
             self.clear_integral()
             raise ValueError('departure clock moved backwards')
@@ -82,15 +84,24 @@ class DepartureHeightController:
             return self.value
         dt = min(.05, now-self.at)
         self.at = now
+        self.integral_budget = min(.05, self.integral_budget+dt)
         vertical_fraction = bounded(vertical_fraction, 0., 1.)
         self.target_speed = bounded(self.height_kp*(self.reference-height),
                                     -self.down_speed, self.up_speed)
         error = self.target_speed-velocity
         previous_source = self.last_source_stamp
         fresh_sample = previous_source is None or source_stamp > previous_source
-        source_dt = 0. if previous_source is None else bounded(source_stamp-previous_source, 0., dt)
+        source_gap = 0. if previous_source is None else source_stamp-previous_source
+        # Budget wall time separately from sample time: a 20 Hz sensor may
+        # integrate its full interval, while a burst of queued frames cannot.
+        source_dt = min(max(0., source_gap), self.integral_budget) if source_gap <= .5 else 0.
+        if source_gap > .5:
+            # A fresh frame after a gap starts a new integration interval; never
+            # integrate the missing time or preserve unverified compensation.
+            self.integral = 0.
         if fresh_sample:
             self.last_source_stamp = source_stamp
+            self.integral_budget = 0. if previous_source is None or source_gap > .5 else max(0., self.integral_budget-source_dt)
         requested, correction, weight, unlimited = self._requested(vertical_fraction, error, self.integral)
         self.integral_active = False
         self.saturated = unlimited > self.max_thrust or abs(correction) >= self.correction_limit-1e-9

@@ -132,6 +132,7 @@ class FlightModeManagerNode:
         self.fault_seen = False
         self.wall_fault_return_ready = False
         self.wall_failure_reason = ""
+        self.wall_return_episode = False
         self.ceiling_approach_timeout_returning = False
         self.wall_approach_timeout_returning = False
         self.wall_timeout_stable_since = self.wall_timeout_last_odom = None
@@ -721,9 +722,31 @@ class FlightModeManagerNode:
         return bool(self.wall_timeout_safe_samples>=3 and self.wall_timeout_stable_since is not None
             and (self.odom_at-self.wall_timeout_stable_since).to_sec()>=.3)
 
+    def _wall_return_requires_exit(self):
+        return bool(getattr(self, "selected_mode", None) == OperatorCommand.MODE_WALL
+                    and (getattr(self, "wall_return_episode", False)
+                         or getattr(self, "detach_seen", False)
+                         or getattr(self, "recovery_seen", False)
+                         or getattr(self, "completed", False)
+                         or getattr(self, "wall_fault_return_ready", False)))
+
+    def _wall_return_exit_ready(self, now):
+        status = getattr(self, "wall", None)
+        if (status is None or not is_fresh(getattr(self, "wall_at", None), self.status_timeout_s, now)
+                or status.state != WallPerchStatus.STATE_EXIT):
+            return False
+        return bool(getattr(status, "fault_recovery_completed", False)
+                    or (getattr(status, "detach_completed", False)
+                        and getattr(status, "recovery_completed", False)
+                        and not status.fault_detected and not getattr(self, "fault_seen", False)))
+
     def _handover_ready(self, now):
         if getattr(self,"wall_approach_timeout_returning",False):
             return self._wall_timeout_handover_ready(now)
+        # A normal EXIT can be revoked while waiting for POSCTL. Read the live
+        # terminal status again here, including the service worker's recheck.
+        if self._wall_return_requires_exit() and not self._wall_return_exit_ready(now):
+            return False
         if (getattr(self,"selected_mode",None) == OperatorCommand.MODE_WALL and not self._wall_horizontal_ready(now,stable=True)):
             return False
         if self.output_mode != 2 or not is_fresh(
@@ -819,11 +842,18 @@ class FlightModeManagerNode:
                 self.completed = True
         elif self.selected_mode == OperatorCommand.MODE_WALL:
             status, received_at = self.wall, self.wall_at
+            self.completed = False
+            self.wall_fault_return_ready = False
             if status is None or not is_fresh(received_at, self.status_timeout_s, now):
                 return
+            if (status.state in (WallPerchStatus.STATE_DETACH_ROTATE, WallPerchStatus.STATE_RECOVER)
+                    or getattr(status, "recovery_completed", False)
+                    or getattr(status, "fault_recovery_completed", False)):
+                self.wall_return_episode = True
             if status.state == WallPerchStatus.STATE_ABORT or status.fault_detected:
                 self.fault_seen = True
-                self.wall_failure_reason = str(status.reason) or "侧吸故障"
+                if status.state == WallPerchStatus.STATE_ABORT or not getattr(self, "wall_failure_reason", ""):
+                    self.wall_failure_reason = str(status.reason) or "侧吸故障"
                 self.completed = False
             if status.state == WallPerchStatus.STATE_DETACH_ROTATE:
                 self.detach_seen = True
@@ -929,6 +959,16 @@ class FlightModeManagerNode:
                     return
             if attempt is not None and attempt != getattr(self, "takeover_attempt", 0):
                 return  # A canceled/previous attempt must not send a late mode change.
+            if mode != "OFFBOARD" and self.phase == self.RETURNING:
+                # A flight callback can arrive while this worker waits for the
+                # service, before the timer retires RETURNING. Never override a
+                # pilot-selected mode (or a disconnected/disarmed FCU) using
+                # still-fresh EXIT and output feedback from the old mode.
+                flight = self.flight
+                if (flight is None or not flight.connected or not flight.armed
+                        or flight.mode.upper() != "OFFBOARD"
+                        or not is_fresh(self.flight_at, self.state_timeout_s, rospy.Time.now())):
+                    return
             if mode == "OFFBOARD":
                 self.offboard_request = (getattr(self, "takeover_attempt", 0),
                                          self.selected_mode, time.monotonic())
@@ -969,6 +1009,7 @@ class FlightModeManagerNode:
         self.fault_seen = False
         self.wall_fault_return_ready = False
         self.wall_failure_reason = ""
+        self.wall_return_episode = False
         self.lock_until_neutral = lock
         self.ceiling_approach_timeout_returning = False
         self._set_phase(self.LOCKED if lock else self.IDLE, reason=reason)
@@ -990,6 +1031,10 @@ class FlightModeManagerNode:
         requested = self._requested_mode(now)
         flight_mode = self.flight.mode.upper() if self.flight else ""
         flight_fresh = is_fresh(self.flight_at, self.state_timeout_s, now)
+        if (self.phase == self.RETURNING and flight_mode == "OFFBOARD"
+                and getattr(self, "selected_mode", None) == OperatorCommand.MODE_WALL
+                and not getattr(self, "wall_approach_timeout_returning", False)):
+            self._observe_completion(now)
 
         if (self.phase in (self.IDLE, self.LOCKED) and flight_fresh and flight_mode == "OFFBOARD"
                 and getattr(self, "canceled_entry_mode", None) is not None):
@@ -1192,6 +1237,8 @@ class FlightModeManagerNode:
                     self.phase_reason="接近超时：受控交回" + self._pilot_mode() + "；" + detail
                 elif getattr(self, "ceiling_approach_timeout_returning", False):
                     self.phase_reason = "吸顶接近超时：保持FAULT，等待有效遥控输入、飞控估计和连续输出后请求ALTCTL"
+                elif self._wall_return_requires_exit() and not self._wall_return_exit_ready(now):
+                    self.phase_reason = "离墙条件重新确认中：保持受控输出，等待新的有效EXIT后交回" + self._pilot_mode()
                 else:
                     prefix = (self._wall_return_reason() + "；"
                         if getattr(self, "selected_mode", None) == OperatorCommand.MODE_WALL
