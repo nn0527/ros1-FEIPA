@@ -146,6 +146,20 @@ wall_perch_decision_node:
   # 真正的单电机硬上限仍须在PX4控制分配器或ESC内实现。
   max_thrust: 0.85
 
+  # Bounded departure support; verification and blending both consume budget.
+  detach_height_continuation_jump_m: 0.25
+  detach_height_continuation_entry_tilt_deg: 30.0
+  detach_height_continuation_episode_s: 1.2
+  detach_height_continuation_total_s: 1.5
+  detach_height_continuation_confirm_s: 0.30
+  detach_height_continuation_min_samples: 4
+  detach_height_continuation_max_gap_s: 0.20
+  detach_height_continuation_step_residual_m: 0.05
+  detach_height_continuation_residual_rate_mps: 0.20
+  detach_height_continuation_restore_tilt_deg: 10.0
+  detach_height_continuation_restore_speed_mps: 0.20
+  detach_height_continuation_blend_s: 0.30
+
   max_rate_rps: 3.0
   flip_max_rate_rps: 6.0
   capture_max_rate_rps: 4.5

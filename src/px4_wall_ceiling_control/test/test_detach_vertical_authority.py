@@ -85,6 +85,8 @@ class DepartureAuthorityTests(unittest.TestCase):
 
     def test_coordinate_reset_is_latched_and_refused(self):
         n = self.node(); n._begin_detach_vertical(rospy.Time.from_sec(10), n.horizontal_output)
+        # Above the explicitly allowed 30-degree support cone, retain refusal.
+        n._current_quaternion = lambda: (0., math.sin(math.radians(31.)/2.), 0., math.cos(math.radians(31.)/2.))
         n.odom.pose.pose.position.z = 1.
         now = self.refresh(n, 10.02)
         self.assertTrue(math.isnan(n._detach_vertical_thrust(now, .02)))
@@ -123,6 +125,7 @@ class DepartureAuthorityTests(unittest.TestCase):
 
     def test_coordinate_reset_abort_reseeds_only_after_consistent_new_frame(self):
         n = self.node(); n._begin_detach_vertical(rospy.Time.from_sec(10), n.horizontal_output)
+        n._current_quaternion = lambda: (0., math.sin(math.radians(31.)/2.), 0., math.cos(math.radians(31.)/2.))
         n.odom.pose.pose.position.z = 1.
         now = self.refresh(n, 10.02)
         self.assertTrue(math.isnan(n._detach_vertical_thrust(now, .02)))
