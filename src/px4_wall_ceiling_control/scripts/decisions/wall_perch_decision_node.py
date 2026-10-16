@@ -2,6 +2,8 @@
 """ROS/MAVROS decision port of the reference PX4 wall_perch state machine."""
 
 import math
+import threading
+from contextlib import nullcontext
 import uuid
 from statistics import median
 
@@ -59,6 +61,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
     }
 
     def __init__(self):
+        self.feedback_lock = threading.RLock()
         install_kill_guard(self, rospy, String)
         self.maneuver_id = uuid.uuid4().hex
         self.control_sequence = 0
@@ -462,7 +465,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             rospy.get_param("~odom_topic", "/mavros/local_position/odom"),
             Odometry,
             self._on_odom,
-            queue_size=10,
+            queue_size=1,
         )
         rospy.Subscriber(
             rospy.get_param("~state_topic", "/mavros/state"),
@@ -711,6 +714,10 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             self.flip_ready_since = self.flip_ready_last_sample_at = None
 
     def _on_odom(self, message):
+        with getattr(self, 'feedback_lock', nullcontext()):
+            self._accept_odom(message)
+
+    def _accept_odom(self, message):
         now = rospy.Time.now()
         stamp = message.header.stamp
         previous = getattr(self, "odom_source_stamp", None)
@@ -774,6 +781,10 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                       self.approach_takeover_thrust, self.approach_base_vertical_thrust)
 
     def _on_state(self, message):
+        with getattr(self, 'feedback_lock', nullcontext()):
+            self._accept_flight_state(message)
+
+    def _accept_flight_state(self, message):
         previous_mode = getattr(getattr(self, "flight_state", None), "mode", "")
         self.flight_state = message
         self.flight_state_received_at = rospy.Time.now()
@@ -1273,6 +1284,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
     def _detach_height_settled(self):
         if getattr(self, "bench_wait_for_ranges", False):
             return self._height_feedback() is not None
+        if getattr(self, 'state', None) != WallPerchStatus.STATE_ABORT and not self._detach_height_loop_ready():
+            return False
         feedback = self._height_feedback()
         return bool(
             getattr(self, "recovery_altitude_m", None) is not None
@@ -1473,6 +1486,11 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         if new_state == self.state:
             self.last_reason = reason
             return
+        if self.state == WallPerchStatus.STATE_DETACH_ROTATE and not getattr(self, "bench_wait_for_ranges", False):
+            # Reuse the normal async transition log; do not perform synchronous
+            # per-cycle logging in the control loop. Capture before resetting
+            # any departure evidence on the destination state.
+            reason += "; " + self._detach_rotation_diagnostic_text(now)
         if (
             new_state in (WallPerchStatus.STATE_WALL_CAPTURE, WallPerchStatus.STATE_WALL_HOLD)
             and self.state == WallPerchStatus.STATE_FLIP_TO_WALL
@@ -1683,6 +1701,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         return abs(self._euler_from_quaternion(quaternion)[1]) >= self.pin_pitch_rad
 
     def _update_state_machine(self, now):
+        self._prepare_detach_vertical_feedback(now)
         mode_requested = self._mode_requested(now)
         cancel = self.cancel_requested or (
             self.state not in (WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_EXIT)
@@ -1917,22 +1936,30 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         elif self.state == WallPerchStatus.STATE_EXIT:
             # Keep a bounded level target until fresh FCU feedback confirms
             # OFFBOARD has ended. Owner release alone is not RC handover.
+            normal_departure = not getattr(self, "fault_recovery_completed", False)
+            if normal_departure and getattr(self, "detach_vertical_fault", ""):
+                self.detach_completed = self.recovery_completed = False
+                self.fault_count += 1
+                self._enter_state(WallPerchStatus.STATE_ABORT, now, self.detach_vertical_fault)
+                return
             if self._flight_ready(now):
-                if (not getattr(self, "fault_recovery_completed", False)
+                height_pending = not self._detach_height_loop_ready()
+                if (normal_departure
                         and not getattr(self, "bench_wait_for_ranges", False)
                         and self.flight_state is not None and self.flight_state.mode.upper() == "OFFBOARD"
-                        and not self._departure_clearance_ready(now)):
+                        and (height_pending or not self._departure_clearance_ready(now))):
                     # EXIT is provisional until the FCU leaves OFFBOARD. A
-                    # revoked distance gate resumes the existing controllers
+                    # revoked height/distance gate resumes existing controllers
                     # without resetting their height reference or time budget.
                     self.detach_completed = self.recovery_completed = False
+                    lost_gate = "height feedback continuity lost" if height_pending else "departure clearance lost"
                     if self._recovery_total_age(now) >= getattr(self, "recover_timeout_s", 15.):
                         self.fault_count += 1
                         self._enter_state(WallPerchStatus.STATE_ABORT, now,
-                            "recovery timeout after departure clearance lost; normal detach incomplete")
+                            "recovery timeout after " + lost_gate + "; normal detach incomplete")
                     else:
                         self._enter_state(WallPerchStatus.STATE_RECOVER, now,
-                            "departure clearance lost before pilot mode handover; resume recovery")
+                            lost_gate + " before pilot mode handover; resume recovery")
                     return
                 self.last_reason = ("fault recovery complete; waiting for pilot mode handover"
                     if getattr(self, "fault_recovery_completed", False)
@@ -2029,7 +2056,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                     getattr(self, "detach_recovered_rate_rps", math.radians(10.)))
 
     def _detach_rotation_ready(self, now):
-        if (self._detach_progress() < 1. or not self._odom_fresh(now)
+        if (not self._detach_height_loop_ready() or self._detach_progress() < 1. or not self._odom_fresh(now)
                 or not self._detach_rotation_pose_valid()
                 or getattr(self, "detach_recovered_samples", 0) < 2
                 or getattr(self, "detach_recovered_since", None) is None
@@ -2038,6 +2065,42 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                    < getattr(self, "detach_recovered_hold_s", .30)):
             return False
         return self._published_recovery_target_ready(now)
+
+    def _detach_rotation_diagnostics(self, now):
+        """Observe the existing completion gates without accumulating evidence."""
+        attitude = self._current_quaternion()
+        odom = getattr(self, "odom", None)
+        rates = odom.twist.twist.angular if odom is not None else None
+        omega = tuple(getattr(rates, axis, math.nan) for axis in "xyz")
+        rate = math.sqrt(sum(value*value for value in omega)) if all(math.isfinite(value) for value in omega) else math.nan
+        tilt = (math.acos(clamp(rotate_vector(attitude, (0., 0., 1.))[2], -1., 1.))
+                if attitude is not None else math.nan)
+        fresh = self._odom_fresh(now)
+        since = getattr(self, "detach_recovered_since", None)
+        last = getattr(self, "detach_recovered_last_stamp", None)
+        duration = max(0., (last-since).to_sec()) if since is not None and last is not None else 0.
+        # A stale final sample is historical evidence, not current stability.
+        continuous = duration if fresh and self._detach_rotation_pose_valid() else 0.
+        checks = (
+            ("height_closed_loop", self._detach_height_loop_ready()),
+            ("trajectory_complete", self._detach_progress() >= 1.),
+            ("fresh_odometry", fresh),
+            ("measured_tilt", math.isfinite(tilt) and tilt <= getattr(self, "detach_recovered_tilt_rad", math.radians(5.))),
+            ("angular_rate_norm", math.isfinite(rate) and rate <= getattr(self, "detach_recovered_rate_rps", math.radians(10.))),
+            ("distinct_samples", getattr(self, "detach_recovered_samples", 0) >= 2),
+            ("continuous_stability", since is not None and last is not None and continuous >= getattr(self, "detach_recovered_hold_s", .30)),
+            ("published_target", self._published_recovery_target_ready(now)),
+        )
+        return {"rates_deg_s": tuple(math.degrees(value) for value in omega),
+                "rate_norm_deg_s": math.degrees(rate), "tilt_deg": math.degrees(tilt),
+                "stable_s": continuous, "failed": tuple(name for name, passed in checks if not passed)}
+
+    def _detach_rotation_diagnostic_text(self, now):
+        evidence = self._detach_rotation_diagnostics(now)
+        return ("detach_stability rate_xyz_deg_s=(%.2f,%.2f,%.2f) rate_norm_deg_s=%.2f "
+                "tilt_deg=%.2f stable_s=%.3f failed=%s" %
+                (*evidence["rates_deg_s"], evidence["rate_norm_deg_s"], evidence["tilt_deg"],
+                 evidence["stable_s"], ",".join(evidence["failed"]) or "none"))
 
     def _published_recovery_target_ready(self, now):
         output = self._valid_wall_output(now)
@@ -2374,6 +2437,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             status.reason += "; " + status.horizontal_velocity_reason
         if self.state == WallPerchStatus.STATE_DETACH_ROTATE and getattr(self, "detach_tracking_limited", False):
             status.reason += "; 脱离轨迹跟踪误差受限"
+        if self.state == WallPerchStatus.STATE_DETACH_ROTATE and not getattr(self, "bench_wait_for_ranges", False):
+            status.reason += "; " + self._detach_rotation_diagnostic_text(now)
         self._fill_detach_vertical_status(status)
         return status
 
@@ -2416,6 +2481,12 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         return candidate
 
     def _on_timer(self, _event):
+        # A timer tick sees one odometry message and its matching receipt time.
+        # Queue size one drops superseded frames while this short section runs.
+        with getattr(self, 'feedback_lock', nullcontext()):
+            self._control_cycle(_event)
+
+    def _control_cycle(self, _event):
         now = rospy.Time.now()
         if self.previous_update_at is None:
             self.control_dt = 0.02

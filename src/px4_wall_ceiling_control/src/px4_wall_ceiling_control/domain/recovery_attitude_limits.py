@@ -55,3 +55,21 @@ def limit_recovery_attitude(desired, previous, dt, max_tilt, tilt_rate, yaw_rate
     error = math.atan2(math.sin(yaw-prev_yaw), math.cos(yaw-prev_yaw))
     yaw = prev_yaw + clamp(error, -yaw_rate*max(0.0,dt), yaw_rate*max(0.0,dt))
     return attitude_from_axis_yaw(cone_axis(axis, max_tilt), yaw), projected
+
+
+def limit_terminal_attitude(desired, previous, dt, tilt_rate, yaw_rate,
+                            response_per_s, max_tilt=math.pi):
+    """Slew a target axis and soften its arrival; no actual-pose guarantee.
+
+    With the default cone, the previously published axis is never projected.
+    The exponential error step cannot cross the desired axis. This is a
+    setpoint governor, not angular-rate feedback or a vehicle dynamics model.
+    """
+    axis, _ = axis_yaw(desired)
+    previous_axis, _ = axis_yaw(previous)
+    axis = cone_axis(axis, max_tilt)
+    distance = math.acos(clamp(sum(a*b for a, b in zip(axis, previous_axis)), -1., 1.))
+    dt = max(0., dt)
+    softened_rate = distance * -math.expm1(-response_per_s * dt) / dt if dt > 0. else 0.
+    return limit_recovery_attitude(desired, previous, dt, max_tilt,
+                                   min(tilt_rate, softened_rate), yaw_rate)[0]

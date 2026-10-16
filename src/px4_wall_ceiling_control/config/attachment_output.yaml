@@ -34,6 +34,13 @@ attachment_output_mux_node:
   hover_thrust: 0.49
   vertical_speed_kp: 0.15
   odom_twist_in_child_frame: true
+  # Independent final DETACH setpoint deceleration before the vehicle levels.
+  # These constrain targets; actual overshoot must be verified in flight logs.
+  detach_terminal_enabled: true
+  detach_terminal_start_deg: 30.0
+  detach_terminal_axis_rate_deg_s: 10.0
+  detach_terminal_yaw_rate_deg_s: 20.0
+  detach_terminal_response_per_s: 2.0
   rc_assist_enabled: false
   # Console enables calibrated roll/pitch for ceiling, roll/yaw for wall.
   rc_ceiling_roll_pitch_enabled: false
@@ -96,3 +103,8 @@ ceiling_attachment_output_node:
 # Separate from the legacy automatic approach timeout and 2 s flip trajectory.
 flight_mode_manager_node:
   manual_wall_wait_timeout_s: 60.0
+  # User-selected early pilot handback after measured leveling, including ABORT.
+  wall_level_handover_enabled: true
+  wall_level_handover_tilt_deg: 5.0
+  wall_level_handover_hold_s: 0.30
+  wall_level_handover_retry_s: 0.50

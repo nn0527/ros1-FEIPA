@@ -525,6 +525,14 @@ class WallHorizontalVelocityMixin:
             if self.state != W.STATE_IDLE:self.horizontal_controller.reset()
             return quaternion
         yaw = self.horizontal_takeover_yaw if self.horizontal_takeover_yaw is not None else euler_from_quaternion(self.q_hover)[2]
+        normal_departure = (self.state in (W.STATE_DETACH_ROTATE, W.STATE_RECOVER)
+            or (self.state == W.STATE_EXIT and not getattr(self, 'fault_recovery_completed', False)))
+        if normal_departure:
+            # The leveling trajectory ends at q_hover. Activating horizontal
+            # braking must not replace that heading with the old approach or
+            # wall-clearance heading. ABORT keeps its emergency behavior.
+            yaw = euler_from_quaternion(self.q_hover)[2]
+        velocity_yaw = yaw
         if not self.horizontal_velocity_ready:
             self._clear_horizontal_integral(self.horizontal_velocity_reason)
             self.horizontal_controller.reset()
@@ -550,7 +558,7 @@ class WallHorizontalVelocityMixin:
             if (self.state == W.STATE_RECOVER and getattr(self, 'departure_active', False)
                     and self.departure_feedback_valid and not self.departure_clear_confirmed):
                 forward = -self.departure_retreat_speed
-                yaw = self.departure_yaw
+                velocity_yaw = self.departure_yaw
             previous = self.recovery_control_at
             dt = min(.05, max(0., (now-previous).to_sec())) if previous is not None else min(.05, max(0., self.control_dt))
             self.recovery_control_at = now
@@ -560,7 +568,9 @@ class WallHorizontalVelocityMixin:
             self.recovery_integral_budget = max(0., self.recovery_integral_budget-integral_dt)
             baseline = self._recovery_baseline(now, dt)
             applied = self.recovery_applied_axis
-        desired = (forward*math.cos(yaw),forward*math.sin(yaw))
+        # Retreat remains in the frozen departure world direction even when
+        # the desired body heading differs after a corrected wall posture.
+        desired = (forward*math.cos(velocity_yaw),forward*math.sin(velocity_yaw))
         quaternion = controller.attitude(desired,self.horizontal_measured,yaw,dt,baseline,
             integrate=integral_dt>0.,integral_dt=integral_dt,max_tilt=math.radians(5.),applied_axis=applied)
         axis = rotate_vector(quaternion,(0.,0.,1.))

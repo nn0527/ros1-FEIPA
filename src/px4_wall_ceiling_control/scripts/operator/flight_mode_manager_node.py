@@ -21,7 +21,7 @@ from px4_wall_ceiling_control.adapters.odometry import (
     vertical_speed_enu_mps,
 )
 from px4_wall_ceiling_control.domain.geometry import euler_from_quaternion
-from px4_wall_ceiling_control.freshness import is_fresh_receipt as is_fresh
+from px4_wall_ceiling_control.freshness import is_fresh_receipt as is_fresh, is_fresh_source
 from px4_wall_ceiling_control.msg import (
     CeilingAttachmentStatus,
     OperatorCommand,
@@ -67,6 +67,20 @@ class FlightModeManagerNode:
         self.ceiling_baro_handover_enabled = bool(rospy.get_param("~ceiling_baro_handover_enabled", False))
         self.ceiling_distance_gate_enabled = bool(rospy.get_param("~ceiling_distance_gate_enabled", False))
         self.wall_pilot_mode = str(rospy.get_param("~wall_pilot_mode", "ALTCTL")).upper()
+        self.wall_level_handover_enabled = bool(rospy.get_param("~wall_level_handover_enabled", True))
+        self.wall_level_handover_tilt_deg = float(rospy.get_param("~wall_level_handover_tilt_deg", 5.))
+        self.wall_level_handover_hold_s = float(rospy.get_param("~wall_level_handover_hold_s", .30))
+        self.wall_level_handover_retry_s = float(rospy.get_param("~wall_level_handover_retry_s", .50))
+        if (not all(math.isfinite(v) for v in (self.wall_level_handover_tilt_deg,
+                self.wall_level_handover_hold_s, self.wall_level_handover_retry_s))
+                or not 0. < self.wall_level_handover_tilt_deg <= 5.
+                or not .30 <= self.wall_level_handover_hold_s <= 2.
+                or not .20 <= self.wall_level_handover_retry_s <= 2.):
+            raise ValueError("invalid wall level pilot handover settings")
+        self.wall_level_returning = False
+        self.wall_level_window = None
+        self.wall_level_handover_reason = "等待回平"
+        self.wall_level_lock = threading.RLock()
         self.wall_horizontal_velocity_enabled = bool(rospy.get_param("/wall_perch_decision_node/horizontal_velocity_enabled",False))
         if self.wall_pilot_mode not in ("ALTCTL","POSCTL"):raise ValueError("unsupported wall pilot mode")
         self.wall_auto_approach = bool(rospy.get_param("~wall_auto_approach", False))
@@ -170,7 +184,7 @@ class FlightModeManagerNode:
         self.phase_reason = "initialized"
         rospy.Subscriber("/mavros/state", State, self._on_flight, queue_size=10)
         rospy.Subscriber(
-            "/mavros/local_position/odom", Odometry, self._on_odom, queue_size=10
+            "/mavros/local_position/odom", Odometry, self._on_odom, queue_size=1
         )
         # Intent cleanup needs live pilot input even when stick centering is disabled.
         rospy.Subscriber(
@@ -254,7 +268,16 @@ class FlightModeManagerNode:
                     self.cancel_entry_stable_since = None
 
     def _on_odom(self, message):
-        self.odom, self.odom_at = message, rospy.Time.now()
+        received = rospy.Time.now()
+        if not hasattr(self, 'wall_level_lock'):self.wall_level_lock = threading.RLock()
+        with self.wall_level_lock:
+            self.odom, self.odom_at = message, received
+            self.handover_odom_snapshot = (message, received)
+            if getattr(self, 'wall_level_handover_enabled', False):
+                # Observe every delivered frame: a brief tilt excursion between
+                # manager ticks must invalidate the continuous-level window.
+                # This only records evidence; mode requests remain in the timer.
+                self._wall_level_handover_ready(received)
 
     def _on_rc(self, message):
         self.rc_channels, self.rc_at = tuple(message.channels), rospy.Time.now()
@@ -730,6 +753,98 @@ class FlightModeManagerNode:
                          or getattr(self, "completed", False)
                          or getattr(self, "wall_fault_return_ready", False)))
 
+    def _wall_level_handover_selected(self):
+        wall = getattr(self, 'wall', None)
+        return bool(getattr(self, 'wall_level_handover_enabled', False)
+                    and self.selected_mode == OperatorCommand.MODE_WALL and wall is not None
+                    and wall.state in (WallPerchStatus.STATE_DETACH_ROTATE,
+                        WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT))
+
+    def _wall_level_handover_failure(self, now, odom, received):
+        if not self._wall_level_handover_selected():return "等待脱离、恢复或ABORT回平阶段"
+        if not kill_clear(self, now):return "急停生效或反馈无效"
+        if (not is_fresh(self.wall_at, self.status_timeout_s, now)
+                or not is_fresh_source(self.wall.header.stamp, self.status_timeout_s, now, future_tolerance_s=.1)):
+            return "侧吸阶段反馈过期"
+        flight = self.flight
+        if (flight is None or not flight.connected or not flight.armed or flight.mode.upper() != 'OFFBOARD'
+                or not is_fresh(self.flight_at, self.state_timeout_s, now)):
+            return "等待新鲜、已解锁的OFFBOARD反馈"
+        if (self.owner != 2 or self.output_mode != 2
+                or not is_fresh(self.owner_at, self.output_timeout_s, now)
+                or not is_fresh(self.output_at, self.output_timeout_s, now)):
+            return "等待侧吸连续姿态输出"
+        if not self._rc_fresh(now):return "遥控反馈缺失或过期"
+        estimate = self.estimator
+        if (estimate is None or not is_fresh(self.estimator_at, self.estimator_timeout_s, now)
+                or not estimate.attitude_status_flag or not estimate.velocity_vert_status_flag):
+            return "PX4姿态或竖直估计未有效"
+        if (self._pilot_mode() == 'POSCTL' and not (estimate.velocity_horiz_status_flag
+                and (estimate.pos_horiz_rel_status_flag or estimate.pos_horiz_abs_status_flag)
+                and not estimate.const_pos_mode_status_flag)):
+            return "PX4位置/水平速度估计未有效，不能交回POSCTL"
+        sample_timeout = min(.20, self.odom_timeout_s)
+        if (odom is None or not is_fresh(received, sample_timeout, now)
+                or not is_fresh_source(odom.header.stamp, sample_timeout, now, future_tolerance_s=.1)
+                or not odometry_is_finite(odom)):
+            return "里程计缺失、过期或无效"
+        q = odom.pose.pose.orientation
+        norm = sum(v*v for v in (q.x,q.y,q.z,q.w))
+        if not .5 <= norm <= 1.5:return "姿态四元数无效"
+        # Total thrust-axis tilt, not separate roll/pitch limits. Magnitudes of
+        # angular/horizontal/vertical velocity deliberately do not gate return.
+        cos_tilt = 1. - 2.*(q.x*q.x+q.y*q.y)/norm
+        if cos_tilt < math.cos(math.radians(self.wall_level_handover_tilt_deg))-1.e-12:
+            return "等待实际总倾角≤%.1f度" % self.wall_level_handover_tilt_deg
+        return None
+
+    def _wall_level_handover_ready(self, now):
+        if not hasattr(self, 'wall_level_lock'):self.wall_level_lock = threading.RLock()
+        with self.wall_level_lock:
+            odom, received = getattr(self, 'handover_odom_snapshot', (self.odom, self.odom_at))
+            failure = self._wall_level_handover_failure(now, odom, received)
+            if failure:
+                self.wall_level_window = None
+                self.wall_level_handover_reason = failure
+                return False
+            # Integer timestamps avoid cancellation at epoch-sized ROS times.
+            source = odom.header.stamp.to_nsec()
+            arrival = received.to_nsec()
+            hold_ns = int(round(self.wall_level_handover_hold_s*1.e9))
+            attempt = getattr(self, 'takeover_attempt', 0)
+            window = getattr(self, 'wall_level_window', None)
+            if window is not None and window[0] == attempt:
+                _, first_source, first_arrival, last_source, last_arrival, samples = window
+                if source < last_source or arrival < last_arrival:
+                    self.wall_level_window = None
+                    self.wall_level_handover_reason = "回平样本乱序，重新确认"
+                    return False
+                if source == last_source:
+                    # Neither a repeated callback nor the service worker can
+                    # extend the confirmation window using the same source frame.
+                    return min(last_source-first_source,last_arrival-first_arrival)+1 >= hold_ns and samples >= 3
+                if source-last_source > 200000001 or arrival-last_arrival > 200000001:
+                    window = None
+            else:window = None
+            if window is None:
+                first_source, first_arrival, samples = source, arrival, 0
+            samples += 1
+            self.wall_level_window = (attempt, first_source, first_arrival, source, arrival, samples)
+            duration_ns = min(source-first_source, arrival-first_arrival)
+            duration = duration_ns/1.e9
+            ready = samples >= 3 and duration_ns+1 >= hold_ns
+            self.wall_level_handover_reason = ("回平确认完成，申请交回" + self._pilot_mode() if ready
+                else "实际总倾角≤%.1f度确认%.2f/%.2f秒" % (self.wall_level_handover_tilt_deg, duration, self.wall_level_handover_hold_s))
+            return ready
+
+    def _wall_level_return_reason(self, confirmed=False):
+        text = ("已确认交回" if confirmed else "回平快速交接，等待PX4确认") + self._pilot_mode()
+        if getattr(self, 'fault_seen', False):
+            text += "；本次含ABORT/故障，未标记正常脱离完成"
+        else:
+            text += "；未等待高度、速度及离墙验收完成"
+        return text
+
     def _wall_return_exit_ready(self, now):
         status = getattr(self, "wall", None)
         if (status is None or not is_fresh(getattr(self, "wall_at", None), self.status_timeout_s, now)
@@ -741,6 +856,8 @@ class FlightModeManagerNode:
                         and not status.fault_detected and not getattr(self, "fault_seen", False)))
 
     def _handover_ready(self, now):
+        if getattr(self, 'wall_level_returning', False):
+            return self._wall_level_handover_ready(now)
         if getattr(self,"wall_approach_timeout_returning",False):
             return self._wall_timeout_handover_ready(now)
         # A normal EXIT can be revoked while waiting for POSCTL. Read the live
@@ -920,9 +1037,11 @@ class FlightModeManagerNode:
 
     def _request_mode(self, mode):
         now = time.monotonic()
+        retry = (self.wall_level_handover_retry_s
+                 if getattr(self, 'wall_level_returning', False) and mode == self._pilot_mode() else self.retry_s)
         if self.request_in_flight or (
             self.last_request_at is not None
-            and now - self.last_request_at < self.retry_s
+            and now - self.last_request_at < retry
         ):
             return
         self.last_request_at = now
@@ -991,6 +1110,8 @@ class FlightModeManagerNode:
             self.request_in_flight = False
 
     def _reset(self, lock=False, reason=None):
+        self.wall_level_returning = False
+        self.wall_level_window = None
         self.wall_approach_timeout_returning = False
         self.wall_timeout_stable_since = self.wall_timeout_last_odom = None
         self.wall_timeout_safe_samples = 0
@@ -1035,6 +1156,10 @@ class FlightModeManagerNode:
                 and getattr(self, "selected_mode", None) == OperatorCommand.MODE_WALL
                 and not getattr(self, "wall_approach_timeout_returning", False)):
             self._observe_completion(now)
+        if (self.phase == self.RETURNING and not getattr(self, 'wall_level_returning', False)
+                and self._wall_level_handover_selected() and self._wall_level_handover_ready(now)):
+            self.wall_level_returning = True
+            self.phase_reason = self._wall_level_return_reason()
 
         if (self.phase in (self.IDLE, self.LOCKED) and flight_fresh and flight_mode == "OFFBOARD"
                 and getattr(self, "canceled_entry_mode", None) is not None):
@@ -1180,7 +1305,11 @@ class FlightModeManagerNode:
                         and is_fresh(self.wall_at, self.status_timeout_s, now)
                         and self.wall.state == WallPerchStatus.STATE_SLOW_APPROACH):
                     self.phase_reason = self.wall.reason
-                if self._wall_approach_timeout_requested(now):
+                if self._wall_level_handover_selected() and self._wall_level_handover_ready(now):
+                    self.wall_level_returning = True
+                    self._set_phase(self.RETURNING, reason=self._wall_level_return_reason())
+                    self._request_mode(self._pilot_mode())
+                elif self._wall_approach_timeout_requested(now):
                     self.wall_approach_timeout_returning = True
                     self.wall_timeout_stable_since=self.wall_timeout_last_odom=None
                     self.wall_timeout_safe_samples=0
@@ -1213,18 +1342,23 @@ class FlightModeManagerNode:
                     )
                     rospy.logerr("%s; returning to ALTCTL", failure_reason)
                     self._set_phase(self.RETURNING, reason=failure_reason)
+                elif self._wall_level_handover_selected():
+                    self.phase_reason = "回平后交回" + self._pilot_mode() + "；" + self.wall_level_handover_reason
         elif self.phase == self.RETURNING:
             if ((getattr(self, "ceiling_approach_timeout_returning", False)
                     or getattr(self,"wall_approach_timeout_returning",False))
                     and (not flight_fresh or self.flight is None or not self.flight.connected)):
                 self.phase_reason = "waiting for fresh connected PX4 mode confirmation"
-            elif (getattr(self,"wall_approach_timeout_returning",False) and flight_fresh
+            elif (getattr(self,"wall_approach_timeout_returning",False)
+                    and not getattr(self, 'wall_level_returning', False) and flight_fresh
                     and self.flight is not None and self.flight.connected and flight_mode == self._pilot_mode()):
                 self._begin_offboard_exit("接近超时已交回" + self._pilot_mode() + "，清理旧OFFBOARD意图",monotonic_now)
             elif flight_fresh and self.flight.connected and flight_mode == self._pilot_mode():
                 self._reset(
                     lock=True,
-                    reason=(self._wall_return_reason(confirmed=True) + "；释放请求后可重试"
+                    reason=(self._wall_level_return_reason(confirmed=True) + "；释放请求后可重试"
+                        if getattr(self, 'wall_level_returning', False)
+                        else self._wall_return_reason(confirmed=True) + "；释放请求后可重试"
                         if self.selected_mode == OperatorCommand.MODE_WALL
                         and (self.completed or getattr(self, "wall_fault_return_ready", False))
                         else "returned to {}; release command before retry".format(self._pilot_mode())),
@@ -1232,7 +1366,9 @@ class FlightModeManagerNode:
             elif flight_fresh and flight_mode == "OFFBOARD" and self._handover_ready(now):
                 self._request_mode(self._pilot_mode())
             elif flight_fresh and flight_mode == "OFFBOARD":
-                if getattr(self,"wall_approach_timeout_returning",False):
+                if getattr(self, 'wall_level_returning', False):
+                    self.phase_reason = self._wall_level_return_reason() + "；" + self.wall_level_handover_reason
+                elif getattr(self,"wall_approach_timeout_returning",False):
                     detail=self._wall_timeout_handover_failure(now) or "等待姿态及竖直速度连续安全0.30秒"
                     self.phase_reason="接近超时：受控交回" + self._pilot_mode() + "；" + detail
                 elif getattr(self, "ceiling_approach_timeout_returning", False):

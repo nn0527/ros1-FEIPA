@@ -4,6 +4,8 @@
 import math
 import json
 import time
+import threading
+from functools import wraps
 
 import rospy
 from geometry_msgs.msg import Quaternion, Vector3Stamped
@@ -34,7 +36,8 @@ from px4_wall_ceiling_control.domain.rc_attitude_assist import (
     stick_fraction,
     trim_attitude,
 )
-from px4_wall_ceiling_control.domain.recovery_attitude_limits import limit_recovery_attitude, axis_yaw
+from px4_wall_ceiling_control.domain.recovery_attitude_limits import (
+    limit_recovery_attitude, limit_terminal_attitude, axis_yaw)
 from px4_wall_ceiling_control.domain.safety import flight_state_ready
 from px4_wall_ceiling_control.freshness import is_fresh_receipt as is_fresh, is_fresh_source
 from px4_wall_ceiling_control.msg import (
@@ -43,6 +46,18 @@ from px4_wall_ceiling_control.msg import (
     OperatorCommand,
     WallPerchStatus,
 )
+
+
+def output_locked(method):
+    """Serialize publication with maneuver, ownership and feedback callbacks."""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        # __new__-based regression fixtures do not call __init__.
+        if not hasattr(self, '_output_lock'):
+            self._output_lock = threading.RLock()
+        with self._output_lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 class AttachmentOutputMuxNode:
@@ -56,6 +71,7 @@ class AttachmentOutputMuxNode:
     ATTITUDE_AND_THRUST_MASK = MavrosSetpointBuilder.ATTITUDE_AND_THRUST_MASK
 
     def __init__(self):
+        self._output_lock = threading.RLock()
         install_kill_guard(self, rospy, String)
         self.output_enabled = bool(rospy.get_param("~output_enabled", False))
         self.ceiling_output_enabled = bool(
@@ -219,6 +235,19 @@ class AttachmentOutputMuxNode:
         self.wall_detach_rate_rad_s = math.radians(1.875 * flip_angle / max(.01, detach_time))
         self.wall_return_thrust_slew_per_s = float(rospy.get_param(
             "/wall_perch_decision_node/return_thrust_slew_per_s", .50))
+        self.detach_terminal_enabled = bool(rospy.get_param("~detach_terminal_enabled", True))
+        self.detach_terminal_start_deg = float(rospy.get_param("~detach_terminal_start_deg", 30.))
+        self.detach_terminal_axis_rate_deg_s = float(rospy.get_param("~detach_terminal_axis_rate_deg_s", 10.))
+        self.detach_terminal_yaw_rate_deg_s = float(rospy.get_param("~detach_terminal_yaw_rate_deg_s", 20.))
+        self.detach_terminal_response_per_s = float(rospy.get_param("~detach_terminal_response_per_s", 2.))
+        terminal_values = (self.detach_terminal_start_deg, self.detach_terminal_axis_rate_deg_s,
+                           self.detach_terminal_yaw_rate_deg_s, self.detach_terminal_response_per_s)
+        if (not all(math.isfinite(value) for value in terminal_values)
+                or not 5. <= self.detach_terminal_start_deg <= 45.
+                or not 0. < self.detach_terminal_axis_rate_deg_s <= 10.
+                or not 0. < self.detach_terminal_yaw_rate_deg_s <= 20.
+                or not 0. < self.detach_terminal_response_per_s <= 5.):
+            raise ValueError("invalid detach terminal leveling bounds")
         if not (math.isfinite(self.wall_maneuver_rate_rad_s) and 0 < self.wall_maneuver_rate_rad_s
                 and math.isfinite(self.wall_maneuver_thrust_slew_per_s)
                 and 0 < self.wall_maneuver_thrust_slew_per_s <= 1.0
@@ -227,6 +256,9 @@ class AttachmentOutputMuxNode:
                 and 0 < self.wall_return_thrust_slew_per_s <= 1.0):
             raise ValueError("invalid wall final publication slew bounds")
         self.last_published_control = None
+        self.last_published_maneuver_id = None
+        self.wall_near_level_maneuver = None
+        self.wall_terminal_maneuver = None
         self.wall_publication_slew = None
         self.flight_state = None
         self.flight_state_at = None
@@ -406,7 +438,19 @@ class AttachmentOutputMuxNode:
                 return "invalid_recovery_support_limit"
         return ""
 
+    def _reset_wall_publication_history(self):
+        self.wall_near_level_maneuver = None
+        self.wall_terminal_maneuver = None
+        self.last_published_maneuver_id = None
+        previous = getattr(self, 'last_published_control', None)
+        if previous is not None and previous[3] == AttachmentControlCandidate.SOURCE_WALL:
+            self.last_published_control = None
+        self.recovery_previous_target = self.recovery_previous_at = None
+        self.wall_publication_slew = None
+
+    @output_locked
     def _retire_wall_maneuver(self):
+        self._reset_wall_publication_history()
         maneuver = getattr(self, "wall_maneuver_id", None)
         retired = getattr(self, "wall_retired_maneuvers", set())
         if maneuver:
@@ -421,6 +465,7 @@ class AttachmentOutputMuxNode:
         self.last_published_control = None
         self.wall_continuity_fcu_snapshot = None
 
+    @output_locked
     def _on_wall_candidate(self, message):
         now = rospy.Time.now()
         reason = self._wall_candidate_problem(message, now)
@@ -454,6 +499,7 @@ class AttachmentOutputMuxNode:
                 if current:
                     retired.add(current)
                 self.wall_retired_maneuvers = retired
+                self._reset_wall_publication_history()
                 self.wall_maneuver_id = maneuver
                 self.wall_maneuver_closed = False
         self.wall_candidate_rejection = reason
@@ -476,6 +522,7 @@ class AttachmentOutputMuxNode:
             candidate = snapshot[0] if snapshot is not None else getattr(self, "wall_candidate", None)
         return candidate if not self._wall_candidate_problem(candidate, now) else None
 
+    @output_locked
     def _on_state(self, message):
         now = rospy.Time.now()
         previous_mode = (
@@ -517,6 +564,7 @@ class AttachmentOutputMuxNode:
         self.flight_state = message
         self.flight_state_at = now
 
+    @output_locked
     def _on_fcu_attitude_target(self, message):
         # Once OFFBOARD is active this topic reflects the external command.
         # Keep that echo separate from the pilot-mode handover baseline. It is
@@ -527,6 +575,7 @@ class AttachmentOutputMuxNode:
         self.fcu_attitude_target = message
         self.fcu_attitude_target_at = rospy.Time.now()
 
+    @output_locked
     def _on_odom(self, message):
         self.odom = message
         self.odom_at = rospy.Time.now()
@@ -769,7 +818,9 @@ class AttachmentOutputMuxNode:
             required_operator_mode=required_mode,
         )
 
+    @output_locked
     def _update_owner(self, now):
+        previous_owner = self.owner
         arbiter = self._ensure_owner_arbiter()
         operator_mode = self._operator_mode(now)
         wall_snapshot = getattr(self, "wall_candidate_snapshot", None)
@@ -791,6 +842,8 @@ class AttachmentOutputMuxNode:
             ),
         )
         self._sync_arbiter_state(arbiter)
+        if previous_owner == self.OWNER_WALL and self.owner != self.OWNER_WALL:
+            self._reset_wall_publication_history()
         if event.conflict:
             rospy.logerr_throttle(
                 1.0, "attachment output conflict: both decisions request ownership"
@@ -1265,7 +1318,7 @@ class AttachmentOutputMuxNode:
         self.recovery_target_publisher.publish(preview)
         self.recovery_horizontal_publisher.publish(Float32(data=target.thrust*math.hypot(axis[0], axis[1])))
 
-    def _remember_publication(self, target, source, published_at):
+    def _remember_publication(self, target, source, published_at, maneuver_id=None):
         orientation = getattr(target, "orientation", None)
         if orientation is None:
             return
@@ -1276,6 +1329,9 @@ class AttachmentOutputMuxNode:
             return
         q = quaternion_normalize(q)
         self.last_published_control = (q, thrust, published_at, source)
+        self.last_published_maneuver_id = (
+            maneuver_id if maneuver_id is not None else getattr(self, 'wall_maneuver_id', None)
+        ) if source == AttachmentControlCandidate.SOURCE_WALL else None
         self.approach_previous_target, self.approach_previous_at = q, published_at
         self.recovery_previous_target, self.recovery_previous_at = q, published_at
 
@@ -1283,6 +1339,8 @@ class AttachmentOutputMuxNode:
         previous = getattr(self, "last_published_control", None)
         if (previous is not None and previous[3] in (AttachmentControlCandidate.SOURCE_NONE,
                                                     AttachmentControlCandidate.SOURCE_WALL)
+                and (previous[3] != AttachmentControlCandidate.SOURCE_WALL
+                     or getattr(self, 'last_published_maneuver_id', None) == getattr(self, 'wall_maneuver_id', None))
                 and is_fresh(previous[2], max(.50, self.odom_timeout_s), now)):
             return previous
         # A fresh measured attitude plus a fresh FCU thrust command is the
@@ -1311,7 +1369,66 @@ class AttachmentOutputMuxNode:
         return (quaternion_normalize((q.x, q.y, q.z, q.w)), thrust, now,
                 AttachmentControlCandidate.SOURCE_NONE)
 
-    def _limit_wall_publication(self, now, target, candidate):
+    @staticmethod
+    def _within_level_cone(q, limit_deg):
+        if not (all(math.isfinite(v) for v in q) and sum(v*v for v in q) > 1e-9):
+            return False
+        axis, _ = axis_yaw(q)
+        return math.acos(max(-1., min(1., axis[2]))) <= math.radians(limit_deg) + 1e-9
+
+    def _near_level_feedback_fresh(self, now):
+        flight = getattr(self, 'flight_state', None)
+        return bool(flight is not None and flight.connected and flight.armed
+                    and flight.mode.upper() == 'OFFBOARD'
+                    and is_fresh(self.flight_state_at, self.state_timeout_s, now)
+                    and self._odom_fresh(now)
+                    and is_fresh_source(self.odom.header.stamp, self.odom_timeout_s, now))
+
+    def _near_level_publication_authorized(self, now):
+        # Emergency feedback stays outside the publication lock so this final
+        # read can observe a kill/RC change while the target is being built.
+        return bool(getattr(self, 'output_enabled', False)
+                    and getattr(self, 'wall_output_enabled', False)
+                    and self.owner == self.OWNER_WALL and kill_clear(self, now)
+                    and self._near_level_feedback_fresh(now)
+                    and self._rc_ready(now, AttachmentControlCandidate.SOURCE_WALL))
+
+    def _near_level_entry_eligible(self, now, candidate, unprojected_q):
+        previous = getattr(self, 'last_published_control', None)
+        if not (getattr(self, 'recovery_attitude_limits_enabled', False)
+                and candidate.control_phase == WallPerchStatus.STATE_DETACH_ROTATE
+                and candidate.keep_ownership and candidate.valid
+                and candidate.horizontal_velocity_enabled and candidate.horizontal_velocity_active
+                and candidate.maneuver_id == getattr(self, 'wall_maneuver_id', None)
+                and previous is not None and previous[3] == AttachmentControlCandidate.SOURCE_WALL
+                and getattr(self, 'last_published_maneuver_id', None) == candidate.maneuver_id
+                and is_fresh(previous[2], max(.50, self.odom_timeout_s), now)
+                and self._near_level_publication_authorized(now)):
+            return False
+        measured = tuple(getattr(self.odom.pose.pose.orientation, k) for k in 'xyzw')
+        return all(self._within_level_cone(q, self.recovery_max_tilt_deg)
+                   for q in (measured, previous[0], unprojected_q))
+
+    def _terminal_history_fresh(self, now, candidate):
+        previous = getattr(self, 'last_published_control', None)
+        return bool(previous is not None and previous[3] == AttachmentControlCandidate.SOURCE_WALL
+                    and candidate.maneuver_id == getattr(self, 'wall_maneuver_id', None)
+                    and getattr(self, 'last_published_maneuver_id', None) == candidate.maneuver_id
+                    and is_fresh(previous[2], max(.50, self.odom_timeout_s), now))
+
+    def _terminal_entry_eligible(self, now, candidate, unprojected_q):
+        if not (getattr(self, 'detach_terminal_enabled', False)
+                and candidate.control_phase == WallPerchStatus.STATE_DETACH_ROTATE
+                and candidate.keep_ownership and candidate.valid
+                and self._terminal_history_fresh(now, candidate)
+                and self._near_level_publication_authorized(now)):
+            return False
+        # Slow the commanded trajectory before crossing level even when the
+        # measured vehicle lags, the flow is unavailable, or yaw is still moving.
+        return any(self._within_level_cone(q, self.detach_terminal_start_deg)
+                   for q in (self.last_published_control[0], unprojected_q))
+
+    def _limit_wall_publication(self, now, target, candidate, unprojected_q=None):
         self.wall_publication_slew = None
         phase = candidate.control_phase
         abort = phase == WallPerchStatus.STATE_ABORT
@@ -1327,7 +1444,11 @@ class AttachmentOutputMuxNode:
                 # Lack of continuity history must not suppress a validated
                 # emergency level command. Hard output bounds still apply.
                 target.thrust = max(self.min_thrust, min(self.max_thrust, target.thrust))
-                self.wall_publication_slew = {"seed_available": False, "abort_level_immediate": True}
+                self.wall_publication_slew = {
+                    "seed_available": False, "abort_level_immediate": True,
+                    "rate_mode": "abort_immediate",
+                    "latched_maneuver_id": getattr(self, 'wall_near_level_maneuver', None),
+                    "thrust_axis_step_deg": None, "heading_step_deg": None}
                 return target
             self.wall_candidate_rejection = "final_slew_seed_unavailable"
             return None
@@ -1342,17 +1463,43 @@ class AttachmentOutputMuxNode:
         desired_q = q
         requested_angle = quaternion_angle(q_previous, q)
         requested_thrust = target.thrust
-        if phase in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT):
+        unprojected_q = q if unprojected_q is None else unprojected_q
+        latched = bool(getattr(self, 'wall_near_level_maneuver', None) == candidate.maneuver_id)
+        entering = not latched and self._near_level_entry_eligible(now, candidate, unprojected_q)
+        near_level = phase == WallPerchStatus.STATE_DETACH_ROTATE and (latched or entering)
+        terminal_latched = getattr(self, 'wall_terminal_maneuver', None) == candidate.maneuver_id
+        terminal_entering = not terminal_latched and self._terminal_entry_eligible(now, candidate, unprojected_q)
+        terminal = phase == WallPerchStatus.STATE_DETACH_ROTATE and (terminal_latched or terminal_entering)
+        if terminal and not self._terminal_history_fresh(now, candidate):
+            self.wall_candidate_rejection = 'terminal_level_publication_history_stale'
+            return None
+        rate_mode = ('abort_immediate' if abort else 'detach_near_level' if near_level
+                     else 'detach_terminal' if terminal
+                     else 'recovery' if phase in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT)
+                     else 'detach_rotation' if returning else 'wall_rotation')
+        if near_level or phase in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT):
             prev_axis, _ = axis_yaw(q_previous)
             if math.acos(max(-1., min(1., prev_axis[2]))) > math.radians(self.recovery_max_tilt_deg) + 1e-6:
                 # Normal RECOVER is admitted only after both measured and sent
                 # axes have settled in the cone. A phase error cannot project
                 # an actually published large tilt instantaneously to 5 deg.
-                self.wall_candidate_rejection = "recovery_entry_published_axis_outside_cone"
+                self.wall_candidate_rejection = (
+                    "near_level_continuity_seed_outside_cone" if near_level
+                    else "recovery_entry_published_axis_outside_cone")
                 return None
-            q, _ = limit_recovery_attitude(q, q_previous, dt,
-                math.radians(self.recovery_max_tilt_deg), math.radians(self.recovery_tilt_slew_deg_s),
-                math.radians(self.recovery_yaw_slew_deg_s))
+            if terminal:
+                q = limit_terminal_attitude(q, q_previous, dt,
+                    math.radians(min(self.recovery_tilt_slew_deg_s, self.detach_terminal_axis_rate_deg_s)),
+                    math.radians(min(self.recovery_yaw_slew_deg_s, self.detach_terminal_yaw_rate_deg_s)),
+                    self.detach_terminal_response_per_s, math.radians(self.recovery_max_tilt_deg))
+            else:
+                q, _ = limit_recovery_attitude(q, q_previous, dt,
+                    math.radians(self.recovery_max_tilt_deg), math.radians(self.recovery_tilt_slew_deg_s),
+                    math.radians(self.recovery_yaw_slew_deg_s))
+        elif terminal:
+            q = limit_terminal_attitude(q, q_previous, dt,
+                math.radians(self.detach_terminal_axis_rate_deg_s),
+                math.radians(self.detach_terminal_yaw_rate_deg_s), self.detach_terminal_response_per_s)
         elif not abort:
             rate = (getattr(self, "wall_detach_rate_rad_s", math.radians(56.25)) if returning
                     else getattr(self, "wall_maneuver_rate_rad_s", math.radians(84.375)))
@@ -1367,8 +1514,20 @@ class AttachmentOutputMuxNode:
         target.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
         target.thrust = max(self.min_thrust, min(self.max_thrust,
             max(thrust_previous-thrust_step, min(thrust_previous+thrust_step, requested_thrust))))
+        previous_axis, previous_yaw = axis_yaw(q_previous)
+        actual_axis, actual_yaw = axis_yaw(q)
+        axis_step = math.acos(max(-1., min(1., sum(a*b for a,b in zip(previous_axis, actual_axis)))))
+        yaw_step = math.atan2(math.sin(actual_yaw-previous_yaw), math.cos(actual_yaw-previous_yaw))
         self.wall_publication_slew = {
             "seed_available": True, "dt_s": dt,
+            "rate_mode": rate_mode,
+            "latched_maneuver_id": getattr(self, 'wall_near_level_maneuver', None),
+            "near_level_latch_pending": entering,
+            "terminal_latch_pending": terminal_entering,
+            "terminal_latched_maneuver_id": getattr(self, 'wall_terminal_maneuver', None),
+            "terminal_softening_active": terminal,
+            "thrust_axis_step_deg": math.degrees(axis_step),
+            "heading_step_deg": math.degrees(yaw_step),
             "attitude_step_deg": math.degrees(quaternion_angle(q_previous, q)),
             "thrust_step": target.thrust-thrust_previous,
             "abort_level_immediate": abort,
@@ -1379,6 +1538,7 @@ class AttachmentOutputMuxNode:
         }
         return target
 
+    @output_locked
     def _publish_candidate(self, now, candidate):
         wall = candidate.source == AttachmentControlCandidate.SOURCE_WALL
         if wall:
@@ -1400,21 +1560,39 @@ class AttachmentOutputMuxNode:
             return self.OUTPUT_NONE
         if target is None:
             return self.OUTPUT_NONE
+        # Eligibility must see the desired attitude before any cone projection.
+        unprojected_q = tuple(getattr(target.orientation, k) for k in 'xyzw')
         target = self._limit_final_recovery_target(now, target, candidate.source, candidate if wall else None)
         target = self._limit_final_approach_target(now, target, candidate.source, candidate if wall else None)
         if wall:
-            target = self._limit_wall_publication(now, target, candidate)
+            target = self._limit_wall_publication(now, target, candidate, unprojected_q)
             if target is None:
                 return self.OUTPUT_NONE
         if wall:
             # Recheck immediately before publication: expensive callbacks must
             # not turn an initially fresh command into a stale outgoing command.
             published_at = rospy.Time.now()
-            if (self._wall_candidate_problem(candidate, published_at)
+            if (not candidate.valid or self._wall_candidate_problem(candidate, published_at)
                     or not is_fresh(snapshot[1], self.wall_candidate_timeout_s, published_at)
                     or candidate.maneuver_id != getattr(self, "wall_maneuver_id", None)):
                 self.wall_candidate_rejection = "candidate_expired_before_publication"
                 return self.OUTPUT_NONE
+            slew_info = getattr(self, 'wall_publication_slew', None) or {}
+            if slew_info.get('terminal_softening_active'):
+                if (not self._near_level_publication_authorized(published_at)
+                        or not self._terminal_history_fresh(published_at, candidate)
+                        or (slew_info.get('terminal_latch_pending')
+                            and not self._terminal_entry_eligible(published_at, candidate, unprojected_q))):
+                    self.wall_candidate_rejection = 'terminal_feedback_invalid_before_publication'
+                    return self.OUTPUT_NONE
+            if (slew_info.get('rate_mode') == 'detach_near_level'
+                    or (getattr(self, 'wall_near_level_maneuver', None) == candidate.maneuver_id
+                        and candidate.control_phase in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT))):
+                if (not self._near_level_publication_authorized(published_at)
+                        or (slew_info.get('near_level_latch_pending')
+                            and not self._near_level_entry_eligible(published_at, candidate, unprojected_q))):
+                    self.wall_candidate_rejection = 'near_level_feedback_invalid_before_publication'
+                    return self.OUTPUT_NONE
             # MAVROS header remains the transport publication time. The original
             # generation time is retained separately with the same sequence.
             target.header.stamp = published_at
@@ -1432,8 +1610,22 @@ class AttachmentOutputMuxNode:
                 "thrust": target.thrust,
             }
         self.attitude_publisher.publish(target)
-        self._remember_publication(target, candidate.source, published_at if wall else now)
+        self._remember_publication(target, candidate.source, published_at if wall else now,
+                                   candidate.maneuver_id if wall else None)
         if wall:
+            # No tentative target/history may establish the latch. publish() is
+            # the ROS handoff boundary; this is not an acknowledgement by PX4.
+            if slew_info.get('near_level_latch_pending'):
+                self.wall_near_level_maneuver = candidate.maneuver_id
+            if slew_info.get('terminal_latch_pending'):
+                self.wall_terminal_maneuver = candidate.maneuver_id
+            if candidate.control_phase == WallPerchStatus.STATE_ABORT:
+                self.wall_terminal_maneuver = None
+            if slew_info:
+                slew_info['latched_maneuver_id'] = getattr(self, 'wall_near_level_maneuver', None)
+                slew_info['near_level_latch_pending'] = False
+                slew_info['terminal_latched_maneuver_id'] = getattr(self, 'wall_terminal_maneuver', None)
+                slew_info['terminal_latch_pending'] = False
             self.last_wall_command = command_diagnostic
             self._publish_recovery_preview(published_at, target, candidate)
         return self.OUTPUT_ATTITUDE_THRUST
@@ -1457,10 +1649,12 @@ class AttachmentOutputMuxNode:
                 "gates": checks, "receipt_ages_s": ages,
                 "cancel_vertical_control": getattr(self, "cancel_vertical_telemetry", None),
                 "last_wall_command": getattr(self, "last_wall_command", None),
+                "near_level_latched_maneuver_id": getattr(self, "wall_near_level_maneuver", None),
                 "wall_candidate_rejection": getattr(self, "wall_candidate_rejection", "")}
         publisher.publish(String(data=json.dumps(data, ensure_ascii=False, allow_nan=False)))
         self.output_health_last_key, self.output_health_last_at = key, now
 
+    @output_locked
     def _on_timer(self, _event):
         now = rospy.Time.now()
         previous_owner = self.owner

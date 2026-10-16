@@ -10,7 +10,7 @@ from sensor_msgs.msg import Range
 from std_msgs.msg import UInt8
 
 import test_wall_horizontal_velocity as fixtures
-from px4_wall_ceiling_control.domain.geometry import rotate_vector
+from px4_wall_ceiling_control.domain.geometry import euler_from_quaternion, rotate_vector
 from px4_wall_ceiling_control.domain.horizontal_velocity import HorizontalVelocityController
 from px4_wall_ceiling_control.domain.recovery_attitude_limits import attitude_from_axis_yaw
 from px4_wall_ceiling_control.msg import SensorHealth, WallPerchStatus as W
@@ -141,6 +141,49 @@ class RecoveryHorizontalDepartureTests(unittest.TestCase):
             axis = rotate_vector(self.q, (0., 0., 1.))
             self.assertLess(sum(a*b for a,b in zip(axis[:2], forward)), 0.)
             self.assertGreaterEqual(axis[2], math.cos(math.radians(5.))-1.e-9)
+
+    def test_three_different_headings_keep_hover_attitude_and_departure_velocity(self):
+        hover_yaw, takeover_yaw, departure_yaw = map(math.radians, (35., -80., 110.))
+        self.n.q_hover = attitude_from_axis_yaw((0., 0., 1.), hover_yaw)
+        self.n.horizontal_takeover_yaw = takeover_yaw
+        self.n.departure_yaw = departure_yaw
+        for i in range(23):
+            self.tick(10.52+i*.05, yaw=departure_yaw)
+        actual_yaw = euler_from_quaternion(self.q)[2]
+        self.assertAlmostEqual(actual_yaw, hover_yaw, places=6)
+        target = self.n.recovery_horizontal_controller.target
+        direction = (math.cos(departure_yaw), math.sin(departure_yaw))
+        self.assertLess(sum(a*b for a,b in zip(target, direction)), -.049)
+        self.assertAlmostEqual(target[0]*direction[1]-target[1]*direction[0], 0., places=7)
+        self.assertGreater(abs(actual_yaw-takeover_yaw), 1.)
+
+    def test_normal_detach_and_exit_keep_hover_yaw_but_fault_path_is_unchanged(self):
+        hover_yaw, takeover_yaw = math.radians(35.), math.radians(-80.)
+        self.n.q_hover = attitude_from_axis_yaw((0., 0., 1.), hover_yaw)
+        self.n.horizontal_takeover_yaw = takeover_yaw
+        self.n.q_detach_start = (0., math.sin(math.pi/4), 0., math.cos(math.pi/4))
+        self.n._detach_progress = lambda: 1.
+        for stage, fault, expected in ((W.STATE_DETACH_ROTATE, False, hover_yaw),
+                (W.STATE_RECOVER, False, hover_yaw), (W.STATE_EXIT, False, hover_yaw),
+                (W.STATE_ABORT, False, takeover_yaw), (W.STATE_EXIT, True, takeover_yaw)):
+            self.n.state = stage
+            self.n.fault_recovery_completed = fault
+            self.tick(self.f.time+.02, distance=None)
+            self.assertTrue(self.n.horizontal_velocity_active)
+            self.assertAlmostEqual(euler_from_quaternion(self.q)[2], expected, places=6)
+
+    def test_approach_uses_takeover_yaw_for_both_attitude_and_forward_direction(self):
+        hover_yaw, takeover_yaw = math.radians(35.), math.radians(-80.)
+        self.n.q_hover = attitude_from_axis_yaw((0., 0., 1.), hover_yaw)
+        self.n.horizontal_takeover_yaw = takeover_yaw
+        self.n.departure_yaw = math.radians(110.)
+        self.n.state = W.STATE_SLOW_APPROACH
+        self.tick(10.52)
+        self.assertAlmostEqual(euler_from_quaternion(self.q)[2], takeover_yaw, places=6)
+        target = self.n.horizontal_controller.target
+        direction = (math.cos(takeover_yaw), math.sin(takeover_yaw))
+        self.assertGreater(sum(a*b for a,b in zip(target, direction)), 0.)
+        self.assertAlmostEqual(target[0]*direction[1]-target[1]*direction[0], 0., places=7)
 
     def test_unknown_front_distance_does_not_retreat_or_complete(self):
         for t in (10.52, 10.54, 10.56):
