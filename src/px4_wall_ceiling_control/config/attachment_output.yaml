@@ -103,8 +103,12 @@ ceiling_attachment_output_node:
 # Separate from the legacy automatic approach timeout and 2 s flip trajectory.
 flight_mode_manager_node:
   manual_wall_wait_timeout_s: 60.0
-  # User-selected early pilot handback after measured leveling, including ABORT.
+  # Quick return only in RECOVER/ABORT/EXIT after height and velocity settle.
+  # Independent handback gates; preserve the recovery height controller.
   wall_level_handover_enabled: true
   wall_level_handover_tilt_deg: 5.0
-  wall_level_handover_hold_s: 0.30
+  wall_level_handover_hold_s: 0.20
   wall_level_handover_retry_s: 0.50
+  wall_level_handover_height_error_m: 0.20
+  wall_level_handover_vertical_speed_mps: 0.30
+  wall_level_handover_horizontal_speed_mps: 0.40

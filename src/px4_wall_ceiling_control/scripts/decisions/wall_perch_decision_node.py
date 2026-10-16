@@ -14,7 +14,7 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Range
 from std_msgs.msg import Bool, String, UInt8
 
-from px4_wall_ceiling_control.adapters.odometry import vertical_speed_enu_mps
+from px4_wall_ceiling_control.adapters.odometry import odometry_is_finite, vertical_speed_enu_mps
 from px4_wall_ceiling_control.adapters.takeoff_height import TakeoffHeightReference
 from px4_wall_ceiling_control.adapters.kill_switch import install_kill_guard, kill_clear
 from px4_wall_ceiling_control.domain.geometry import (
@@ -392,6 +392,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         self.operator_received_at = None
         self.detach_requested = False
         self.cancel_requested = False
+        self.cancel_requested_at = None
+        self.canceled_entry_recovery = False
         self.rearm_required = False
         self.front_ready_since = None
         self.front_ready_last_sample_at = None
@@ -834,6 +836,51 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
     def _on_cancel(self, message):
         if message.data:
             self.cancel_requested = True
+            self.cancel_requested_at = rospy.Time.now()
+
+    def _canceled_entry_recovery_ready(self, now):
+        """A wall-specific cancel may describe recovery before WALL owned output."""
+        flight = getattr(self, "flight_state", None)
+        operator = getattr(self, "operator", None)
+        timeout = getattr(self, "manager_phase_timeout_s", .5)
+        if (self.state != WallPerchStatus.STATE_IDLE
+                or not getattr(self, "decision_enabled", False)
+                or not getattr(self, "cancel_requested", False)
+                or not is_fresh(getattr(self, "cancel_requested_at", None), timeout, now)):
+            return False
+        if (operator is not None and operator.mode == OperatorCommand.MODE_CEILING
+                and is_fresh(getattr(self, "operator_received_at", None), self.operator_timeout_s, now)):
+            return False
+        return bool(getattr(self, "manager_phase", None) == "CANCELING_ENTRY"
+            and is_fresh(getattr(self, "manager_phase_received_at", None), timeout, now)
+            and flight is not None and flight.connected and flight.armed
+            and flight.mode.upper() == "OFFBOARD"
+            and is_fresh(getattr(self, "flight_state_received_at", None), self.state_timeout_s, now)
+            and getattr(self, "horizontal_output_owner", None) == AttachmentControlCandidate.SOURCE_NONE
+            and is_fresh(getattr(self, "horizontal_output_owner_at", None), .30, now)
+            and kill_clear(self, now)
+            and self._odom_fresh(now) and odometry_is_finite(self.odom))
+
+    def _update_canceled_entry_recovery(self, now):
+        if self._canceled_entry_recovery_ready(now):
+            self._capture_attitude_references()
+            self.canceled_entry_recovery = True
+            self.fault_count += 1
+            self._enter_state(WallPerchStatus.STATE_ABORT, now,
+                "canceled OFFBOARD entry recovery; output mux retains neutral-owner height control")
+            return True
+        if not getattr(self, "canceled_entry_recovery", False):
+            return False
+        flight = getattr(self, "flight_state", None)
+        if (flight is not None and flight.connected
+                and is_fresh(getattr(self, "flight_state_received_at", None), self.state_timeout_s, now)
+                and (not flight.armed or flight.mode.upper() != "OFFBOARD")):
+            self._enter_state(WallPerchStatus.STATE_IDLE, now,
+                "canceled entry recovery released after fresh pilot-mode/disarm confirmation")
+        # This is a recovery-stage declaration only. The existing output-mux
+        # cancellation controller retains ownership, reference and thrust seed.
+        # Do not run normal ABORT completion or acquire WALL from STANDBY.
+        return True
 
     @staticmethod
     def _quat_multiply(a, b):
@@ -1524,6 +1571,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             q = output.orientation
             self.q_detach_start = self._quat_normalize((q.x, q.y, q.z, q.w))
         if new_state in (WallPerchStatus.STATE_IDLE, WallPerchStatus.STATE_FRONT_WALL_DETECT):
+            self.canceled_entry_recovery = False
+            self.cancel_requested_at = None
             self.recovery_started_at = None
             self._reset_flip_vertical_support()
             self._reset_detach_vertical()
@@ -1701,6 +1750,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         return abs(self._euler_from_quaternion(quaternion)[1]) >= self.pin_pitch_rad
 
     def _update_state_machine(self, now):
+        if self._update_canceled_entry_recovery(now):
+            return
         self._prepare_detach_vertical_feedback(now)
         mode_requested = self._mode_requested(now)
         cancel = self.cancel_requested or (
@@ -1734,7 +1785,9 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             if not mode_requested:
                 self.rearm_required = False
                 self.detach_requested = False
-                self.cancel_requested = False
+                if not is_fresh(getattr(self, "cancel_requested_at", None),
+                                getattr(self, "manager_phase_timeout_s", .5), now):
+                    self.cancel_requested = False
             altitude_ok = self._entry_height_ready()
             safety_ok = self._safety_ok(now)
             if (getattr(self, "auto_approach", False) and mode_requested
@@ -2217,6 +2270,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         return self.flip_thrust_value
 
     def _candidate(self, now):
+        if getattr(self, "canceled_entry_recovery", False):
+            return False, None, math.nan, 0.0
         if (self.state == WallPerchStatus.STATE_SLOW_APPROACH
                 and not getattr(self, "auto_approach", False)
                 and not getattr(self, "ignore_range_loss_during_attachment", False)
@@ -2306,6 +2361,20 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         status.header.stamp = now
         status.state = self.state
         status.state_name = self.STATE_NAMES[self.state]
+        if getattr(self, "canceled_entry_recovery", False):
+            # ABORT describes the canceled side-attachment attempt; owner NONE's
+            # already-running output controller remains the sole producer.
+            status.enabled = status.acquire_request = status.keep_ownership = False
+            status.candidate_valid = False
+            status.fault_detected = True
+            status.fault_count = self.fault_count
+            status.odom_fresh = self._odom_fresh(now)
+            status.flight_state_fresh = self._flight_ready(now)
+            status.vertical_control_active = status.vertical_reference_valid = False
+            status.vertical_reference_m = math.nan
+            status.vertical_reference_source = "output_mux_cancel_vertical_control"
+            status.reason = self.last_reason
+            return status
         status.enabled = self.state != WallPerchStatus.STATE_IDLE
         status.acquire_request = self._acquire_requested(now)
         status.keep_ownership = status.enabled

@@ -8,6 +8,7 @@ its attitude prestream and uses MAVROS only to change flight modes.
 import threading
 import time
 import math
+import json
 
 import rospy
 from mavros_msgs.msg import EstimatorStatus, RCIn, State
@@ -17,6 +18,7 @@ from std_msgs.msg import Bool, String, UInt8
 from px4_wall_ceiling_control.adapters.kill_switch import install_kill_guard, kill_clear
 
 from px4_wall_ceiling_control.adapters.odometry import (
+    linear_velocity_parent_frame,
     odometry_is_finite,
     vertical_speed_enu_mps,
 )
@@ -69,13 +71,26 @@ class FlightModeManagerNode:
         self.wall_pilot_mode = str(rospy.get_param("~wall_pilot_mode", "ALTCTL")).upper()
         self.wall_level_handover_enabled = bool(rospy.get_param("~wall_level_handover_enabled", True))
         self.wall_level_handover_tilt_deg = float(rospy.get_param("~wall_level_handover_tilt_deg", 5.))
-        self.wall_level_handover_hold_s = float(rospy.get_param("~wall_level_handover_hold_s", .30))
+        self.wall_level_handover_hold_s = float(rospy.get_param("~wall_level_handover_hold_s", .20))
         self.wall_level_handover_retry_s = float(rospy.get_param("~wall_level_handover_retry_s", .50))
+        # Keep the existing height reference; handback tolerances are independent
+        # of the recovery controller's own settle/continuation limits.
+        self.wall_level_handover_height_error_m = float(rospy.get_param(
+            "~wall_level_handover_height_error_m", .20))
+        self.wall_level_handover_vertical_speed_mps = float(rospy.get_param(
+            "~wall_level_handover_vertical_speed_mps", .30))
+        self.wall_level_handover_horizontal_speed_mps = float(rospy.get_param(
+            "~wall_level_handover_horizontal_speed_mps", .40))
         if (not all(math.isfinite(v) for v in (self.wall_level_handover_tilt_deg,
-                self.wall_level_handover_hold_s, self.wall_level_handover_retry_s))
+                self.wall_level_handover_hold_s, self.wall_level_handover_retry_s,
+                self.wall_level_handover_height_error_m, self.wall_level_handover_vertical_speed_mps,
+                self.wall_level_handover_horizontal_speed_mps))
                 or not 0. < self.wall_level_handover_tilt_deg <= 5.
-                or not .30 <= self.wall_level_handover_hold_s <= 2.
-                or not .20 <= self.wall_level_handover_retry_s <= 2.):
+                or not .20 <= self.wall_level_handover_hold_s <= 2.
+                or not .20 <= self.wall_level_handover_retry_s <= 2.
+                or self.wall_level_handover_height_error_m <= 0.
+                or self.wall_level_handover_vertical_speed_mps <= 0.
+                or not 0. < self.wall_level_handover_horizontal_speed_mps <= 1.):
             raise ValueError("invalid wall level pilot handover settings")
         self.wall_level_returning = False
         self.wall_level_window = None
@@ -91,6 +106,7 @@ class FlightModeManagerNode:
         self.manual_wait_canceled = False
         rospy.Subscriber("/wall_perch/cancel_wait", Bool, self._on_wait_cancel, queue_size=1)
         self.cancel_pub = rospy.Publisher("/attachment/terminal_command", String, queue_size=1)
+        self.wall_cancel_pub = rospy.Publisher("/wall_perch/cancel", Bool, queue_size=1)
         self.wall_bench_wait_for_ranges = bool(rospy.get_param("~wall_bench_wait_for_ranges", False))
         self.ignore_range_loss_during_attachment = bool(rospy.get_param(
             "~ignore_range_loss_during_attachment",
@@ -165,6 +181,8 @@ class FlightModeManagerNode:
         self.sensor_at = None
         self.output_mode = None
         self.output_at = None
+        self.output_health = None
+        self.output_health_at = None
         self.owner = 0
         self.owner_at = None
         self.ceiling = None
@@ -204,6 +222,7 @@ class FlightModeManagerNode:
         rospy.Subscriber(
             "/attachment/output_mode", UInt8, self._on_output, queue_size=10
         )
+        rospy.Subscriber("/attachment/output_health", String, self._on_output_health, queue_size=1)
         rospy.Subscriber(
             "/attachment/output_owner", UInt8, self._on_owner, queue_size=10
         )
@@ -274,8 +293,8 @@ class FlightModeManagerNode:
             self.odom, self.odom_at = message, received
             self.handover_odom_snapshot = (message, received)
             if getattr(self, 'wall_level_handover_enabled', False):
-                # Observe every delivered frame: a brief tilt excursion between
-                # manager ticks must invalidate the continuous-level window.
+                # Observe every delivered frame: brief tilt/velocity/height
+                # excursions between manager ticks invalidate confirmation.
                 # This only records evidence; mode requests remain in the timer.
                 self._wall_level_handover_ready(received)
 
@@ -303,7 +322,26 @@ class FlightModeManagerNode:
         self.ceiling, self.ceiling_at = message, rospy.Time.now()
 
     def _on_wall(self, message):
-        self.wall, self.wall_at = message, rospy.Time.now()
+        received = rospy.Time.now()
+        if not hasattr(self, 'wall_level_lock'):self.wall_level_lock = threading.RLock()
+        with self.wall_level_lock:
+            self.wall, self.wall_at = message, received
+            if getattr(self, 'wall_level_handover_enabled', False):
+                # A short loss of the height loop or a phase change cannot be
+                # hidden by the next status arriving before the manager timer.
+                self._wall_level_handover_ready(received)
+
+    def _on_output_health(self, message):
+        try:
+            health = json.loads(message.data)
+        except (ValueError, TypeError):
+            health = None
+        if not hasattr(self, 'wall_level_lock'):self.wall_level_lock = threading.RLock()
+        with self.wall_level_lock:
+            self.output_health, self.output_health_at = health, rospy.Time.now()
+            if (getattr(self, 'wall_level_handover_enabled', False)
+                    and self.phase == self.CANCELING_ENTRY and self.owner == 0):
+                self._wall_level_handover_ready(self.output_health_at)
 
     def _set_phase(self, phase, reason=None):
         if self.phase != phase:
@@ -557,11 +595,15 @@ class FlightModeManagerNode:
             if self._offboard_exit_request_ready(now):
                 if self.cancel_entry_stable_since is None:
                     self.cancel_entry_stable_since = monotonic_now
-                if monotonic_now - self.cancel_entry_stable_since >= .3:
+                if ((getattr(self, 'wall_level_handover_enabled', False)
+                        and self.selected_mode == OperatorCommand.MODE_WALL)
+                        or monotonic_now - self.cancel_entry_stable_since >= .3):
                     self._request_mode(pilot)
             else:
                 self.cancel_entry_stable_since = None
             self.phase_reason = "OFFBOARD异常退出清理：旧模式再次生效，等待安全交回" + pilot + "；禁止新动作"
+            if getattr(self, 'wall_level_handover_enabled', False) and self.selected_mode == OperatorCommand.MODE_WALL:
+                self.phase_reason += "；" + self.wall_level_handover_reason
             return
         self.cancel_entry_stable_since = None
         submitted = getattr(self, "pilot_intent_request_at", None)
@@ -581,6 +623,9 @@ class FlightModeManagerNode:
             self.phase_reason = "OFFBOARD异常退出清理：已请求" + pilot + "，等待后续连续模式反馈及在途请求结束；禁止新动作"
 
     def _entry_cancel_handover_ready(self, now):
+        if (getattr(self, 'wall_level_handover_enabled', False)
+                and self.selected_mode == OperatorCommand.MODE_WALL):
+            return self._wall_level_handover_ready(now)
         # If a behavior acquired ownership meanwhile, retain its full recovery gates.
         if self.owner != 0:
             return self._handover_ready(now)
@@ -618,11 +663,15 @@ class FlightModeManagerNode:
             if self._entry_cancel_handover_ready(now):
                 if getattr(self, "cancel_entry_stable_since", None) is None:
                     self.cancel_entry_stable_since = monotonic_now
-                if monotonic_now - self.cancel_entry_stable_since >= .3:
+                if ((getattr(self, 'wall_level_handover_enabled', False)
+                        and self.selected_mode == OperatorCommand.MODE_WALL)
+                        or monotonic_now - self.cancel_entry_stable_since >= .3):
                     self._request_mode(self._pilot_mode())
             else:
                 self.cancel_entry_stable_since = None
             self.phase_reason = "取消接管处理中：已检测到OFFBOARD，进行有界竖直闭环稳定，等待安全交回" + self._pilot_mode()
+            if getattr(self, 'wall_level_handover_enabled', False) and self.selected_mode == OperatorCommand.MODE_WALL:
+                self.phase_reason += "；" + self.wall_level_handover_reason
         elif flight_mode == self._pilot_mode():
             self.cancel_entry_stable_since = None
             # Two new FCU heartbeats, quiescent service worker and a full entry
@@ -757,11 +806,55 @@ class FlightModeManagerNode:
         wall = getattr(self, 'wall', None)
         return bool(getattr(self, 'wall_level_handover_enabled', False)
                     and self.selected_mode == OperatorCommand.MODE_WALL and wall is not None
-                    and wall.state in (WallPerchStatus.STATE_DETACH_ROTATE,
-                        WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT))
+                    and wall.state in (WallPerchStatus.STATE_RECOVER,
+                        WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT))
+
+    def _wall_pilot_request_phase_ready(self, mode, now):
+        if (getattr(self, 'selected_mode', None) != OperatorCommand.MODE_WALL or mode != 'POSCTL'):
+            return True
+        flight = getattr(self, 'flight', None)
+        if (flight is not None and flight.connected and flight.mode.upper() == 'POSCTL'
+                and is_fresh(self.flight_at, self.state_timeout_s, now)):
+            # Already in the pilot mode: clear a stale OFFBOARD intention. This
+            # does not transfer control or override a different pilot mode.
+            return True
+        wall = getattr(self, 'wall', None)
+        # Never transfer out of a detach rotation, even with the optional
+        # convergence shortcut disabled.
+        if wall is not None and wall.state == WallPerchStatus.STATE_DETACH_ROTATE:
+            return False
+        if not getattr(self, 'wall_level_handover_enabled', False):
+            return True
+        return bool(wall is not None and wall.state in (WallPerchStatus.STATE_RECOVER,
+                WallPerchStatus.STATE_ABORT, WallPerchStatus.STATE_EXIT)
+            and is_fresh(self.wall_at, self.status_timeout_s, now)
+            and is_fresh_source(wall.header.stamp, self.status_timeout_s, now, future_tolerance_s=.1))
+
+    def _wall_handover_height_reference(self, now):
+        if self.phase == self.CANCELING_ENTRY and self.owner == 0:
+            # A canceled entry never acquired WALL. Retain the mux's existing
+            # cancellation controller and use its actual frozen height target.
+            health = getattr(self, 'output_health', None)
+            if (not isinstance(health, dict)
+                    or not is_fresh(getattr(self, 'output_health_at', None), .20, now)):
+                return None
+            stamp = health.get('sampled_at_s')
+            control = health.get('cancel_vertical_control')
+            if (not isinstance(stamp, (int, float)) or not math.isfinite(stamp)
+                    or not -.10 <= now.to_sec()-stamp <= .20
+                    or health.get('owner') != 0 or health.get('output_mode') != 2
+                    or not isinstance(control, dict) or control.get('active') is not True):
+                return None
+            reference = control.get('height_reference_m')
+        else:
+            if (not getattr(self.wall, 'vertical_reference_valid', False)
+                    or not getattr(self.wall, 'vertical_control_active', False)):
+                return None
+            reference = getattr(self.wall, 'vertical_reference_m', None)
+        return reference if isinstance(reference, (int, float)) and math.isfinite(reference) else None
 
     def _wall_level_handover_failure(self, now, odom, received):
-        if not self._wall_level_handover_selected():return "等待脱离、恢复或ABORT回平阶段"
+        if not self._wall_level_handover_selected():return "仅RECOVER、ABORT、EXIT允许自动交回遥控器"
         if not kill_clear(self, now):return "急停生效或反馈无效"
         if (not is_fresh(self.wall_at, self.status_timeout_s, now)
                 or not is_fresh_source(self.wall.header.stamp, self.status_timeout_s, now, future_tolerance_s=.1)):
@@ -770,7 +863,8 @@ class FlightModeManagerNode:
         if (flight is None or not flight.connected or not flight.armed or flight.mode.upper() != 'OFFBOARD'
                 or not is_fresh(self.flight_at, self.state_timeout_s, now)):
             return "等待新鲜、已解锁的OFFBOARD反馈"
-        if (self.owner != 2 or self.output_mode != 2
+        canceled_entry = self.phase == self.CANCELING_ENTRY and self.owner == 0
+        if ((self.owner != 2 and not canceled_entry) or self.output_mode != 2
                 or not is_fresh(self.owner_at, self.output_timeout_s, now)
                 or not is_fresh(self.output_at, self.output_timeout_s, now)):
             return "等待侧吸连续姿态输出"
@@ -791,11 +885,24 @@ class FlightModeManagerNode:
         q = odom.pose.pose.orientation
         norm = sum(v*v for v in (q.x,q.y,q.z,q.w))
         if not .5 <= norm <= 1.5:return "姿态四元数无效"
-        # Total thrust-axis tilt, not separate roll/pitch limits. Magnitudes of
-        # angular/horizontal/vertical velocity deliberately do not gate return.
+        # Total thrust-axis tilt. No additional angular-rate or clearance gate.
         cos_tilt = 1. - 2.*(q.x*q.x+q.y*q.y)/norm
         if cos_tilt < math.cos(math.radians(self.wall_level_handover_tilt_deg))-1.e-12:
             return "等待实际总倾角≤%.1f度" % self.wall_level_handover_tilt_deg
+        reference = self._wall_handover_height_reference(now)
+        if reference is None:
+            return "等待有效高度基准及高度闭环恢复"
+        error = reference - odom.pose.pose.position.z
+        if abs(error) >= self.wall_level_handover_height_error_m:
+            return "等待高度收敛：误差%+.3fm，绝对值需<%.2fm" % (error, self.wall_level_handover_height_error_m)
+        vx, vy, vz = linear_velocity_parent_frame(odom, self.odom_twist_in_child_frame)
+        if not all(math.isfinite(v) for v in (vx, vy, vz)):
+            return "ENU速度无效"
+        if abs(vz) >= self.wall_level_handover_vertical_speed_mps:
+            return "等待竖直速度收敛：%+.3fm/s，绝对值需<%.2fm/s" % (vz, self.wall_level_handover_vertical_speed_mps)
+        speed = math.hypot(vx, vy)
+        if speed >= self.wall_level_handover_horizontal_speed_mps:
+            return "等待水平速度收敛：%.3fm/s，需<%.2fm/s" % (speed, self.wall_level_handover_horizontal_speed_mps)
         return None
 
     def _wall_level_handover_ready(self, now):
@@ -813,6 +920,10 @@ class FlightModeManagerNode:
             hold_ns = int(round(self.wall_level_handover_hold_s*1.e9))
             attempt = getattr(self, 'takeover_attempt', 0)
             window = getattr(self, 'wall_level_window', None)
+            reference = self._wall_handover_height_reference(now)
+            if reference != getattr(self, 'wall_level_reference', None):
+                window = None
+            self.wall_level_reference = reference
             if window is not None and window[0] == attempt:
                 _, first_source, first_arrival, last_source, last_arrival, samples = window
                 if source < last_source or arrival < last_arrival:
@@ -827,14 +938,16 @@ class FlightModeManagerNode:
                     window = None
             else:window = None
             if window is None:
-                first_source, first_arrival, samples = source, arrival, 0
+                # A wall/reference callback can reuse an older (still fresh)
+                # odometry frame. Never count time before this gate opened.
+                first_source, first_arrival, samples = source, max(arrival, now.to_nsec()), 0
             samples += 1
             self.wall_level_window = (attempt, first_source, first_arrival, source, arrival, samples)
-            duration_ns = min(source-first_source, arrival-first_arrival)
+            duration_ns = max(0, min(source-first_source, arrival-first_arrival))
             duration = duration_ns/1.e9
             ready = samples >= 3 and duration_ns+1 >= hold_ns
-            self.wall_level_handover_reason = ("回平确认完成，申请交回" + self._pilot_mode() if ready
-                else "实际总倾角≤%.1f度确认%.2f/%.2f秒" % (self.wall_level_handover_tilt_deg, duration, self.wall_level_handover_hold_s))
+            self.wall_level_handover_reason = ("回平、高度和速度收敛确认完成，申请交回" + self._pilot_mode() if ready
+                else "回平、高度和速度同时满足，确认%.2f/%.2f秒" % (duration, self.wall_level_handover_hold_s))
             return ready
 
     def _wall_level_return_reason(self, confirmed=False):
@@ -842,7 +955,7 @@ class FlightModeManagerNode:
         if getattr(self, 'fault_seen', False):
             text += "；本次含ABORT/故障，未标记正常脱离完成"
         else:
-            text += "；未等待高度、速度及离墙验收完成"
+            text += "；高度和速度已收敛，未等待完整离墙验收"
         return text
 
     def _wall_return_exit_ready(self, now):
@@ -856,6 +969,11 @@ class FlightModeManagerNode:
                         and not status.fault_detected and not getattr(self, "fault_seen", False)))
 
     def _handover_ready(self, now):
+        if (getattr(self, 'wall_level_handover_enabled', False)
+                and getattr(self, 'selected_mode', None) == OperatorCommand.MODE_WALL):
+            # All wall return paths, including approach timeout, use the same
+            # height/velocity gate. A legacy flag cannot bypass it.
+            return self._wall_level_handover_ready(now)
         if getattr(self, 'wall_level_returning', False):
             return self._wall_level_handover_ready(now)
         if getattr(self,"wall_approach_timeout_returning",False):
@@ -1036,6 +1154,8 @@ class FlightModeManagerNode:
         return detail or "{} candidate did not request ownership".format(label)
 
     def _request_mode(self, mode):
+        if not self._wall_pilot_request_phase_ready(mode, rospy.Time.now()):
+            return
         now = time.monotonic()
         retry = (self.wall_level_handover_retry_s
                  if getattr(self, 'wall_level_returning', False) and mode == self._pilot_mode() else self.retry_s)
@@ -1093,6 +1213,26 @@ class FlightModeManagerNode:
                                          self.selected_mode, time.monotonic())
             request = SetModeRequest()
             request.custom_mode = mode
+            if not self._wall_pilot_request_phase_ready(mode, rospy.Time.now()):
+                return
+            if (mode == 'POSCTL' and self.selected_mode == OperatorCommand.MODE_WALL
+                    and getattr(self, 'wall_level_handover_enabled', False)):
+                checked_at = rospy.Time.now()
+                if self.phase == self.CANCELING_ENTRY:
+                    ready = (self._offboard_exit_request_ready(checked_at)
+                             if getattr(self, 'offboard_exit_cleanup', False)
+                             else self._entry_cancel_handover_ready(checked_at))
+                else:
+                    ready = self.phase == self.RETURNING and self._handover_ready(checked_at)
+                flight = self.flight
+                same_mode_cleanup = (self.phase == self.CANCELING_ENTRY
+                    and getattr(self, 'offboard_exit_cleanup', False)
+                    and flight is not None and flight.mode.upper() == mode)
+                if (not ready or flight is None or not flight.connected
+                        or not is_fresh(self.flight_at, self.state_timeout_s, checked_at)
+                        or (not same_mode_cleanup and (not flight.armed or flight.mode.upper() != 'OFFBOARD'))
+                        or (attempt is not None and attempt != getattr(self, 'takeover_attempt', 0))):
+                    return
             response = self.set_mode(request)
             if not response.mode_sent:
                 rospy.logwarn("PX4 did not accept %s mode request", mode)
@@ -1152,6 +1292,13 @@ class FlightModeManagerNode:
         requested = self._requested_mode(now)
         flight_mode = self.flight.mode.upper() if self.flight else ""
         flight_fresh = is_fresh(self.flight_at, self.state_timeout_s, now)
+        if (self.phase == self.CANCELING_ENTRY and self.selected_mode == OperatorCommand.MODE_WALL
+                and getattr(self, 'wall_level_handover_enabled', False)
+                and flight_fresh and flight_mode == 'OFFBOARD'
+                and hasattr(self, 'wall_cancel_pub')):
+            # Repeat only while canceling this wall acquisition, so a late
+            # OFFBOARD confirmation can still enter the allowed ABORT phase.
+            self.wall_cancel_pub.publish(Bool(data=True))
         if (self.phase == self.RETURNING and flight_mode == "OFFBOARD"
                 and getattr(self, "selected_mode", None) == OperatorCommand.MODE_WALL
                 and not getattr(self, "wall_approach_timeout_returning", False)):
