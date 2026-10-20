@@ -142,3 +142,8 @@ should not acquire additional deployment-specific topic names.
 
 Files under `docs/archive/` describe older interfaces and must not be used as
 current test instructions.
+
+## 一键遥控器接管
+
+支持 ABORT 中从实测姿态平滑跟随遥控器，再交回原 ALTCTL / POSCTL。
+页面按钮与终端入口见 [rc_takeover.md](docs/rc_takeover.md)。

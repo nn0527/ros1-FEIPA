@@ -31,7 +31,10 @@ from px4_wall_ceiling_control.msg import (
 )
 
 
-class FlightModeManagerNode:
+from px4_wall_ceiling_control.adapters.rc_takeover import RCTakeoverManager
+
+
+class FlightModeManagerNode(RCTakeoverManager):
     IDLE = "IDLE"
     WAITING_WALL = "WAITING_WALL"
     PRESTREAM = "PRESTREAM"
@@ -215,6 +218,7 @@ class FlightModeManagerNode:
         rospy.Subscriber('/mavros/px4flow/raw/optical_flow_rad', OpticalFlowRad,
                          self._on_wall_fusion_flow, queue_size=1)
         self.set_mode = rospy.ServiceProxy("/mavros/set_mode", SetMode)
+        self._init_rc_takeover_manager()
         self.timer = rospy.Timer(rospy.Duration(0.1), self._on_timer)
         if rospy.get_param("~motor_output_telemetry_enabled", False):
             threading.Thread(target=self._motor_telemetry_loop, daemon=True).start()
@@ -252,6 +256,8 @@ class FlightModeManagerNode:
             time.sleep(2)
 
     def _on_flight(self, message):
+        if message.connected and message.mode.upper() in ("ALTCTL", "POSCTL"):
+            self.last_pilot_mode = message.mode.upper()
         self.flight, self.flight_at = message, rospy.Time.now()
         if getattr(self,"wall_approach_timeout_returning",False) and message.mode.upper() != "OFFBOARD":
             self.wall_timeout_stable_since=self.wall_timeout_last_odom=None
@@ -466,6 +472,8 @@ class FlightModeManagerNode:
         return "unsupported attachment mode"
 
     def _pilot_mode(self, selected=None):
+        if getattr(self, "phase", None) == "RC_TAKEOVER":
+            return self.rc_takeover_return_mode
         selected = getattr(self,"selected_mode",None) if selected is None else selected
         return getattr(self,"wall_pilot_mode","ALTCTL") if selected == OperatorCommand.MODE_WALL else "ALTCTL"
 
@@ -1026,6 +1034,10 @@ class FlightModeManagerNode:
         return detail or "{} candidate did not request ownership".format(label)
 
     def _request_mode(self, mode):
+        if getattr(self, "rc_takeover_requested", False) and (
+                self.phase != "RC_TAKEOVER" or mode != self._pilot_mode()
+                or not self._rc_takeover_handover_ready(rospy.Time.now())):
+            return
         now = time.monotonic()
         if self.request_in_flight or (
             self.last_request_at is not None
@@ -1045,6 +1057,10 @@ class FlightModeManagerNode:
             rospy.wait_for_service("/mavros/set_mode", timeout=0.2)
             if not kill_clear(self, rospy.Time.now()):
                 return
+            if getattr(self, "rc_takeover_requested", False) and (
+                    self.phase != "RC_TAKEOVER" or mode != self._pilot_mode()
+                    or not self._rc_takeover_handover_ready(rospy.Time.now())):
+                return
             if mode == "OFFBOARD":
                 if (
                     self.phase != self.ENTERING
@@ -1056,7 +1072,10 @@ class FlightModeManagerNode:
                 ):
                     return
             elif mode == self._pilot_mode():
-                if self.phase == self.CANCELING_ENTRY:
+                if self.phase == "RC_TAKEOVER":
+                    if not self._rc_takeover_handover_ready(rospy.Time.now()):
+                        return
+                elif self.phase == self.CANCELING_ENTRY:
                     ready = (self._offboard_exit_request_ready(rospy.Time.now())
                              if getattr(self, "offboard_exit_cleanup", False)
                              else self._entry_cancel_handover_ready(rospy.Time.now()))
@@ -1127,6 +1146,8 @@ class FlightModeManagerNode:
 
     def _on_timer(self, _event):
         now = rospy.Time.now()
+        if self._tick_rc_takeover_manager(now):
+            return
         if not kill_clear(self, now):
             if self.phase == self.RETURNING and getattr(self,"wall_approach_timeout_returning",False):
                 self._begin_offboard_exit("急停生效或反馈无效；输出立即停止",time.monotonic())

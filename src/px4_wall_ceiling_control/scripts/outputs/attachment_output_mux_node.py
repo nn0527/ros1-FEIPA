@@ -45,7 +45,10 @@ from px4_wall_ceiling_control.msg import (
 )
 
 
-class AttachmentOutputMuxNode:
+from px4_wall_ceiling_control.adapters.rc_takeover import RCTakeoverOutput
+
+
+class AttachmentOutputMuxNode(RCTakeoverOutput):
     OWNER_NONE = OWNER_NONE
     OWNER_CEILING = OWNER_CEILING
     OWNER_WALL = OWNER_WALL
@@ -341,25 +344,25 @@ class AttachmentOutputMuxNode:
                 self._on_fcu_attitude_target,
                 queue_size=10,
             )
-        if self.rc_assist_enabled:
-            rospy.Subscriber(
-                rospy.get_param("~rc_topic", "/mavros/rc/in"),
-                RCIn,
-                self._on_rc,
-                queue_size=1,
-            )
-            rospy.Subscriber(
-                rospy.get_param("~ceiling_status_topic", "/ceiling_attachment/status"),
-                CeilingAttachmentStatus,
-                self._on_ceiling_status,
-                queue_size=1,
-            )
-            rospy.Subscriber(
-                rospy.get_param("~wall_status_topic", "/wall_perch/status"),
-                WallPerchStatus,
-                self._on_wall_status,
-                queue_size=1,
-            )
+        # Subscribe independently of optional attitude trim for explicit takeover.
+        rospy.Subscriber(
+            rospy.get_param("~rc_topic", "/mavros/rc/in"),
+            RCIn,
+            self._on_rc,
+            queue_size=1,
+        )
+        rospy.Subscriber(
+            rospy.get_param("~ceiling_status_topic", "/ceiling_attachment/status"),
+            CeilingAttachmentStatus,
+            self._on_ceiling_status,
+            queue_size=1,
+        )
+        rospy.Subscriber(
+            rospy.get_param("~wall_status_topic", "/wall_perch/status"),
+            WallPerchStatus,
+            self._on_wall_status,
+            queue_size=1,
+        )
         rospy.Subscriber(
             rospy.get_param("~prestream_topic", "/attachment/prestream"),
             Bool,
@@ -372,6 +375,7 @@ class AttachmentOutputMuxNode:
         self.output_health_publisher = rospy.Publisher("/attachment/output_health", String, queue_size=10)
         self.output_health_last_key = None
         self.output_health_last_at = None
+        self._init_rc_takeover()
         self.timer = rospy.Timer(
             rospy.Duration(1.0 / max(publish_rate_hz, 2.0)), self._on_timer
         )
@@ -654,6 +658,7 @@ class AttachmentOutputMuxNode:
         return Quaternion(x=values[0], y=values[1], z=values[2], w=values[3])
 
     def _on_rc(self, message):
+        self.rc_source_stamp = message.header.stamp
         self.rc_channels = tuple(message.channels)
         self.rc_at = rospy.Time.now()
         if (getattr(self, "rc_roll_yaw_enabled", False)
@@ -1463,6 +1468,8 @@ class AttachmentOutputMuxNode:
 
     def _on_timer(self, _event):
         now = rospy.Time.now()
+        if self._tick_rc_takeover(now):
+            return
         previous_owner = self.owner
         self._update_owner(now)
         if self.owner != self.OWNER_NONE:

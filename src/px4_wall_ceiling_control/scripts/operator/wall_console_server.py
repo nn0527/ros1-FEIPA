@@ -183,6 +183,7 @@ class RemoteRuntime:
                       "health": ("/sensor/health", SensorHealth), "wall": ("/wall_perch/status", WallPerchStatus),
                       "ceiling_status": ("/ceiling_attachment/status", CeilingAttachmentStatus),
                       "wall_sensor_fusion": ("/wall_perch/sensor_fusion_status", WallSensorFusionStatus),
+                      "rc_takeover": ("/attachment/rc_takeover/status", String),
                       "phase": ("/attachment/flight_phase", String), "reason": ("/attachment/flight_phase_reason", String),
                       "owner": ("/attachment/output_owner", UInt8), "operator": ("/operator/command", OperatorCommand),
                       "front": ("/sensor/front/range", Range), "ceiling": ("/sensor/ceiling/range", Range),
@@ -226,7 +227,7 @@ class RemoteRuntime:
                       "auto_approach_enabled", "approach_paused", "horizontal_velocity_enabled", "approach_takeover_thrust", "approach_base_vertical_thrust", "horizontal_velocity_ready", "horizontal_velocity_active", "horizontal_velocity_stable", "horizontal_velocity_reason", "horizontal_forward_target_mps", "horizontal_forward_measured_mps", "horizontal_integral_x_enu_mps2", "horizontal_integral_y_enu_mps2", "horizontal_integral_active", "horizontal_integral_reason", "horizontal_control_saturated",  "horizontal_velocity_x_enu_mps", "horizontal_velocity_y_enu_mps", "horizontal_target_x_enu_mps", "horizontal_target_y_enu_mps", "optical_flow_quality", "horizontal_equilibrium_enabled", "horizontal_equilibrium_valid", "horizontal_equilibrium_frozen", "horizontal_equilibrium_reason", "horizontal_prestream_valid", "fault_recovery_completed", "recovery_support_valid", "recovery_thrust_limit", "detach_vertical_active", "detach_vertical_reason", "detach_vertical_base_source", "detach_vertical_base_thrust", "detach_vertical_integral", "detach_vertical_integral_active", "detach_vertical_saturated", "detach_vertical_support_weight", "detach_height_error_m", "departure_clearance_ready", "departure_clearance_distance_m", "departure_clearance_reason", "recovery_horizontal_integral_x", "recovery_horizontal_integral_y", "recovery_horizontal_integral_active")}
         elif name in ("front_diagnostic", "ceiling_diagnostic", "kill"):
             value = json.loads(msg.data)
-        elif name in ("phase", "reason", "owner"):
+        elif name in ("phase", "reason", "owner", "rc_takeover"):
             value = msg.data
         elif name == "operator":
             value = {"mode": msg.mode, "enabled": msg.enable_control}
@@ -677,6 +678,17 @@ class RemoteRuntime:
         self.state.send_detach(publish)
         return {"message": "离墙请求已发送；控制节点等待连续稳定后旋转，8 秒未满足会取消"}
 
+    def rc_takeover(self):
+        from std_srvs.srv import Trigger
+        if self.ros is None:
+            raise ValueError("ROS 尚未连接")
+        self.ros.wait_for_service("/attachment/rc_takeover", timeout=2.)
+        reply = self.ros.ServiceProxy("/attachment/rc_takeover", Trigger)()
+        if not reply.success:
+            raise ValueError(reply.message)
+        self.state.event(reply.message)
+        return {"message": reply.message}
+
     def cancel_wait(self):
         with self.state.lock:
             if not self.state.snapshot()["can_cancel_wait"]:
@@ -915,7 +927,7 @@ class SSHTransport:
                 raise ValueError("SSH 未连接，操作未发送")
             if action == "stop" and not self.session.get("control"):
                 raise ValueError("需要控制权，终止未发送")
-            if action in ("start", "wall", "detach", "cancel_wait") and (not self.push_enabled or not self.session.get("control") or time.monotonic() - self.arrived >= 2):
+            if action in ("start", "wall", "detach", "cancel_wait", "rc_takeover") and (not self.push_enabled or not self.session.get("control") or time.monotonic() - self.arrived >= 2):
                 raise ValueError("需要控制权和有效的实时反馈，操作未发送")
             if action == "push":
                 self.push_enabled = bool(config["enabled"])
@@ -1004,6 +1016,8 @@ def http_main(args):
                     result = transport.request("ceiling" if self.path == "/api/ceiling" else "ceiling_detach")
                 elif self.path == "/api/wall":
                     result = transport.request("wall")
+                elif self.path == "/api/rc-takeover":
+                    result = transport.request("rc_takeover")
                 elif self.path == "/api/cancel-wait":
                     result = transport.request("cancel_wait")
                 elif self.path == "/api/stop":

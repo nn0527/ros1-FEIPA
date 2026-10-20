@@ -27,7 +27,7 @@ DEFAULT_CONFIG = {
     "test_profile": "flight",
 }
 LIMITS = {"state": 1.5, "odom": 0.5, "estimator": 1.5, "rc": 0.2,
-          "health": 0.3, "wall": 0.5, "phase": 0.5, "reason": 0.5,
+          "health": 0.3, "wall": 0.5, "phase": 0.5, "reason": 0.5, "rc_takeover": 0.5,
           "owner": 0.3, "operator": 0.5, "setpoint": 0.3,
           "battery": 5.0, "front": 0.6, "ceiling": 0.6, "runtime": 3.0}
 LIMITS.update({"front_diagnostic": 3.0, "ceiling_diagnostic": 3.0})

@@ -9,6 +9,7 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   sensor_msgs
   std_msgs
+  std_srvs
 )
 
 catkin_python_setup()
@@ -47,6 +48,7 @@ catkin_package(
   rospy
   sensor_msgs
   std_msgs
+  std_srvs
 )
 
 catkin_install_python(PROGRAMS
@@ -55,6 +57,7 @@ catkin_install_python(PROGRAMS
   scripts/decisions/ceiling_attachment_decision_node.py
   scripts/decisions/wall_perch_decision_node.py
   scripts/operator/operator_gate_node.py
+  scripts/operator/rc_takeover.py
   scripts/operator/terminal_operator_node.py
   scripts/operator/flight_mode_manager_node.py
   scripts/operator/wall_console_server.py
@@ -88,6 +91,7 @@ install(FILES README.md
 )
 
 if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_rc_takeover.py)
   catkin_add_nosetests(test/test_detach_vertical.py)
   catkin_add_nosetests(test/test_height_continuation.py)
   catkin_add_nosetests(test/test_bounded_detach_integration.py)
