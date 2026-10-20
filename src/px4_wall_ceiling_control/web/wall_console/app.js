@@ -38,6 +38,19 @@ function pair(label, value, className=""){
   const a=document.createElement("span"),b=document.createElement("span");a.textContent=label;b.textContent=value;
   el.append(a,b);return el;
 }
+function paintSensorFusion(fusion){
+  const phases = {DISABLED:"未启用",INITIALIZING:"读取原值",READY:"参数就绪",DISABLING:"暂停中",SUSPENDED:"已暂停",RESTORING:"恢复中",SETTLING:"应用缓冲及读回确认",ERROR:"等待处理"};
+  const param = value => Number.isInteger(value) && value >= 0 ? String(value) : "未知";
+  const stamp = value => Number.isFinite(value) && value > 0 ? value.toFixed(3)+" s" : "—";
+  text("wallSensorFusionState", !fusion ? "光流 / 测距参数切换：无新鲜反馈" :
+    !fusion.enabled && !fusion.restore_required ? "光流 / 测距参数切换：未启用" :
+    "光流 / 测距参数切换："+(phases[fusion.phase] || fusion.phase)+" · 实测总倾角 "+n(fusion.measured_tilt_deg,1)+"°"+
+    (fusion.control_ready?" · 原值已确认，应用缓冲完成":fusion.parameters_restored?" · 原值已确认，等待应用缓冲":""));
+  text("wallSensorFusionReason", fusion?.reason || "等待参数管理状态");
+  text("wallSensorFusionFlow", fusion ? [fusion.snapshot_valid?fusion.original_flow:-1,fusion.target_flow,fusion.confirmed_flow].map(param).join(" / ") : "—");
+  text("wallSensorFusionRange", fusion ? [fusion.snapshot_valid?fusion.original_range:-1,fusion.target_range,fusion.confirmed_range].map(param).join(" / ") : "—");
+  text("wallSensorFusionTiming", fusion ? "请求 "+stamp(fusion.request_stamp)+" · 确认 "+stamp(fusion.confirmed_stamp)+" · 缓冲截止 "+stamp(fusion.ready_after)+" · 重试 "+fusion.retry_count : "无新鲜反馈");
+}
 function paint(s){
   latest=s; token=s.token;
   const ceilingStatus=fresh(s,"ceiling_status");
@@ -73,6 +86,7 @@ function paint(s){
   $("killState").classList.toggle("errorText",!kill?.valid || !!kill.active);
   text("detachCondition",wall?.state_name!=="WALL_HOLD"?"离墙仅在当前贴墙保持阶段接受请求":wall.detach_pending?"离墙请求等待中："+(wall.detach_block_reason || "等待连续稳定"):wall.detach_ready?"旋转条件已满足，可提交离墙请求":"可提交离墙请求，旋转前还需："+(wall.detach_block_reason || "等待姿态和角速度稳定"));
   text("wallBlockReason",s.can_wall?"":s.blockers.join("；"));
+  paintSensorFusion(fresh(s,"wall_sensor_fusion"));
   const horizontal=wall?.horizontal_velocity_enabled;
   const hspeed=horizontal&&Number.isFinite(wall.horizontal_velocity_x_enu_mps)&&Number.isFinite(wall.horizontal_velocity_y_enu_mps)?Math.hypot(wall.horizontal_velocity_x_enu_mps,wall.horizontal_velocity_y_enu_mps):NaN;
   text("horizontalVelocityState",horizontal?"水平速度闭环："+(wall.horizontal_velocity_reason||"等待反馈")+" · 实测 "+(Number.isFinite(hspeed)?hspeed.toFixed(3):"—")+" m/s · 光流质量 "+wall.optical_flow_quality+(wall.horizontal_velocity_stable?" · 稳定确认完成":""):"水平速度闭环未启用或反馈过期");
@@ -124,8 +138,8 @@ function paint(s){
     if(phase==="ACTIVE" && check.id==="idle"){label="贴墙动作";ok=true;value="执行中";}
     const el=pair(label,value,"check"+(ok?" ok":""));el.title=check.reason;return el;
   });
-  const ages=[["飞控心跳","state"],["里程计","odom"],["估计器","estimator"],["遥控输入","rc"],["急停反馈","kill"],["两路雷达","health"],["贴墙状态","wall"]];
-  rows($("ages"),ages,([label,key])=>{const item=s.status[key],el=pair(label,!session.push?"推送已暂停":item.age_s===null?"未收到":n(item.age_s,2)+" s","ageRow");el.lastChild.classList.toggle("stale",!item.fresh);return el;});
+  const ages=[["飞控心跳","state"],["里程计","odom"],["估计器","estimator"],["遥控输入","rc"],["急停反馈","kill"],["两路雷达","health"],["贴墙状态","wall"],["光流 / 测距参数","wall_sensor_fusion"]];
+  rows($("ages"),ages,([label,key])=>{const item=s.status[key] || {age_s:null,fresh:false},el=pair(label,!session.push?"推送已暂停":item.age_s===null?"未收到":n(item.age_s,2)+" s","ageRow");el.lastChild.classList.toggle("stale",!item.fresh);return el;});
   text("sshError",ssh?"":s.ssh.error);
   text("recording",!live?"试飞日志：当前无法确认":runtime?.logger?"试飞日志：录制中":enabled?"试飞日志：未检测到录制节点":"试飞日志：等待启动");
   if(s.events.length){rows($("events"),s.events.slice(-25).reverse(),event=>pair(new Date(event.time*1000).toLocaleTimeString("zh-CN",{hour12:false}),event.text,"eventRow "+event.kind));}
@@ -170,6 +184,8 @@ async function poll(){
     text("sshError",error.message);document.querySelectorAll(".steps li").forEach(el=>el.classList.remove("current"));
     document.querySelectorAll(".check").forEach(el=>{el.classList.remove("ok");el.lastChild.textContent="待确认";});
     document.querySelectorAll(".ageRow").forEach(el=>{el.lastChild.textContent="反馈中断";el.lastChild.classList.add("stale");});
+    paintSensorFusion(null);
+    text("horizontalVelocityState","水平速度闭环：实时反馈中断");
     text("recording","试飞日志：无法确认");
   }finally{polling=false;}
 }

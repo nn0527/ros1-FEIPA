@@ -113,6 +113,44 @@ class LoggerTests(unittest.TestCase):
             self.assertAlmostEqual(float(row["wall_horizontal_forward_measured_mps"]),-.02)
             self.assertEqual(row["wall_horizontal_integral_active"],"True")
 
+    def test_fusion_parameter_switch_csv_and_events_preserve_ack_semantics(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            summary = logger.SignalSummary(root, FakeRos(root), True)
+            summary.write()  # Header includes the topic before the first message.
+            fusion = NS(header=header(), enabled=True, phase="restoring", episode_id="wall-1",
+                snapshot_valid=True, restore_required=True, parameters_restored=False,
+                control_ready=False, original_flow=1, original_range=2, target_flow=1,
+                target_range=2, confirmed_flow=1, confirmed_range=0, measured_tilt_deg=79.,
+                retry_count=1, reason="waiting range ACK", request_stamp=NS(to_sec=lambda: 8.25),
+                confirmed_stamp=NS(to_sec=lambda: 8.5), ready_after=NS(to_sec=lambda: 0.))
+            summary.remember("/wall_perch/sensor_fusion_status", fusion)
+            summary.write()
+            fusion.measured_tilt_deg = 60.  # Per-loop telemetry does not flood events.
+            summary.remember("/wall_perch/sensor_fusion_status", fusion)
+            fusion.phase = "settling"
+            fusion.parameters_restored = True
+            fusion.confirmed_range = 2
+            fusion.reason = "application buffer"
+            fusion.confirmed_stamp = NS(to_sec=lambda: 9.5)
+            fusion.ready_after = NS(to_sec=lambda: 10.7)
+            summary.remember("/wall_perch/sensor_fusion_status", fusion)
+            summary.close()
+            with (root / "signals.csv").open(encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertIn("/wall_perch/sensor_fusion_status", logger.TOPICS)
+            self.assertEqual(rows[0]["wall_sensor_fusion_phase"], "")
+            self.assertEqual(rows[1]["wall_sensor_fusion_original_range"], "2")
+            self.assertEqual(rows[1]["wall_sensor_fusion_confirmed_range"], "0")
+            self.assertEqual(rows[1]["wall_sensor_fusion_request_stamp_s"], "8.25")
+            self.assertEqual(rows[2]["wall_sensor_fusion_ready_after_s"], "10.7")
+            self.assertEqual(rows[2]["wall_sensor_fusion_control_ready"], "False")
+            events = (root / "events.log").read_text(encoding="utf-8")
+            self.assertEqual(events.count("wall sensor parameter switch"), 2)
+            self.assertIn("confirmed=1/0", events)
+            self.assertIn("ack_s=9.500000", events)
+            self.assertNotIn("measured_tilt", events)
+
     def test_event_changes_and_repeated_state_are_distinguishable(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -10,7 +10,7 @@ import time
 import math
 
 import rospy
-from mavros_msgs.msg import EstimatorStatus, RCIn, State
+from mavros_msgs.msg import EstimatorStatus, OpticalFlowRad, RCIn, State
 from mavros_msgs.srv import SetMode, SetModeRequest
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, String, UInt8
@@ -21,12 +21,13 @@ from px4_wall_ceiling_control.adapters.odometry import (
     vertical_speed_enu_mps,
 )
 from px4_wall_ceiling_control.domain.geometry import euler_from_quaternion
-from px4_wall_ceiling_control.freshness import is_fresh_receipt as is_fresh
+from px4_wall_ceiling_control.freshness import is_fresh_receipt as is_fresh, is_fresh_source
 from px4_wall_ceiling_control.msg import (
     CeilingAttachmentStatus,
     OperatorCommand,
     SensorHealth,
     WallPerchStatus,
+    WallSensorFusionStatus,
 )
 
 
@@ -68,6 +69,12 @@ class FlightModeManagerNode:
         self.ceiling_distance_gate_enabled = bool(rospy.get_param("~ceiling_distance_gate_enabled", False))
         self.wall_pilot_mode = str(rospy.get_param("~wall_pilot_mode", "ALTCTL")).upper()
         self.wall_horizontal_velocity_enabled = bool(rospy.get_param("/wall_perch_decision_node/horizontal_velocity_enabled",False))
+        self.wall_sensor_fusion_enabled = bool(rospy.get_param("/wall_sensor_fusion_manager_node/enabled", False))
+        self.wall_fusion_status_snapshot = self.wall_fusion_flow_snapshot = None
+        self.wall_fusion_epoch = None
+        self.wall_fusion_reason = ''
+        self.wall_fusion_since = self.wall_fusion_last_sample = None
+        self.wall_fusion_samples = 0
         if self.wall_pilot_mode not in ("ALTCTL","POSCTL"):raise ValueError("unsupported wall pilot mode")
         self.wall_auto_approach = bool(rospy.get_param("~wall_auto_approach", False))
         if self.wall_manual_approach and self.wall_auto_approach:
@@ -202,6 +209,11 @@ class FlightModeManagerNode:
         rospy.Subscriber(
             "/wall_perch/status", WallPerchStatus, self._on_wall, queue_size=10
         )
+        # A disabled manager can still own a journaled restoration after restart.
+        rospy.Subscriber('/wall_perch/sensor_fusion_status', WallSensorFusionStatus,
+                         self._on_wall_fusion_status, queue_size=1)
+        rospy.Subscriber('/mavros/px4flow/raw/optical_flow_rad', OpticalFlowRad,
+                         self._on_wall_fusion_flow, queue_size=1)
         self.set_mode = rospy.ServiceProxy("/mavros/set_mode", SetMode)
         self.timer = rospy.Timer(rospy.Duration(0.1), self._on_timer)
         if rospy.get_param("~motor_output_telemetry_enabled", False):
@@ -282,6 +294,95 @@ class FlightModeManagerNode:
     def _on_wall(self, message):
         self.wall, self.wall_at = message, rospy.Time.now()
 
+    def _on_wall_fusion_status(self, message):
+        self.wall_fusion_status_snapshot = (message, rospy.Time.now())
+
+    def _on_wall_fusion_flow(self, message):
+        self.wall_fusion_flow_snapshot = (message, rospy.Time.now())
+
+    def _reset_wall_fusion_gate(self):
+        self.wall_fusion_since = self.wall_fusion_last_sample = None
+        self.wall_fusion_samples = 0
+        # Never reuse pre-restoration stability for a late mode request.
+        self.cancel_entry_stable_since = None
+        self.wall_timeout_stable_since = self.wall_timeout_last_odom = None
+        self.wall_timeout_safe_samples = 0
+
+    def _wall_fusion_required(self):
+        snapshot = getattr(self, 'wall_fusion_status_snapshot', None)
+        return bool(getattr(self, 'wall_sensor_fusion_enabled', False)
+                    or (snapshot is not None
+                        and (snapshot[0].enabled or snapshot[0].restore_required)))
+
+    def _wall_fusion_ready(self, now):
+        """Require restored parameters and continuous fresh post-buffer feedback."""
+        if not self._wall_fusion_required():
+            return True
+        snapshot = getattr(self, 'wall_fusion_status_snapshot', None)
+        status, received = snapshot if snapshot is not None else (None, None)
+        valid = bool(status is not None and is_fresh(received, .5, now)
+            and is_fresh_source(status.header.stamp, .5, now, future_tolerance_s=0.)
+            and status.enabled and status.snapshot_valid and status.parameters_restored
+            and status.control_ready and not status.restore_required
+            and 0. < status.ready_after.to_sec() <= now.to_sec())
+        epoch = (status.episode_id, status.ready_after.to_sec()) if valid else None
+        if not valid or epoch != getattr(self, 'wall_fusion_epoch', None):
+            self._reset_wall_fusion_gate()
+        self.wall_fusion_epoch = epoch
+        self.wall_fusion_reason = '等待新鲜的融合参数恢复确认及应用缓冲'
+        if not valid:
+            return False
+        ready = status.ready_after
+        for message, at, timeout in (
+                (getattr(self, 'odom', None), getattr(self, 'odom_at', None), self.odom_timeout_s),
+                (getattr(self, 'estimator', None), getattr(self, 'estimator_at', None), self.estimator_timeout_s)):
+            if (message is None or not is_fresh(at, timeout, now) or at <= ready
+                    or message.header.stamp <= ready
+                    or not is_fresh_source(message.header.stamp, timeout, now)):
+                self._reset_wall_fusion_gate()
+                self.wall_fusion_reason = '等待参数应用缓冲后的新里程计和估计器样本'
+                return False
+        flow_snapshot = getattr(self, 'wall_fusion_flow_snapshot', None)
+        flow, at = flow_snapshot if flow_snapshot is not None else (None, None)
+        if (flow is None or not is_fresh(at, .6, now) or at <= ready
+                or not is_fresh_source(flow.header.stamp, .6, now)
+                or flow.integration_time_us <= 0 or flow.quality < 1
+                or not all(math.isfinite(v) for v in (flow.integrated_x, flow.integrated_y,
+                    flow.integrated_xgyro, flow.integrated_ygyro, flow.distance)) or flow.distance <= 0.
+                or flow.header.stamp.to_sec() - flow.integration_time_us * 1.e-6 <= ready.to_sec()):
+            self._reset_wall_fusion_gate()
+            self.wall_fusion_reason = '等待参数应用缓冲后完整采集的新光流样本'
+            return False
+        sample = flow.header.stamp
+        previous = getattr(self, 'wall_fusion_last_sample', None)
+        if previous is not None and (sample < previous or (sample - previous).to_sec() > .6):
+            self._reset_wall_fusion_gate()
+            previous = None
+        if previous is None or sample > previous:
+            self.wall_fusion_last_sample = sample
+            self.wall_fusion_samples = getattr(self, 'wall_fusion_samples', 0) + 1
+            if self.wall_fusion_since is None:
+                self.wall_fusion_since = sample
+        confirmed = bool(self.wall_fusion_samples >= 2 and self.wall_fusion_since is not None
+            and (sample - self.wall_fusion_since).to_sec() >= .3)
+        self.wall_fusion_reason = '' if confirmed else '等待参数恢复后新光流连续有效0.30秒'
+        return confirmed
+
+    def _wall_fusion_handover_ready(self, now):
+        snapshot = getattr(self, 'wall_fusion_status_snapshot', None)
+        status = snapshot[0] if snapshot is not None else None
+        debt = bool(status is not None and status.restore_required)
+        # A corrupt journal has unknown originals, so the manager advertises
+        # enabled/ERROR even though it cannot assert restore_required. Keep
+        # that barrier after canceled-entry cleanup clears selected_mode.
+        manager_blocked = bool(status is not None and status.enabled
+            and (status.phase == 'ERROR' or not status.snapshot_valid
+                 or not status.parameters_restored or not status.control_ready))
+        if (getattr(self, 'selected_mode', None) == OperatorCommand.MODE_WALL
+                or debt or manager_blocked):
+            return self._wall_fusion_ready(now)
+        return True
+
     def _set_phase(self, phase, reason=None):
         if self.phase != phase:
             if reason:
@@ -338,6 +439,8 @@ class FlightModeManagerNode:
             return "attitude or vertical velocity estimate invalid"
         if getattr(self, "require_rc_center", False) and not self._rc_fresh(now):
             return "RC input unavailable or invalid"
+        if selected == OperatorCommand.MODE_WALL and not self._wall_fusion_ready(now):
+            return self.wall_fusion_reason
         if selected == OperatorCommand.MODE_WALL and not self._wall_horizontal_ready(now):
             detail=(self.wall.horizontal_equilibrium_reason if self.wall is not None
                     and getattr(self.wall,"horizontal_equilibrium_enabled",False) and not self.wall.horizontal_equilibrium_valid
@@ -498,6 +601,7 @@ class FlightModeManagerNode:
         self.phase_reason = "OFFBOARD异常退出清理：" + reason + "；禁止新动作"
 
     def _offboard_exit_request_ready(self, now):
+        if not self._wall_fusion_handover_ready(now):return False
         flight = self.flight
         if (flight is None or not flight.connected
                 or not is_fresh(self.flight_at, self.state_timeout_s, now)):
@@ -558,6 +662,7 @@ class FlightModeManagerNode:
             self.phase_reason = "OFFBOARD异常退出清理：已请求" + pilot + "，等待后续连续模式反馈及在途请求结束；禁止新动作"
 
     def _entry_cancel_handover_ready(self, now):
+        if not self._wall_fusion_handover_ready(now):return False
         # If a behavior acquired ownership meanwhile, retain its full recovery gates.
         if self.owner != 0:
             return self._handover_ready(now)
@@ -660,6 +765,7 @@ class FlightModeManagerNode:
             and str(wall.reason).startswith("自动接近超时"))
 
     def _wall_timeout_handover_failure(self, now):
+        if not self._wall_fusion_handover_ready(now):return self.wall_fusion_reason
         if not kill_clear(self,now):return "急停生效或反馈无效"
         wall=getattr(self,"wall",None)
         recovered=bool(getattr(self,"wall_approach_timeout_returning",False)
@@ -741,6 +847,7 @@ class FlightModeManagerNode:
                         and not status.fault_detected and not getattr(self, "fault_seen", False)))
 
     def _handover_ready(self, now):
+        if not self._wall_fusion_handover_ready(now):return False
         if getattr(self,"wall_approach_timeout_returning",False):
             return self._wall_timeout_handover_ready(now)
         # A normal EXIT can be revoked while waiting for POSCTL. Read the live
@@ -957,6 +1064,10 @@ class FlightModeManagerNode:
                         return
                 elif self.phase != self.RETURNING or not self._handover_ready(rospy.Time.now()):
                     return
+            # Recheck immediately before the RPC as restoration status can change
+            # while this worker is waiting for MAVROS or another eligibility gate.
+            if mode != 'OFFBOARD' and not self._wall_fusion_handover_ready(rospy.Time.now()):
+                return
             if attempt is not None and attempt != getattr(self, "takeover_attempt", 0):
                 return  # A canceled/previous attempt must not send a late mode change.
             if mode != "OFFBOARD" and self.phase == self.RETURNING:

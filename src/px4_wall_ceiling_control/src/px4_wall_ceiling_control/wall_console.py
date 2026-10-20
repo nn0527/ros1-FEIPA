@@ -33,6 +33,7 @@ LIMITS = {"state": 1.5, "odom": 0.5, "estimator": 1.5, "rc": 0.2,
 LIMITS.update({"front_diagnostic": 3.0, "ceiling_diagnostic": 3.0})
 LIMITS["kill"] = 0.35
 LIMITS["ceiling_status"] = 0.5
+LIMITS["wall_sensor_fusion"] = 0.5
 
 
 def validate_config(values):

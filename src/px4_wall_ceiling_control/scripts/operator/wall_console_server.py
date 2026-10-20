@@ -172,7 +172,7 @@ class RemoteRuntime:
             from sensor_msgs.msg import Range, BatteryState
             from std_msgs.msg import String, UInt8, Bool
             from rosgraph_msgs.msg import Log
-            from px4_wall_ceiling_control.msg import SensorHealth, WallPerchStatus, CeilingAttachmentStatus, OperatorCommand
+            from px4_wall_ceiling_control.msg import SensorHealth, WallPerchStatus, WallSensorFusionStatus, CeilingAttachmentStatus, OperatorCommand
             rospy.init_node("wall_console_bridge", anonymous=True, disable_signals=True)
             self.publisher = rospy.Publisher("/attachment/terminal_command", String, queue_size=1)
             self.subscriptions_ack = rospy.Subscriber("/attachment/terminal_ack", String, self._on_terminal_ack, queue_size=10)
@@ -182,6 +182,7 @@ class RemoteRuntime:
                       "odom": ("/mavros/local_position/odom", Odometry),
                       "health": ("/sensor/health", SensorHealth), "wall": ("/wall_perch/status", WallPerchStatus),
                       "ceiling_status": ("/ceiling_attachment/status", CeilingAttachmentStatus),
+                      "wall_sensor_fusion": ("/wall_perch/sensor_fusion_status", WallSensorFusionStatus),
                       "phase": ("/attachment/flight_phase", String), "reason": ("/attachment/flight_phase_reason", String),
                       "owner": ("/attachment/output_owner", UInt8), "operator": ("/operator/command", OperatorCommand),
                       "front": ("/sensor/front/range", Range), "ceiling": ("/sensor/ceiling/range", Range),
@@ -207,6 +208,15 @@ class RemoteRuntime:
                      "ceiling_age_s": msg.ceiling_age_s, "front_age_s": msg.front_age_s}
         elif name == "ceiling_status":
             value = {key: getattr(msg, key) for key in ("state_name", "reason", "fault_detected", "attach_confirmed", "distance_stable", "range_fresh", "odom_fresh", "candidate_valid", "ceiling_distance_filtered_m", "compression_m", "target_distance_m", "detach_failed", "activation_ready", "detach_start_height_m", "descended_height_m", "detach_height_ready", "height_source", "baro_fresh", "baro_reference_ready", "baro_pressure_pa", "hold_pressure_pa")}
+        elif name == "wall_sensor_fusion":
+            # Parameter ACKs are not proof that the EKF fused a measurement.
+            value = {key: getattr(msg, key) for key in (
+                "enabled", "phase", "episode_id", "snapshot_valid", "restore_required",
+                "parameters_restored", "control_ready", "original_flow", "original_range",
+                "target_flow", "target_range", "confirmed_flow", "confirmed_range",
+                "measured_tilt_deg", "retry_count", "reason")}
+            for key in ("request_stamp", "confirmed_stamp", "ready_after"):
+                value[key] = getattr(msg, key).to_sec()
         elif name == "wall":
             value = {key: getattr(msg, key) for key in ("state_name", "reason", "progress", "fault_detected",
                       "front_distance_filtered_m", "top_distance_filtered_m", "thrust_normalized", "top_contact_ready",

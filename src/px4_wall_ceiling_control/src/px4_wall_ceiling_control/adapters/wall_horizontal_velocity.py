@@ -12,11 +12,20 @@ from px4_wall_ceiling_control.domain.horizontal_equilibrium import HorizontalEqu
 from px4_wall_ceiling_control.domain.flow_timestamps import FlowTimestampGuard
 from px4_wall_ceiling_control.domain.recovery_attitude_limits import attitude_from_axis_yaw
 from px4_wall_ceiling_control.freshness import is_fresh, is_fresh_receipt, is_fresh_source
-from px4_wall_ceiling_control.msg import WallPerchStatus as W, AttachmentControlCandidate as C
+from px4_wall_ceiling_control.msg import (
+    WallPerchStatus as W, AttachmentControlCandidate as C, WallSensorFusionStatus,
+)
 
 
 class WallHorizontalVelocityMixin:
     def _init_horizontal_velocity(self):
+        self.wall_sensor_fusion_enabled = bool(rospy.get_param('/wall_sensor_fusion_manager_node/enabled', False))
+        self.wall_fusion_status_snapshot = None
+        self.wall_fusion_epoch = None
+        self.wall_fusion_reason = ''
+        # This gate also protects recovery/entry with the horizontal loop disabled.
+        rospy.Subscriber('/wall_perch/sensor_fusion_status', WallSensorFusionStatus,
+                         self._on_wall_fusion_status, queue_size=1)
         self.horizontal_velocity_enabled = bool(rospy.get_param('~horizontal_velocity_enabled', False))
         self.horizontal_approach_speed = float(rospy.get_param('~horizontal_approach_speed_mps', .10))
         self.horizontal_resume_tilt = math.radians(float(rospy.get_param('~horizontal_resume_tilt_deg', 10.)))
@@ -77,6 +86,59 @@ class WallHorizontalVelocityMixin:
             rospy.Subscriber('/mavros/setpoint_raw/target_attitude', AttitudeTarget, self._on_horizontal_fcu_target, queue_size=10)
             rospy.Subscriber('/mavros/px4flow/raw/optical_flow_rad', OpticalFlowRad, self._on_horizontal_flow, queue_size=10)
             rospy.Subscriber('/mavros/estimator_status', EstimatorStatus, self._on_horizontal_estimator, queue_size=10)
+
+    def _on_wall_fusion_status(self, message):
+        # Preserve the status/receipt association across callback/timer races.
+        self.wall_fusion_status_snapshot = (message, rospy.Time.now())
+
+    def _wall_fusion_required(self):
+        snapshot = getattr(self, 'wall_fusion_status_snapshot', None)
+        return bool(getattr(self, 'wall_sensor_fusion_enabled', False)
+                    or (snapshot is not None
+                        and (snapshot[0].enabled or snapshot[0].restore_required)))
+
+    def _wall_fusion_ready(self, now):
+        """Parameter restoration gate; never describes actual EKF fusion."""
+        if not self._wall_fusion_required():
+            return True
+        snapshot = getattr(self, 'wall_fusion_status_snapshot', None)
+        status, received = snapshot if snapshot is not None else (None, None)
+        valid = bool(status is not None and is_fresh_receipt(received, .5, now)
+            and is_fresh_source(status.header.stamp, .5, now, future_tolerance_s=0.)
+            and status.enabled and status.snapshot_valid and status.parameters_restored
+            and status.control_ready and not status.restore_required
+            and 0. < status.ready_after.to_sec() <= now.to_sec())
+        epoch = (status.episode_id, status.ready_after.to_sec()) if valid else None
+        if not valid or epoch != getattr(self, 'wall_fusion_epoch', None):
+            self._reset_horizontal_gate('等待融合参数恢复确认、应用缓冲及新样本')
+        self.wall_fusion_epoch = epoch
+        self.wall_fusion_reason = '' if valid else '等待新鲜的融合参数恢复确认及应用缓冲'
+        return valid
+
+    def _wall_fusion_samples_ready(self, now):
+        if not self._wall_fusion_ready(now):
+            return False
+        if not self._wall_fusion_required():
+            return True
+        ready = rospy.Time.from_sec(self.wall_fusion_epoch[1])
+        for message, received, timeout in (
+                (getattr(self, 'odom', None), getattr(self, 'odom_received_at', None), self.odom_timeout_s),
+                (getattr(self, 'horizontal_estimator', None), getattr(self, 'horizontal_estimator_at', None), 1.)):
+            if (message is None or not is_fresh_receipt(received, timeout, now)
+                    or received <= ready or message.header.stamp <= ready
+                    or not is_fresh_source(message.header.stamp, timeout, now)):
+                self.wall_fusion_reason = '等待参数应用缓冲后的新里程计和估计器样本'
+                return False
+        snapshot = getattr(self, 'horizontal_flow_snapshot', None)
+        flow, received, error = snapshot if snapshot is not None else (None, None, '')
+        if (flow is None or not is_fresh_receipt(received, self.horizontal_flow_timeout, now)
+                or received <= ready or flow.header.stamp <= ready
+                or flow.header.stamp.to_sec() - flow.integration_time_us * 1.e-6 <= ready.to_sec()
+                or not is_fresh_source(flow.header.stamp, self.horizontal_flow_timeout, now) or error):
+            self.wall_fusion_reason = '等待参数应用缓冲后完整采集的新光流样本'
+            return False
+        self.wall_fusion_reason = ''
+        return True
 
     def _on_horizontal_output_owner(self, message):
         self.horizontal_output_owner,self.horizontal_output_owner_at = message.data,rospy.Time.now()
@@ -444,6 +506,9 @@ class WallHorizontalVelocityMixin:
 
     def _prepare_horizontal_velocity(self, now):
         if not getattr(self,'horizontal_velocity_enabled',False):return
+        if not self._wall_fusion_samples_ready(now):
+            self._reset_horizontal_gate(self.wall_fusion_reason)
+            return
         if not self._horizontal_phase_allowed(now):
             self._reset_horizontal_gate('翻转或贴墙阶段：水平速度闭环暂停')
             return
@@ -510,6 +575,7 @@ class WallHorizontalVelocityMixin:
             and self.horizontal_stable_since is not None and (self.odom_received_at-self.horizontal_stable_since).to_sec() >= self.horizontal_stable_time)
 
     def _horizontal_recovery_ready(self, now):
+        if not self._wall_fusion_ready(now):return False
         if not getattr(self,'horizontal_velocity_enabled',False):return True
         self._prepare_horizontal_velocity(now)
         return bool(self.horizontal_velocity_stable and (not getattr(self, 'departure_active', False)

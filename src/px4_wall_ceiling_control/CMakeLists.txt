@@ -23,6 +23,7 @@ add_message_files(
   OperatorCommand.msg
   SensorHealth.msg
   WallPerchStatus.msg
+  WallSensorFusionStatus.msg
   # Legacy generic distance-control contracts.
   BehaviorCommand.msg
   ControllerStatus.msg
@@ -61,6 +62,7 @@ catkin_install_python(PROGRAMS
   scripts/outputs/attachment_output_mux_node.py
   scripts/sensors/lidar_distance_node.py
   scripts/sensors/sensor_range_manager_node.py
+  scripts/sensors/wall_sensor_fusion_manager_node.py
   scripts/standalone/ceiling_attachment_output_node.py
   scripts/test_support/mock_attachment_mechanism_node.py
   scripts/test_support/mock_flight_inputs_node.py
@@ -125,4 +127,6 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_horizontal_pi.py)
   catkin_add_nosetests(test/test_flow_timestamps.py)
   catkin_add_nosetests(test/test_wall_timeout_handover.py)
+  catkin_add_nosetests(test/test_wall_sensor_fusion.py)
+  catkin_add_nosetests(test/test_wall_fusion_handover.py)
 endif()

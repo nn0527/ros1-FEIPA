@@ -2,6 +2,7 @@
 /dist/
 /devel/
 /logs/
+/.wall_sensor_fusion/
 *.bag
 *.bag.active
 __pycache__/

@@ -1732,6 +1732,9 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 self.cancel_requested = False
             altitude_ok = self._entry_height_ready()
             safety_ok = self._safety_ok(now)
+            if mode_requested and not self._wall_fusion_ready(now):
+                self.last_reason = "等待光流/对地测距参数就绪：" + self.wall_fusion_reason
+                return
             if (getattr(self, "auto_approach", False) and mode_requested
                     and not self._auto_takeover_confirmed(now)):
                 self.last_reason = "等待本次 OFFBOARD 接管确认"

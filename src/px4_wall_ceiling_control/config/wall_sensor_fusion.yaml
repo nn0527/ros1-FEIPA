@@ -1,0 +1,25 @@
+# Parameter acknowledgements describe configuration, not actual EKF fusion.
+wall_sensor_fusion_manager_node:
+  enabled: false
+  # Initial bench-calibration value: aim for actual fusion before measured 10 deg.
+  restore_tilt_deg: 80.0
+  application_settle_s: 1.2
+  odom_timeout_s: 0.30
+  status_timeout_s: 0.60
+  state_timeout_s: 1.50
+  future_tolerance_s: 0.10
+  request_timeout_s: 5.0
+  # MAVROS 1.20.1 waits up to 5 s for PARAM_SET ACK. On a pending-write
+  # restart, isolate the old service for 10 s before issuing any new calls.
+  restart_quarantine_s: 10.0
+  retry_initial_s: 1.0
+  retry_max_s: 8.0
+  mavros_namespace: /mavros
+  odom_topic: /mavros/local_position/odom
+  state_topic: /mavros/state
+  wall_status_topic: /wall_perch/status
+  status_topic: /wall_perch/sensor_fusion_status
+  # ros1_noetic mounts this workspace from the Pi, retaining restore records
+  # across both node and container restarts. File name uses vehicle identity.
+  journal_directory: /root/ros_ws/.wall_sensor_fusion
+  # Optional vehicle_id and journal_path must identify this FCU consistently.

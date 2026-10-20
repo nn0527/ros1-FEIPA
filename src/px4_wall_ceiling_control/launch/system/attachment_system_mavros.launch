@@ -11,6 +11,8 @@
        default="/dev/serial/by-path/pci-0000:04:00.3-usb-0:4.1:1.0-port0" />
   <arg name="ceiling_enabled" default="false" />
   <arg name="wall_enabled" default="false" />
+  <arg name="wall_sensor_fusion_enabled" default="false" />
+  <arg name="wall_sensor_fusion_restore_tilt_deg" default="80.0" />
   <arg name="output_enabled" default="false" />
   <arg name="mechanism_output_enabled" default="false" />
   <arg name="operator_source" default="rc" />
@@ -64,6 +66,8 @@
             file="$(find px4_wall_ceiling_control)/config/ceiling_attachment.yaml" />
   <rosparam command="load"
             file="$(find px4_wall_ceiling_control)/config/wall_perch.yaml" />
+  <rosparam command="load"
+            file="$(find px4_wall_ceiling_control)/config/wall_sensor_fusion.yaml" />
   <rosparam command="load"
             file="$(find px4_wall_ceiling_control)/config/attachment_output.yaml" />
 
@@ -121,6 +125,14 @@
         name="sensor_range_manager_node" output="$(arg node_output)">
     <param if="$(arg wall_bench_wait_for_ranges)" name="input_timeout_s"
            value="$(arg wall_bench_range_timeout_s)" />
+  </node>
+
+  <!-- Keep the manager alive even when disabled so a persisted restore debt
+       can be recovered after restart. Parameter calls run in its own worker. -->
+  <node pkg="px4_wall_ceiling_control" type="wall_sensor_fusion_manager_node.py"
+        name="wall_sensor_fusion_manager_node" output="$(arg node_output)">
+    <param name="enabled" value="$(arg wall_sensor_fusion_enabled)" />
+    <param name="restore_tilt_deg" value="$(arg wall_sensor_fusion_restore_tilt_deg)" />
   </node>
 
   <node if="$(arg ceiling_enabled)"

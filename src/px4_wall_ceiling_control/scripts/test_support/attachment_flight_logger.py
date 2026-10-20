@@ -18,6 +18,7 @@ import zipfile
 
 
 TOPICS = [
+    "/wall_perch/sensor_fusion_status",
     "/wall_perch/status", "/wall_perch/control_candidate", "/wall_perch/detach", "/wall_perch/cancel",
     "/ceiling_attachment/status", "/ceiling_attachment/control_candidate", "/ceiling_attachment/detach",
     "/mavros/setpoint_raw/attitude", "/mavros/setpoint_raw/target_attitude",
@@ -157,6 +158,18 @@ class SignalSummary:
         if topic == "/wall_perch/status":
             event = "wall state={} reason={} faults={} candidate_valid={}".format(
                 message.state_name, message.reason, message.fault_count, message.candidate_valid)
+        elif topic == "/wall_perch/sensor_fusion_status":
+            # Deliberately exclude tilt and publishing time: they change every
+            # loop, while the event stream records only transaction changes.
+            event = ("wall sensor parameter switch phase={} episode={} original={}/{} "
+                     "target={}/{} confirmed={}/{} enabled={} snapshot={} restore_required={} restored={} control_ready={} "
+                     "request_s={:.6f} ack_s={:.6f} retries={} reason={}").format(
+                message.phase, message.episode_id, message.original_flow, message.original_range,
+                message.target_flow, message.target_range, message.confirmed_flow, message.confirmed_range,
+                message.enabled, message.snapshot_valid, message.restore_required,
+                message.parameters_restored, message.control_ready,
+                message.request_stamp.to_sec(), message.confirmed_stamp.to_sec(),
+                message.retry_count, message.reason)
         elif topic == "/ceiling_attachment/status":
             event = "ceiling state={} reason={} faults={} candidate_valid={}".format(
                 message.state_name, message.reason, message.fault_count, message.candidate_valid)
@@ -207,6 +220,15 @@ class SignalSummary:
         for name in ("horizontal_equilibrium_attitude", "horizontal_prestream_attitude"):
             value=getattr(wall,name,None)
             for key in "xyzw":row["wall_"+name+"_"+key]=getattr(value,key,None)
+        fusion = sample("/wall_perch/sensor_fusion_status", "wall_sensor_fusion")
+        for key in ("enabled", "phase", "episode_id", "snapshot_valid", "restore_required",
+                    "parameters_restored", "control_ready", "original_flow", "original_range",
+                    "target_flow", "target_range", "confirmed_flow", "confirmed_range",
+                    "measured_tilt_deg", "retry_count", "reason"):
+            row["wall_sensor_fusion_" + key] = getattr(fusion, key, None)
+        for key in ("request_stamp", "confirmed_stamp", "ready_after"):
+            stamp = getattr(fusion, key, None)
+            row["wall_sensor_fusion_" + key + "_s"] = stamp.to_sec() if stamp is not None else None
         ceiling = sample("/ceiling_attachment/status", "ceiling")
         for key in ("state_name", "reason", "candidate_valid", "fault_count", "range_fresh", "odom_fresh",
                     "ceiling_distance_raw_m", "ceiling_distance_filtered_m", "activation_ready",

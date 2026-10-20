@@ -5,6 +5,8 @@
   <arg name="hover_thrust" default="0.49" />
   <arg name="preflip_right_roll_deg" default="1.7" />
   <arg name="restrained_bench" default="false" />
+  <arg name="wall_sensor_fusion_enabled" default="true" />
+  <arg name="wall_sensor_fusion_restore_tilt_deg" default="80.0" />
   <include file="$(find px4_wall_ceiling_control)/launch/system/attachment_system_mavros.launch">
     <arg name="ceiling_serial_port" value="$(arg ceiling_serial_port)" />
     <arg name="front_serial_port" value="$(arg front_serial_port)" />
@@ -12,6 +14,8 @@
     <arg name="kill_guard_enabled" value="true" />
     <arg name="flight_mode_enabled" value="true" />
     <arg name="wall_enabled" value="true" />
+    <arg name="wall_sensor_fusion_enabled" value="$(arg wall_sensor_fusion_enabled)" />
+    <arg name="wall_sensor_fusion_restore_tilt_deg" value="$(arg wall_sensor_fusion_restore_tilt_deg)" />
     <arg name="wall_manual_approach" value="false" />
     <arg name="wall_auto_approach" value="true" />
     <arg name="wall_flip_thrust_follow_tilt" value="true" />

@@ -23,6 +23,28 @@ spec.loader.exec_module(server)
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_fusion_status_serializes_ros_times_and_expires(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = self.state
+        fusion = SimpleNamespace(enabled=True, phase="settling", episode_id="wall-1",
+            snapshot_valid=True, restore_required=False, parameters_restored=True,
+            control_ready=False, original_flow=1, original_range=2, target_flow=1,
+            target_range=2, confirmed_flow=1, confirmed_range=2, measured_tilt_deg=float("nan"),
+            retry_count=0, reason="application buffer", request_stamp=SimpleNamespace(to_sec=lambda: 8.25),
+            confirmed_stamp=SimpleNamespace(to_sec=lambda: 8.5), ready_after=SimpleNamespace(to_sec=lambda: 9.7))
+        runtime.callback(fusion, "wall_sensor_fusion")
+        item = runtime.state.snapshot()["status"]["wall_sensor_fusion"]
+        self.assertTrue(item["fresh"])
+        self.assertEqual(item["value"]["confirmed_stamp"], 8.5)
+        self.assertEqual(item["value"]["ready_after"], 9.7)
+        self.assertEqual(item["value"]["original_range"], 2)
+        self.assertIsNone(item["value"]["measured_tilt_deg"])
+        self.assertTrue(item["value"]["parameters_restored"])
+        self.assertFalse(item["value"]["control_ready"])
+        json.dumps(item, allow_nan=False)  # No ROS Time or NaN leaks to HTTP.
+        self.now += .51
+        self.assertFalse(runtime.state.snapshot()["status"]["wall_sensor_fusion"]["fresh"])
+
     def test_task_sync_plugins_are_isolated_in_project_launch(self):
         import yaml
         root=server_path.parents[2]
