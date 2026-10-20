@@ -14,7 +14,7 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Range
 from std_msgs.msg import Bool, String, UInt8
 
-from px4_wall_ceiling_control.adapters.odometry import vertical_speed_enu_mps
+from px4_wall_ceiling_control.adapters.odometry import odometry_is_finite, vertical_speed_enu_mps
 from px4_wall_ceiling_control.adapters.takeoff_height import TakeoffHeightReference
 from px4_wall_ceiling_control.adapters.kill_switch import install_kill_guard, kill_clear
 from px4_wall_ceiling_control.domain.geometry import (
@@ -316,6 +316,9 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         )
         self.ignore_down_velocity_during_hold = bool(
             rospy.get_param("~ignore_down_velocity_during_hold", False)
+        )
+        self.manual_wall_recovery_enabled = bool(
+            rospy.get_param("~manual_wall_recovery_enabled", False)
         )
         if self.ignore_range_loss_during_hold:
             rospy.logwarn("WALL_HOLD/WALL_PIN range-loss abort checks disabled; actual range and health remain unchanged")
@@ -1301,6 +1304,37 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         roll, pitch, _yaw = self._euler_from_quaternion(quaternion)
         return abs(roll) < self.recover_angle_rad and abs(pitch) < self.recover_angle_rad
 
+    def _manual_wall_recovery_active(self, now):
+        """Allow wheel correction after the existing late-top HOLD gate.
+
+        A completed flip without a fresh accepted top frame is insufficient.
+        This is a control-phase latch, not proof of physical wall contact.
+        """
+        if not getattr(self, "manual_wall_recovery_enabled", False):
+            return False
+        return bool(self.state == WallPerchStatus.STATE_WALL_HOLD or (
+            self.state in (WallPerchStatus.STATE_FLIP_TO_WALL,
+                           WallPerchStatus.STATE_WALL_CAPTURE)
+            and self._late_top_frame_ready(now)))
+
+    def _manual_wall_recovery_reason(self, now):
+        if not self._manual_wall_recovery_active(now) or self.state != WallPerchStatus.STATE_WALL_HOLD:
+            return ""
+        warnings = []
+        if not self._rates_safe(self.capture_max_rate_rps):
+            warnings.append("机体转速较大")
+        vz = vertical_speed_enu_mps(self.odom, self.odom_twist_in_child_frame)
+        if math.isfinite(vz) and vz < -self.max_down_velocity_mps:
+            warnings.append("估计下降速度越限")
+        measured = self._current_quaternion()
+        if measured is not None and quaternion_angle(measured, self._hold_follow_quaternion()) > self.detach_axis_error_rad:
+            warnings.append("姿态偏离贴墙方向")
+        if self._top_clear_ready(now):
+            warnings.append("顶部距离偏大")
+        if not warnings:
+            return ""
+        return "贴墙调整：保持压墙推力，等待轮子回正后手动脱离（{}）".format("；".join(warnings))
+
     def _safety_ok(self, now):
         if not self._flight_ready(now) or not self._odom_fresh(now):
             return False
@@ -1315,6 +1349,11 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             return False
         if self._top_required() and not self._top_fresh(now):
             return False
+        if self._manual_wall_recovery_active(now):
+            # Wheel correction may involve descent, fast body rotation or a
+            # large axis error. Keep bounded wall pressure instead of leveling.
+            # Finite feedback, flight/odom freshness, kill and mode still gate it.
+            return odometry_is_finite(self.odom)
         if self.state == WallPerchStatus.STATE_FLIP_TO_WALL:
             rate_limit = self.flip_max_rate_rps
         elif self.state in (
@@ -1857,13 +1896,15 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
 
         elif self.state == WallPerchStatus.STATE_WALL_HOLD:
             contact_lost = self._top_clear_ready(now)
-            if not self._safety_ok(now) or contact_lost:
+            manual_recovery = self._manual_wall_recovery_active(now)
+            if not self._safety_ok(now) or (contact_lost and not manual_recovery):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "wall contact or safety lost")
             elif self._pin_triggered():
                 self._enter_state(WallPerchStatus.STATE_WALL_PIN, now, "pin pitch reached")
             elif self.detach_requested or (
-                self.hold_time_s > 0.0 and self._state_age(now) >= self.hold_time_s
+                not manual_recovery and self.hold_time_s > 0.0
+                and self._state_age(now) >= self.hold_time_s
             ):
                 requested_at = getattr(self, "detach_requested_at", now)
                 if (self.detach_requested and (now - requested_at).to_sec() >=
@@ -2290,7 +2331,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         status.detach_block_reason = self._detach_block_reason(now) if self.state == WallPerchStatus.STATE_WALL_HOLD and not self._detach_start_ready(now) else ""
         status.detach_ready = bool(self.state == WallPerchStatus.STATE_WALL_HOLD
             and self._safety_ok(now) and self._detach_start_ready(now)
-            and not self._top_clear_ready(now))
+            and (self._manual_wall_recovery_active(now) or not self._top_clear_ready(now)))
         status.flight_state_fresh = self._flight_ready(now)
         status.auto_approach_enabled = getattr(self, "auto_approach", False)
         status.approach_paused = bool(status.auto_approach_enabled and self.state == WallPerchStatus.STATE_SLOW_APPROACH
@@ -2381,6 +2422,9 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         status.flip_support_thrust = self.flip_support_thrust if flip_support else math.nan
         status.flip_pressure_thrust = self.flip_pressure_thrust if flip_support else math.nan
         status.reason = self.last_reason
+        adjustment_reason = self._manual_wall_recovery_reason(now)
+        if adjustment_reason:
+            status.reason += "; " + adjustment_reason
         if self.state == WallPerchStatus.STATE_FLIP_TO_WALL and getattr(self, "flip_tracking_limited", False):
             status.reason += "; 翻转目标跟踪误差受限，减缓姿态轨迹"
         if flip_support:

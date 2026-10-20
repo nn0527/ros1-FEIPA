@@ -49,6 +49,10 @@ wall_perch_decision_node:
   capture_timeout_s: 8.00
   # Remain against the wall until the operator stops the wheels and requests detach.
   hold_time_s: 0.00
+  # Keep bounded wall pressure during slip/wheel correction; only a manual
+  # detach request advances after the normal pose/rate stability gates pass.
+  # Enabled after the existing final-flip valid top-frame gate; not before it.
+  manual_wall_recovery_enabled: true
   hold_entry_blend_s: 0.50
   # Detach admission requires stable measured pose and bounded vertical speed.
   # The trajectory starts from the last actual published attitude/thrust.
