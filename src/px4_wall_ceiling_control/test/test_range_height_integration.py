@@ -370,7 +370,9 @@ class RangeTelemetryTests(unittest.TestCase):
         runtime.callback(message, 'wall')
         name, value = runtime.state.update.call_args.args
         self.assertEqual(name, 'wall')
-        self.assertEqual(value['detach_range_lock_source_time'], 10.123)
+        # rospy.Time.from_sec truncates to integer nanoseconds; converting back
+        # may differ by one nanosecond from the original decimal float.
+        self.assertAlmostEqual(value['detach_range_lock_source_time'], 10.123, delta=2.e-9)
         self.assertIsNone(value['detach_range_velocity_mps'])
         self.assertFalse(value['detach_range_velocity_valid'])
         self.assertEqual(value['detach_range_lock_raw_m'], 1.24)
