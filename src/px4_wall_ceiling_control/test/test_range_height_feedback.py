@@ -13,6 +13,33 @@ def pitch(degrees):
 
 
 class RangeHeightTests(unittest.TestCase):
+    def test_read_snapshot_cannot_lock_pending_frame_or_advance_clock(self):
+        r = self.tracker()
+        r.observe_pose(10.24, 10.25, pitch(7.))
+        r.observe_range(10.2501, 10.25, 1.13)
+        self.assertFalse(r.locked)
+        last_tick, pending = r.last_tick, tuple(r.pending)
+        r.read_snapshot(10.280711)
+        self.assertFalse(r.locked)
+        self.assertEqual(r.last_tick, last_tick)
+        self.assertEqual(tuple(r.pending), pending)
+        r.process(10.30)
+        self.assertTrue(r.locked)
+        self.assertEqual(r.action_started, 10.30)
+
+    def test_read_snapshot_does_not_invalidate_history_but_still_reports_expiry(self):
+        r = self.tracker()
+        self.frame(r, 10.1)
+        self.frame(r, 10.35)
+        last_tick, samples = r.last_tick, tuple(r.samples)
+        self.assertFalse(r.read_snapshot(11.).valid)
+        self.assertFalse(r.read_snapshot(10.2).valid)
+        self.assertEqual(r.last_tick, last_tick)
+        self.assertEqual(tuple(r.samples), samples)
+        self.assertIsNone(r.invalid_since)
+        r.process(11.)
+        self.assertIsNotNone(r.invalid_since)
+
     def test_manual_fixed_target_is_never_cosine_projected_or_written_to_feedback(self):
         r = self.tracker()
         self.frame(r, 10.1, 1.24, 5.)

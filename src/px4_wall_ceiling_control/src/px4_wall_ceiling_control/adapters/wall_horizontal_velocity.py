@@ -1,5 +1,6 @@
 """Phase and sensor gates for the optional wall horizontal velocity loop."""
 import math
+from contextlib import nullcontext
 
 import rospy
 from mavros_msgs.msg import OpticalFlowRad, EstimatorStatus, AttitudeTarget
@@ -37,7 +38,7 @@ class WallHorizontalVelocityMixin:
         self.horizontal_flow_quality_min = int(rospy.get_param('~horizontal_flow_quality_min', 1))
         self.horizontal_reacquire_time = float(rospy.get_param('~horizontal_reacquire_time_s', .30))
         self.horizontal_equilibrium_window = float(rospy.get_param('~horizontal_equilibrium_window_s', .5))
-        self.horizontal_equilibrium_speed = float(rospy.get_param('~horizontal_equilibrium_speed_mps', .10))
+        self.horizontal_equilibrium_speed = float(rospy.get_param('~horizontal_equilibrium_speed_mps', .20))
         values = (self.horizontal_equilibrium_window,self.horizontal_equilibrium_speed,self.horizontal_approach_speed,self.horizontal_resume_tilt,self.horizontal_stable_speed,
                   self.horizontal_stable_time,self.horizontal_flow_timeout,self.horizontal_reacquire_time)
         if any(not math.isfinite(v) or v <= 0 for v in values) or self.horizontal_approach_speed > .3 or not 1 <= self.horizontal_flow_quality_min <= 255:
@@ -141,10 +142,15 @@ class WallHorizontalVelocityMixin:
         return True
 
     def _on_horizontal_output_owner(self, message):
-        self.horizontal_output_owner,self.horizontal_output_owner_at = message.data,rospy.Time.now()
+        received_at = rospy.Time.now()
+        with getattr(self, 'feedback_lock', nullcontext()):
+            self.horizontal_output_owner,self.horizontal_output_owner_at = message.data,received_at
 
     def _on_horizontal_output(self, message):
-        self.horizontal_output,self.horizontal_output_at = message,rospy.Time.now()
+        # Record arrival before waiting; contention must not renew freshness.
+        received_at = rospy.Time.now()
+        with getattr(self, 'feedback_lock', nullcontext()):
+            self.horizontal_output,self.horizontal_output_at = message,received_at
 
     def _clear_horizontal_integral(self, reason):
         self.horizontal_controller.clear_integral()
@@ -429,7 +435,7 @@ class WallHorizontalVelocityMixin:
             and is_fresh_receipt(self.horizontal_fcu_target_at,.35,now))
         if eligible:
             angular=self.odom.twist.twist.angular
-            eligible=(math.isfinite(angular.y) and abs(angular.y)<=math.radians(10.)
+            eligible=(math.isfinite(angular.y) and abs(angular.y)<=math.radians(20.)
                 and rotate_vector(q,(0.,0.,1.))[2]>=math.cos(math.radians(5.)))
         if eligible:
             qtarget=tuple(getattr(target.orientation,k) for k in 'xyzw')

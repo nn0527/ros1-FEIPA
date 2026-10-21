@@ -309,6 +309,10 @@ class RangeHeightFeedback:
 
     def snapshot(self, now):
         self.process(now)
+        return self.read_snapshot(now)
+
+    def read_snapshot(self, now):
+        """Read feedback without processing pending frames or changing clocks."""
         age = max(now-self.source, now-self.received) if self.locked else math.inf
         valid = bool(self.locked and self.invalid_since is None
                      and -self.config.future_tolerance_s <= now-self.source <= self.config.timeout_s

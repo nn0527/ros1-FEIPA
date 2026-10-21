@@ -313,6 +313,9 @@ class RemoteRuntime:
 
     def update_process_errors(self, runtime):
         """Report the live ROS instance rather than an obsolete launcher PID."""
+        # An intentional stop (including failed cleanup) owns its error state.
+        if getattr(self, "stop_requested", False):
+            return
         mavros_error = "mavros 无响应，请查看启动日志"
         mavros_present = "/mavros" in runtime.get("nodes", [])
         expected = self.state.config["fcu_port"] + ":" + str(self.state.config["baud"])
@@ -351,6 +354,8 @@ class RemoteRuntime:
             time.sleep(1)
 
     def start(self, config):
+        if getattr(self, "repairing", False):
+            raise ValueError("正在执行地面恢复，请等待 MAVROS 重启结果")
         if getattr(self, "stopping", False):
             raise ValueError("正在终止现有进程，请等待结束")
         if (getattr(self, "stop_requested", False)
@@ -501,26 +506,24 @@ class RemoteRuntime:
             raise ValueError("请先确认飞机已落地、未解锁且电机停止")
         with self.state.lock:
             snapshot = self.state.snapshot()
-            flight = snapshot["status"]["state"].get("value") or {}
-            runtime = snapshot["status"]["runtime"].get("value") or {}
-            phase = snapshot["status"]["phase"]
-            if flight.get("armed"):
-                raise ValueError("飞控解锁或历史解锁状态未确认，不能修复连接")
-            if self.state.starting or getattr(self, "stopping", False):
+            flight = snapshot["status"]["state"]
+            if flight["fresh"] and (flight.get("value") or {}).get("armed"):
+                raise ValueError("飞控仍处于解锁状态，请先落地上锁")
+            if self.state.starting or getattr(self, "stopping", False) or getattr(self, "repairing", False):
                 raise ValueError("已有启动或停止操作正在进行")
-            if runtime.get("enabled") or (phase["fresh"] and phase["value"] not in (None, "IDLE", "LOCKED")):
-                raise ValueError("飞行控制链路正在运行，请先落地并停止基础链路")
+            self.repairing = True
             self.stop_requested = False
             self.state.starting = True
             self.state.launch_error = ""
-            self.state.mavros_repair = {"state": "RUNNING", "reason": "正在检查 MAVROS、串口占用与失效登记"}
+            self.state.mavros_repair = {"state": "RUNNING", "reason": "正在停止并核验旧链路，随后重启 MAVROS"}
             self.state.event("MAVROS 连接修复请求已接收")
         threading.Thread(target=self.repair_mavros_worker, daemon=True).start()
-        return {"message": "连接修复已开始；请等待结果，修复仅启动 MAVROS，不启动飞行控制"}
+        return {"message": "地面恢复已开始：停止旧链路后重启 MAVROS；成功后请手动启动基础链路"}
 
     def ensure_mavros_repair_state(self):
         snapshot = self.state.snapshot()
-        if (snapshot["status"]["state"].get("value") or {}).get("armed"):
+        flight = snapshot["status"]["state"]
+        if flight["fresh"] and (flight.get("value") or {}).get("armed"):
             raise ValueError("检测到飞控解锁状态，取消连接修复")
         runtime = snapshot["status"]["runtime"].get("value") or {}
         phase = snapshot["status"]["phase"]
@@ -529,17 +532,12 @@ class RemoteRuntime:
 
     def repair_mavros_worker(self):
         try:
+            # Use the same verified cleanup as Stop. Never create a second serial
+            # reader or resume an old operator request after reconnecting the FCU.
+            self.stop({"grounded_confirmed": True}, _repair=True)
+            self.stop_requested = False
             self.ensure_mavros_repair_state()
             nodes = self.nodes()
-            if "/mavros" in nodes and self.mavros_alive():
-                item = self.state.snapshot()["status"]["state"]
-                if item["fresh"] and item["value"].get("connected") and not item["value"].get("armed"):
-                    reason = "MAVROS 与飞控已正常连接，无需重复启动"
-                    with self.state.lock:
-                        self.state.mavros_repair = {"state": "SUCCEEDED", "reason": reason}
-                        self.state.event(reason)
-                    return
-                raise ValueError("MAVROS 节点能响应，但飞控心跳无效；请检查飞控供电、接线和波特率")
             conflicts = self.mavros_process_conflicts()
             if conflicts:
                 raise ValueError("仍有 MAVROS 或控制进程 PID " + str(conflicts) + "；请先落地后停止基础链路，修复不会强杀进程")
@@ -602,6 +600,7 @@ class RemoteRuntime:
         finally:
             with self.state.lock:
                 self.state.starting = False
+                self.repairing = False
 
 
     @staticmethod
@@ -824,14 +823,17 @@ class RemoteRuntime:
             if owners:
                 failures.append(self.state.config[key] + " 仍被 PID " + str(owners) + " 占用")
         for name, child in self.children.items():
-            if child.poll() is None:
+            # stop() deliberately preserves the shared ROS master.
+            if name != "roscore" and child.poll() is None:
                 failures.append("启动进程仍存活: " + name)
         if failures:
             raise ValueError("停止未完成；" + "；".join(failures))
 
-    def stop(self, config=None):
+    def stop(self, config=None, _repair=False):
         """Stop this console's test pipeline, preserving ROS master and SSH."""
         with self.state.lock:
+            if getattr(self, "repairing", False) and not _repair:
+                raise ValueError("正在执行地面恢复，请等待 MAVROS 重启结果")
             if getattr(self, "stopping", False):
                 raise ValueError("正在终止现有进程，请等待结束")
             snapshot = self.state.snapshot()
@@ -852,7 +854,7 @@ class RemoteRuntime:
                     return Path('/proc', str(pid), 'cmdline').read_bytes() == original
                 except OSError:
                     return False
-            for sig, delay in ((signal.SIGINT, 3.0), (signal.SIGTERM, 2.0), (signal.SIGKILL, .3)):
+            for sig, delay in ((signal.SIGINT, 3.0), (signal.SIGTERM, 2.0), (signal.SIGKILL, 2.0)):
                 # Include replacements/children created after the first scan.
                 targets.update(self.stop_processes())
                 for pid, original in list(targets.items()):
@@ -872,7 +874,7 @@ class RemoteRuntime:
                 self.children.pop(name, None)
             with self.state.lock:
                 self.state.pending_since = self.state.detach_pending_since = None
-                self.state.starting = False
+                self.state.starting = bool(getattr(self, "repairing", False))
                 self.state.launch_error = ""
             with self.state.lock:
                 self.state.samples.clear()  # Removed producers must not leave stale action state.

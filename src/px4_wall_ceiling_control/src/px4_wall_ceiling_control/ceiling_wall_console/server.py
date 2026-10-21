@@ -74,7 +74,8 @@ class Sessions:
                 raise ValueError("在线设备已达 8 台，请关闭闲置页面后稍候再登录")
             identifier = secrets.token_urlsafe(32)
             self.items[identifier] = {"transport": self.factory(label), "csrf": secrets.token_urlsafe(32),
-                                      "seen": self.clock(), "created": self.clock(), "lock": threading.Lock()}
+                                      "seen": self.clock(), "created": self.clock(), "lock": threading.Lock(),
+                                      "recovery_lock": threading.Lock()}
             return identifier
 
     def get(self, cookie):
@@ -229,7 +230,8 @@ class Application:
                         raise ValueError("请确认飞机已落地、未解锁且电机停止")
                     if action == "push" and type(data.get("enabled")) is not bool:
                         raise ValueError("enabled 必须为布尔值")
-                    if not item["lock"].acquire(blocking=False):
+                    action_lock = item["recovery_lock"] if action == "repair_mavros" else item["lock"]
+                    if not action_lock.acquire(blocking=False):
                         return self.respond(409, {"error": "已有操作等待回执，请勿重复提交"})
                     try:
                         if action == "start":
@@ -245,7 +247,7 @@ class Application:
                         else:
                             result = item["transport"].request(action, data if action in ("stop", "push", "repair_mavros", 'mock_scenario') else None)
                     finally:
-                        item["lock"].release()
+                        action_lock.release()
                     return self.respond(200, result)
                 except (ValueError, TypeError, KeyError, OSError) as error:
                     return self.respond(409, {"error": str(error)})

@@ -87,6 +87,27 @@ class SharedTests(unittest.TestCase):
         snapshot["status"]["runtime"]["fresh"]=True;snapshot["status"]["phase"]["value"]="ACTIVE"
         self.assertFalse(self.bridge.safe_transfer())
 
+    def test_ground_recovery_with_stale_armed_cache_does_not_grant_authority(self):
+        self.bridge.request("a", "acquire")
+        snapshot = self.runtime.state.snapshot()
+        snapshot["status"]["state"].update(fresh=False, value={"connected":True,"armed":True,"mode":"OFFBOARD"})
+        self.runtime.state = Mock(snapshot=lambda:snapshot)
+        with self.assertRaises(ValueError): self.bridge.request("b", "repair_mavros")
+        self.bridge.request("b", "repair_mavros", {"grounded_confirmed":True})
+        self.runtime.repair_mavros.assert_called_once()
+        self.assertEqual(self.bridge.owner, "a")
+        with self.assertRaises(ValueError): self.bridge.request("b", "wall")
+
+    def test_recovery_cannot_override_live_armed_vehicle_or_healthy_other_owner(self):
+        self.bridge.request("a", "acquire")
+        self.runtime.state.update("state", {"connected":True,"armed":False,"mode":"POSCTL"})
+        with self.assertRaises(ValueError):
+            self.bridge.request("b", "repair_mavros", {"grounded_confirmed":True})
+        self.runtime.state.update("state", {"connected":True,"armed":True,"mode":"OFFBOARD"})
+        with self.assertRaises(ValueError):
+            self.bridge.request("b", "repair_mavros", {"grounded_confirmed":True})
+        self.runtime.repair_mavros.assert_not_called()
+
     def test_explicit_release_allows_new_controller(self):
         self.bridge.request("a", "acquire")
         self.bridge.request("a", "release")

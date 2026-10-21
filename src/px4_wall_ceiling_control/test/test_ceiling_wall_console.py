@@ -247,11 +247,24 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(self.request('/api/push',bad,cookie,token)[0],409)
         self.assertTrue(self.request('/api/status',cookie=cookie)[1]['session']['push'])
 
-    def test_mavros_repair_requires_confirmation_and_control(self):
+    def test_ground_recovery_has_its_own_http_request_lock(self):
+        cookie, token = self.login()
+        self.request('/api/acquire', {}, cookie, token)
+        item = self.app.sessions.get(cookie)
+        item['lock'].acquire()
+        try:
+            self.assertEqual(self.request('/api/stop', {'grounded_confirmed':True}, cookie, token)[0], 409)
+            self.assertEqual(self.request('/api/repair-mavros', {'grounded_confirmed':True}, cookie, token)[0], 200)
+        finally:
+            item['lock'].release()
+        self.assertEqual(self.runtime.commands, ['repair_mavros'])
+
+    def test_mavros_repair_requires_confirmation_and_preserves_healthy_owner(self):
         cookie,token=self.login()
         self.assertEqual(self.request('/api/repair-mavros',{},cookie,token)[0],409)
-        self.assertEqual(self.request('/api/repair-mavros',{'grounded_confirmed':True},cookie,token)[0],409)
-        self.assertEqual(self.runtime.commands,[])
+        self.assertEqual(self.request('/api/repair-mavros',{'grounded_confirmed':True},cookie,token)[0],200)
+        self.assertEqual(self.runtime.commands,['repair_mavros'])
+        self.runtime.commands.clear()
         self.assertEqual(self.request('/api/acquire',{},cookie,token)[0],200)
         self.assertEqual(self.request('/api/repair-mavros',{'grounded_confirmed':True},cookie,token)[0],200)
         self.assertEqual(self.runtime.commands,['repair_mavros'])

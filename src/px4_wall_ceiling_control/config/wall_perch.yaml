@@ -70,7 +70,7 @@ wall_perch_decision_node:
   # 90 deg over 3 s (quintic setpoint).
   detach_time_s: 3.00
   detach_duration_timeout_s: 8.00
-  detach_max_tracking_error_deg: 40.0
+  detach_max_tracking_error_deg: 30.0
   detach_recovered_tilt_deg: 5.0
   detach_recovered_rate_deg_s: 10.0
   detach_recovered_hold_s: 0.30
@@ -163,7 +163,7 @@ wall_perch_decision_node:
   horizontal_velocity_ki: 0.30
   horizontal_integral_limit_mps2: 0.20
   horizontal_equilibrium_window_s: 0.5
-  horizontal_equilibrium_speed_mps: 0.10
+  horizontal_equilibrium_speed_mps: 0.20
   # Feedback increment around the frozen POSCTL equilibrium; final total cone remains 5deg.
   horizontal_max_acceleration_mps2: 0.30
   horizontal_target_acceleration_mps2: 0.10

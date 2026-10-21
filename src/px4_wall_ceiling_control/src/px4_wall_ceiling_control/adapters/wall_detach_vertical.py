@@ -36,6 +36,11 @@ class DepartureFeedback:
 
 
 class WallDetachVerticalMixin:
+    def _range_feedback_now(self):
+        """Share the timer's time; callbacks take a new time outside that cycle."""
+        cycle_at = getattr(self, 'detach_range_cycle_at', None)
+        return rospy.Time.now() if cycle_at is None else cycle_at
+
     def _init_detach_vertical(self):
         self.detach_vertical_controller = DepartureHeightController(
             height_kp=float(rospy.get_param('~detach_height_kp', .50)),
@@ -113,7 +118,7 @@ class WallDetachVerticalMixin:
 
     def _detach_height_loop_ready(self):
         if self._range_task_active():
-            s = self.detach_range.snapshot(rospy.Time.now().to_sec())
+            s = self.detach_range.read_snapshot(self._range_feedback_now().to_sec())
             return bool(s.valid and s.velocity_valid and not self.detach_vertical_fault)
         continuation = getattr(self, 'detach_height_continuation', None)
         return not getattr(self, 'detach_vertical_active', False) or continuation is None or continuation.ready
@@ -254,7 +259,10 @@ class WallDetachVerticalMixin:
         if not self._detach_vertical_feedback_ok(now):
             return False
         actual = self._detach_vertical_output(now)
-        if actual is None or output is not actual:
+        if actual is None:
+            return False
+        if output is not actual:
+            self.detach_vertical_reason = '脱离初始化期间最终输出消息已变化，等待一致的姿态与推力快照'
             return False
         feedback = self._height_feedback()
         base = getattr(self, 'approach_base_vertical_thrust', None)
@@ -458,7 +466,7 @@ class WallDetachVerticalMixin:
                 and flight.mode.upper() == 'OFFBOARD'
                 and is_fresh_source(flight.header.stamp, self.state_timeout_s, now)):
             return '等待有效急停反馈及新鲜已解锁OFFBOARD权限'
-        s = r.snapshot(now.to_sec())
+        s = r.read_snapshot(now.to_sec())
         if not s.valid or not s.velocity_valid:
             return '等待新鲜测距高度和有效测距速度窗口'
         output = self._valid_wall_output(now)
@@ -602,7 +610,11 @@ class WallDetachVerticalMixin:
 
     def _prepare_range_feedback(self, now):
         r = self.detach_range
-        s = r.snapshot(now.to_sec())
+        seconds = now.to_sec()
+        clock_reversed = r.last_tick is not None and seconds < r.last_tick
+        # Advance once at the cycle boundary. Queries below must stay read-only.
+        r.process(seconds)
+        s = r.read_snapshot(seconds)
         self._sync_range_lock(now)
         self.detach_range_snapshot = s
         self.detach_range_block_reason = (self.detach_vertical_fault or getattr(self, 'last_reason', '')
@@ -613,9 +625,8 @@ class WallDetachVerticalMixin:
                 self.detach_range_block_reason = '倾角已满足，等待首条有效测距；'+s.reason
             return
         self.detach_feedback_valid = bool(s.valid and self._detach_vertical_feedback_ok(now))
-        seconds = now.to_sec()
         failure = ''
-        if seconds < r.action_started:
+        if clock_reversed or seconds < r.action_started:
             failure = '测距控制时钟倒退'
         elif seconds-r.action_started >= r.config.control_timeout_s:
             failure = '测距闭环总时间预算超时'
@@ -632,18 +643,18 @@ class WallDetachVerticalMixin:
             self.detach_range_block_reason = failure
 
     def _range_height_feedback(self):
-        s = self.detach_range.snapshot(rospy.Time.now().to_sec())
+        s = self.detach_range.read_snapshot(self._range_feedback_now().to_sec())
         return (s.height, s.velocity) if s.valid else None
 
     def _range_height_settled(self, now):
-        s, c = self.detach_range.snapshot(now.to_sec()), self.detach_range.config
+        s, c = self.detach_range.read_snapshot(now.to_sec()), self.detach_range.config
         return bool(s.valid and s.velocity_valid and abs(s.target-s.height) <= c.height_tolerance_m
                     and abs(s.velocity) <= c.speed_tolerance_mps)
 
     def _range_vertical_thrust(self, now):
         self.recovery_support_valid = False
         c, r = self.detach_vertical_controller, self.detach_range
-        s = r.snapshot(now.to_sec())
+        s = r.read_snapshot(now.to_sec())
         flight = getattr(self, 'flight_state', None)
         if not (flight and flight.connected and flight.armed and flight.mode.upper() == 'OFFBOARD'
                 and is_fresh_receipt(self.flight_state_received_at, self.state_timeout_s, now)
@@ -692,7 +703,7 @@ class WallDetachVerticalMixin:
 
     def _range_stability_ready(self, now):
         """All gates run continuously; duplicate timer ticks add no samples."""
-        s, c = self.detach_range.snapshot(now.to_sec()), self.detach_range.config
+        s, c = self.detach_range.read_snapshot(now.to_sec()), self.detach_range.config
         reason = ''
         if self.detach_range_faulted or self.state == W.STATE_ABORT:
             reason = '本轮异常，不能标记正常交回'
@@ -749,7 +760,7 @@ class WallDetachVerticalMixin:
         if r is None:
             return
         now = status.header.stamp.to_sec()
-        s = r.snapshot(now)
+        s = r.read_snapshot(now)
         names = ('NONE', 'ROTATING_TO_RANGE_ENTRY', 'RANGE_HEIGHT_CONTROL', 'HANDOVER_READY', 'FAULT', 'COMPLETED')
         phase = getattr(self, 'detach_task_phase', 'NONE')
         status.detach_task_phase = names.index(phase)

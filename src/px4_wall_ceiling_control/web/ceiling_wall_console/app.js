@@ -31,8 +31,16 @@ function view(s,busy=false){
   else if(s.can_ceiling_detach)detachReason="脱离入口已就绪";
   const canAttach=control && complete && !busy && !!s.can_ceiling;
   const canDetach=control && complete && !!fresh(s,"setpoint") && !busy && !!s.can_ceiling_detach;
-  const canRepair=control&&!busy&&!s.starting&&!s.status?.state?.value?.armed&&!s.status?.runtime?.value?.enabled;
+  const canRepair=maintenanceView(s,busy).canRepair;
   return {live,control,runtime,state,ceiling,phase,owner,kill,enabled,editable,canStart:editable,canRepair,canAttach,canDetach,reasons,detachReason,stage,reason,step};
+}
+function maintenanceView(s,busy=false,recoveryBusy=false){
+  const linked=!!s.ssh?.connected,flight=fresh(s,"state"),armed=!!flight?.armed;
+  const recovering=recoveryBusy||s.mavros_repair?.state==="RUNNING";
+  const recoveryAuthority=!!s.session?.control||!flight?.connected||!s.session?.owner||s.session?.owner_connected===false;
+  const repairReason=!linked?"测试台反馈服务未连接，等待连接恢复":recovering?"正在恢复，请等待结果":armed?"飞控仍已解锁，请先落地上锁":s.starting?"正在启动，请先停止基础链路":!recoveryAuthority?"其他在线设备持有控制权，请由控制端操作":"";
+  const stopReason=!linked?"测试台反馈服务未连接，等待连接恢复":recovering?"正在恢复，请等待结果":!s.session?.control?"停止需要控制权；失联时可使用地面恢复":armed?"飞控仍已解锁，请先落地上锁":busy?"其他操作等待回执":"";
+  return {canRepair:!repairReason,canStop:!stopReason,repairReason,stopReason};
 }
 const wallTranslations = {
   initialized:"等待贴墙指令", "PX4 entered OFFBOARD":"飞控已进入 OFFBOARD",
@@ -105,25 +113,25 @@ function rangeView(s,busy=false){
   return {active,wall,canSetHeight,target:wall?.detach_range_manual_target_m??s.config?.detach_range_manual_target_m??1.5,
     reason:canSetHeight?"可提交固定目标；保留实测高度和首帧证据":s.set_range_height_blockers?.[0]||wall?.detach_range_manual_block_reason||"等待离墙回平、有效测距及控制权限"};
 }
-if(typeof module!=="undefined")module.exports={view,fresh,wallView,rangeView};
+if(typeof module!=="undefined")module.exports={view,fresh,wallView,rangeView,maintenanceView};
 if(typeof document!=="undefined"){
 const $=id=>document.getElementById(id),form=$("config");
-let latest=null,token="",busy=false,loaded=false,polling=false,wasDetaching=false;
+let latest=null,token="",busy=false,recoveryBusy=false,loaded=false,polling=false,wasDetaching=false;
 const text=(id,value)=>{$(id).textContent=value;};
 const n=(v,d=2)=>typeof v==="number"&&Number.isFinite(v)?v.toFixed(d):"—";
 const summarize=items=>items.slice(0,2).join("；")+(items.length>2?"（另有 "+(items.length-2)+" 项，见贴墙就绪检查）":"");
 const tell=(v,error=false)=>{text("message",v);$("message").classList.toggle("error",error);};
 function paint(s){
-  latest=s;token=s.token||"";const v=view(s,busy),w=wallView(s,busy),paused=s.session?.push===false;
+  latest=s;token=s.token||"";const v=view(s,busy||recoveryBusy),w=wallView(s,busy||recoveryBusy),paused=s.session?.push===false,m=maintenanceView(s,busy,recoveryBusy);
   $("dot").classList.toggle("live",v.live);text("connection",paused?"实时反馈已暂停":v.live?"实时反馈已连接":"实时反馈未连接");text("host",s.ssh?.host||"树莓派 ROS1 · SSH");
   text("session",(s.session?.control?"本机为控制端":s.session?.owner?"本机为观察端 · 当前控制端："+s.session.owner:"本机为观察端 · 申请控制权后可操作")+" · 在线 "+(s.session?.clients||0)+" 台"+(paused?" · 反馈暂停中":""));
   text("control",s.session?.control?"释放控制权":"申请控制权");$("control").disabled=busy||!s.ssh?.connected||(!s.session?.control&&!!s.session?.owner);
   text("push",paused?"恢复实时反馈":"暂停实时反馈");$("push").disabled=busy||!s.ssh?.connected;
-  $("repairMavros").disabled=!v.canRepair;
-  text("repairMavros",s.mavros_repair?.state==="RUNNING"?"正在修复 MAVROS…":"修复 MAVROS 连接");
-  text("repairStatus",s.mavros_repair&&s.mavros_repair.state!=="IDLE"?s.mavros_repair.reason:"连接超时时使用；先落地上锁并停止基础链路。沿用已保存的飞控串口与波特率。");
+  $("repairMavros").disabled=!m.canRepair;$("repairMavros").title=m.repairReason;
+  text("repairMavros",s.mavros_repair?.state==="RUNNING"?"正在重启 MAVROS…":"重启 MAVROS（地面恢复）");
+  text("repairStatus",m.repairReason||(s.mavros_repair&&s.mavros_repair.state!=="IDLE"?s.mavros_repair.reason:"先确认落地、上锁且电机停止；自动清理旧控制、雷达和日志，再重启 MAVROS。成功后手动启动基础链路。"));
   $("start").disabled=!v.canStart;$("attach").disabled=!v.canAttach;$("detach").disabled=!v.canDetach;
-  $("stop").disabled=busy||!s.session?.control||!s.ssh?.connected||!!s.status?.state?.value?.armed||!!s.starting;
+  $("stop").disabled=!m.canStop;$("stop").title=m.stopReason;text("stopStatus",m.stopReason||"落地上锁后可停止；飞控反馈过期时需人工确认电机已停止。");
   $("wallAction").disabled=!w.canWall;$("wallDetach").disabled=!w.canDetach;
   $("cancelWait").hidden=!s.can_cancel_wait;$("cancelWait").disabled=!w.canCancel;
   text("wallBlockReason",w.canWall?"贴墙入口已就绪":summarize(w.blockers)||"等待贴墙入口条件");
@@ -194,12 +202,16 @@ function paint(s){
   text("bridgeError",s.ssh?.error||s.launch_error||"");
   if(s.events?.length)$("events").replaceChildren(...s.events.slice(-18).reverse().map(event=>{const el=document.createElement("div"),time=document.createElement("time"),body=document.createElement("span");el.className="event";time.textContent=new Date(event.time*1000).toLocaleTimeString("zh-CN",{hour12:false});body.textContent=event.text;el.append(time,body);return el;}));
 }
-async function action(path,data={}){
-  if(busy)return;busy=true;if(latest)paint(latest);
-  tell(path==="/api/start"?"配置并启动请求已提交，等待回执…":"请求已提交，等待回执…");
-  try{const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Console-Token":token},body:JSON.stringify(data),signal:AbortSignal.timeout(10000)});const result=await response.json();if(response.status===401){window.location.replace("/login");return;}if(!response.ok)throw new Error(result.error||"请求失败");tell(result.message||"请求已发送，请观察节点执行状态");}
-  catch(error){tell(error.name==="TimeoutError"?"回执超时，执行结果未知；请核对实时状态，页面不会自动重发":error.message,true);}
-  finally{busy=false;await poll();}
+async function action(path,data={},recovery=false){
+  if(recovery?recoveryBusy:(busy||recoveryBusy))return;
+  if(recovery)recoveryBusy=true;else busy=true;
+  try{
+    if(latest)paint(latest);
+    tell(path==="/api/start"?"配置并启动请求已提交，等待回执…":"请求已提交，等待回执…");
+    const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Console-Token":token},body:JSON.stringify(data),signal:AbortSignal.timeout(path==="/api/stop"?20000:10000)});
+    const result=await response.json();if(response.status===401){window.location.replace("/login");return;}if(!response.ok)throw new Error(result.error||"请求失败");tell(result.message||"请求已发送，请观察节点执行状态");
+  }catch(error){tell(error.name==="TimeoutError"?"回执超时，执行结果未知；请核对实时状态，页面不会自动重发":error.message,true);}
+  finally{if(recovery)recoveryBusy=false;else busy=false;await poll();}
 }
 $("control").addEventListener("click",()=>action(latest?.session?.control?"/api/release":"/api/acquire"));
 $("push").addEventListener("click",()=>action("/api/push",{enabled:latest?.session?.push===false}));
@@ -208,7 +220,7 @@ $("wallDetach").addEventListener("click",()=>{if(latest&&wallView(latest,busy).c
 $("setRangeHeight").addEventListener("click",()=>{if(latest&&rangeView(latest,busy).canSetHeight)action("/api/set-range-height");});
 $("mockScenario").addEventListener("change",()=>action("/api/mock-scenario",{scenario:$("mockScenario").value}));
 $("cancelWait").addEventListener("click",()=>{if(latest&&wallView(latest,busy).canCancel)action("/api/cancel-wait");});
-$("repairMavros").addEventListener("click",()=>{if(!latest||!view(latest,busy).canRepair)return;if(confirm("确认飞机已落地、未解锁且电机已停止？将检查并清理失效的 MAVROS 登记，重新连接飞控；不会启动顶吸或侧吸程序。"))action("/api/repair-mavros",{grounded_confirmed:true});});
+$("repairMavros").addEventListener("click",()=>{if(!latest||!maintenanceView(latest,busy,recoveryBusy).canRepair)return;if(confirm("确认飞机已落地、上锁且电机已停止？反馈过期时必须现场核实。将停止控制、雷达和日志，清理旧链路并重启 MAVROS；成功后需手动启动基础链路。"))action("/api/repair-mavros",{grounded_confirmed:true},true);});
 $("start").addEventListener("click",()=>{if(!latest||!view(latest,busy).canStart||!form.reportValidity())return;const data=Object.fromEntries(new FormData(form));data.baud=Number(data.baud);data.hover_thrust=Number(data.hover_thrust);data.detach_range_manual_target_m=Number(data.detach_range_manual_target_m);action("/api/start",data);});
 $("attach").addEventListener("click",()=>{if(latest&&view(latest,busy).canAttach){wasDetaching=false;action("/api/ceiling");}});
 $("detach").addEventListener("click",()=>{if(latest&&view(latest,busy).canDetach)action("/api/ceiling-detach");});

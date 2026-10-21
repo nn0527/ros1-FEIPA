@@ -58,6 +58,15 @@ class SharedBridge:
                       snapshot["status"]["owner"]["fresh"] and
                       snapshot["status"]["owner"]["value"] == 0)))
 
+    def recovery_available(self):
+        """Ground cleanup can recover lost authority, never grant flight control."""
+        flight = self.runtime.state.snapshot()["status"]["state"]
+        value = flight.get("value") or {}
+        if flight["fresh"] and value.get("armed"):
+            return False
+        return (not flight["fresh"] or not value.get("connected")
+                or not self.owner or self.owner not in self.clients)
+
     def request(self, identifier, action, config=None):
         with self.lock:
             meta = self.metadata(identifier)
@@ -80,9 +89,12 @@ class SharedBridge:
                 return {"message": "已释放控制权"}
             if action not in ("start", "wall", "detach", "ceiling", "ceiling_detach", "cancel_wait", "rc_takeover", "set_range_height", "stop", "repair_mavros"):
                 raise ValueError("未知操作")
-            if not meta["control"]:
+            recovery = (action == "repair_mavros"
+                        and (config or {}).get("grounded_confirmed") is True
+                        and self.recovery_available())
+            if not meta["control"] and not recovery:
                 raise ValueError("当前为观察端；请先申请控制权")
-            if not meta["push"] and action != "stop":
+            if not meta["push"] and action not in ("stop", "repair_mavros"):
                 raise ValueError("实时反馈已暂停，动作未发送")
             # Ownership checks and dispatch are one critical section.
             return getattr(self.runtime, action)(config) if action in ("start", "stop", "repair_mavros") else getattr(self.runtime, action)()

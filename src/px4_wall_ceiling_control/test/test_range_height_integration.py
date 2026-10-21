@@ -87,6 +87,49 @@ class RangeDetachNodeTests(unittest.TestCase):
         self.assertFalse(n.detach_range.velocity_valid)
         self.assertTrue(math.isnan(n.detach_range.velocity))
 
+    def test_reading_feedback_later_in_tick_cannot_lock_with_a_future_start(self):
+        n = self.n
+        self.seconds = 10.25
+        self.fx.feedback(n, 10.25, source=10.24, tilt=7.)
+        self.fx.output(n, 10.28, tilt=7.)
+        message = OpticalFlowRad(distance=1.13)
+        message.header.stamp = at(10.2501)
+        n._on_detach_range(message)
+        self.assertFalse(n.detach_range.locked)
+        tick = at(10.28)
+        # Crossing the pose-wait deadline during a query used to lock with
+        # a timestamp 0.711 ms newer than the outer control cycle's time.
+        self.seconds = 10.280711
+        n._detach_height_loop_ready()
+        self.assertFalse(n.detach_range.locked)
+        n._prepare_range_feedback(tick)
+        self.assertFalse(n.detach_range_faulted)
+        self.seconds = 10.30
+        n._prepare_range_feedback(at(self.seconds))
+        self.assertTrue(n.detach_range.locked)
+        self.assertEqual(n.detach_range.action_started, self.seconds)
+        self.assertEqual(n.detach_task_phase, 'RANGE_HEIGHT_CONTROL')
+        self.assertFalse(n.detach_vertical_fault)
+
+    def test_real_clock_reversal_still_faults_the_range_task(self):
+        self.frame(10.25, angle=7.)
+        self.frame(10.5, angle=7.)
+        self.seconds = 10.4  # Later than lock time, earlier than last update.
+        self.n._prepare_range_feedback(at(self.seconds))
+        self.assertTrue(self.n.detach_range_faulted)
+        self.assertIn('时钟倒退', self.n.detach_vertical_fault)
+
+    def test_cycle_time_is_shared_and_cleared_after_exception(self):
+        n = self.n
+        def inside(now):
+            self.seconds += .000711
+            self.assertEqual(n._range_feedback_now(), now)
+            raise RuntimeError('cycle interrupted')
+        with mock.patch.object(n, '_control_cycle_at', side_effect=inside):
+            with self.assertRaisesRegex(RuntimeError, 'cycle interrupted'):
+                n._control_cycle(None)
+        self.assertEqual(n._range_feedback_now(), at(self.seconds))
+
     def test_old_z_and_world_vz_cannot_change_range_control_or_height_gate(self):
         outputs = []
         for height, vz in ((2.4, .4), (-999., -99.), (math.nan, math.nan)):

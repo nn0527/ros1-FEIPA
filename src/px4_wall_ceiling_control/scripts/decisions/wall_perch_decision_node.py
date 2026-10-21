@@ -190,7 +190,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         )
         self.detach_request_timeout_s = float(rospy.get_param("~detach_request_timeout_s", 8.0))
         self.detach_duration_timeout_s = float(rospy.get_param("~detach_duration_timeout_s", 8.0))
-        self.detach_max_tracking_error_rad = math.radians(float(rospy.get_param("~detach_max_tracking_error_deg", 40.0)))
+        self.detach_max_tracking_error_rad = math.radians(float(rospy.get_param("~detach_max_tracking_error_deg", 30.0)))
         self.detach_recovered_tilt_rad = math.radians(float(rospy.get_param("~detach_recovered_tilt_deg", 5.0)))
         self.detach_recovered_rate_rps = math.radians(float(rospy.get_param("~detach_recovered_rate_deg_s", 10.0)))
         self.detach_recovered_hold_s = float(rospy.get_param("~detach_recovered_hold_s", .30))
@@ -1219,12 +1219,13 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
 
     def _vertical_speed_safe(self):
         if self._range_locked():
-            s = self.detach_range.snapshot(rospy.Time.now().to_sec())
+            now = self._range_feedback_now().to_sec()
+            s = self.detach_range.read_snapshot(now)
             # Single-frame/short-loss support has no invented velocity. Stability
             # still requires valid range velocity through _range_height_settled.
             return bool((s.valid and (not s.velocity_valid or s.velocity >= -self.max_down_velocity_mps))
                         or (self.detach_range.invalid_since is not None
-                            and rospy.Time.now().to_sec()-self.detach_range.invalid_since < self.detach_range.config.loss_support_s))
+                            and now-self.detach_range.invalid_since < self.detach_range.config.loss_support_s))
         if self.odom is None:
             return False
         velocity_z = vertical_speed_enu_mps(
@@ -1327,7 +1328,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
 
     def _detach_height_settled(self):
         if self._range_locked():
-            return self._range_height_settled(rospy.Time.now())
+            return self._range_height_settled(self._range_feedback_now())
         if getattr(self, "bench_wait_for_ranges", False):
             return self._height_feedback() is not None
         if getattr(self, 'state', None) != WallPerchStatus.STATE_ABORT and not self._detach_height_loop_ready():
@@ -2184,7 +2185,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         elapsed = self.detach_elapsed_s
         proposed = min(self.detach_time_s, elapsed + self.detach_step_dt)
         measured = self._current_quaternion() if self._odom_fresh(now) else None
-        limit = getattr(self, "detach_max_tracking_error_rad", math.radians(40.))
+        limit = getattr(self, "detach_max_tracking_error_rad", math.radians(30.))
         def error(seconds):
             target = self._quat_slerp(self.q_detach_start, self.q_hover,
                                      self._smoothstep5(seconds / self.detach_time_s))
@@ -2622,6 +2623,13 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
 
     def _control_cycle(self, _event):
         now = rospy.Time.now()
+        self.detach_range_cycle_at = now
+        try:
+            self._control_cycle_at(now)
+        finally:
+            self.detach_range_cycle_at = None
+
+    def _control_cycle_at(self, now):
         if self.previous_update_at is None:
             self.control_dt = 0.02
         else:

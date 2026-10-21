@@ -119,6 +119,92 @@ class ConsoleTests(unittest.TestCase):
         thread.assert_not_called()
 
 
+    def test_repair_accepts_running_chain_and_stale_armed_cache_only_with_confirmation(self):
+        for stale in (False, True):
+            runtime = self.stop_runtime()
+            runtime.state.update('runtime', {'enabled':True})
+            runtime.state.update('phase', 'CANCELING_ENTRY')
+            if stale:
+                snapshot = runtime.state.snapshot()
+                snapshot['status']['state'].update(fresh=False, value={'armed':True})
+                runtime.state.snapshot = lambda:snapshot
+            with mock.patch.object(server.threading, 'Thread') as thread:
+                with self.assertRaises(ValueError): runtime.repair_mavros({})
+                runtime.repair_mavros({'grounded_confirmed':True})
+                thread.assert_called_once()
+            self.assertTrue(runtime.repairing)
+            with self.assertRaises(ValueError): runtime.start(dict(DEFAULT_CONFIG))
+
+    def test_repair_rejects_fresh_armed_state(self):
+        runtime = self.stop_runtime()
+        runtime.state.update('state', {'connected':True, 'armed':True, 'mode':'OFFBOARD'})
+        with mock.patch.object(server.threading, 'Thread') as thread:
+            with self.assertRaises(ValueError): runtime.repair_mavros({'grounded_confirmed':True})
+            thread.assert_not_called()
+
+    def test_repair_stops_old_chain_before_starting_unique_mavros(self):
+        runtime = self.stop_runtime()
+        runtime.repairing = True
+        runtime.state.starting = True
+        runtime.state.update('runtime', {'enabled':True})
+        runtime.state.update('phase', 'CANCELING_ENTRY')
+        runtime.nodes = mock.Mock(return_value={'/rosout'})
+        runtime.init_ros = mock.Mock()
+        runtime.port_owners = mock.Mock(return_value=[])
+        runtime.mavros_process_conflicts = mock.Mock(return_value=[])
+        runtime.require_mavros_task_isolation = mock.Mock()
+        order = []
+        def stop(*args, **kwargs):
+            order.append('stop')
+            runtime.state.samples.clear()
+            runtime.state.update('runtime', {'enabled':False})
+        runtime.stop = mock.Mock(side_effect=stop)
+        def spawn(name, args):
+            order.append(name)
+            self.assertEqual(name, 'mavros')
+            runtime.children[name] = mock.Mock(poll=lambda:None)
+            runtime.state.update('state', {'connected':True,'armed':False,'mode':'POSCTL'})
+        runtime.spawn = mock.Mock(side_effect=spawn)
+        with mock.patch.object(server.Path, 'is_char_device', return_value=True):
+            runtime.repair_mavros_worker()
+        self.assertEqual(order, ['stop', 'mavros'])
+        self.assertEqual(runtime.state.mavros_repair['state'], 'SUCCEEDED')
+        self.assertFalse(runtime.state.starting)
+        self.assertFalse(runtime.repairing)
+        self.assertFalse(runtime.state.snapshot()['status']['runtime']['value']['enabled'])
+
+    def test_repair_cleanup_failure_never_spawns_mavros_and_unlocks_retry(self):
+        runtime = self.stop_runtime()
+        runtime.repairing = True
+        runtime.state.starting = True
+        runtime.spawn = mock.Mock()
+        runtime.stop = mock.Mock(side_effect=ValueError('serial still occupied'))
+        runtime.repair_mavros_worker()
+        runtime.stop.assert_called_once_with({'grounded_confirmed':True}, _repair=True)
+        runtime.spawn.assert_not_called()
+        self.assertFalse(runtime.repairing)
+        self.assertFalse(runtime.state.starting)
+        self.assertEqual(runtime.state.mavros_repair['state'], 'FAILED')
+
+    def test_stop_verification_preserves_master_but_rejects_live_launcher(self):
+        runtime = self.stop_runtime()
+        runtime.children = {'roscore': SimpleNamespace(poll=lambda: None)}
+        with mock.patch.object(runtime, 'stop_processes', return_value={}), \
+                mock.patch.object(runtime, 'stop_ros_residuals', return_value=[]), \
+                mock.patch.object(runtime, 'port_owners', return_value=[]):
+            runtime.verify_stopped()
+            runtime.children['wall_flight'] = SimpleNamespace(poll=lambda: None)
+            with self.assertRaisesRegex(ValueError, '启动进程仍存活: wall_flight'):
+                runtime.verify_stopped()
+
+    def test_cleanup_failure_is_not_overwritten_by_old_launcher_exit(self):
+        runtime = self.stop_runtime()
+        runtime.stop_requested = True
+        runtime.children = {'wall_flight': SimpleNamespace(poll=lambda: 0)}
+        runtime.state.launch_error = '停止核验失败：serial still occupied'
+        runtime.update_process_errors({'enabled': False, 'nodes': []})
+        self.assertEqual(runtime.state.launch_error, '停止核验失败：serial still occupied')
+
     def test_stop_rejects_armed_or_expired_state(self):
         runtime = object.__new__(server.RemoteRuntime)
         runtime.state = ConsoleState()

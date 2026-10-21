@@ -85,19 +85,19 @@ class EquilibriumHandoverTests(unittest.TestCase):
         for t in (10.,10.25,10.5,10.75,11.,11.25,11.5):self.sample(t)
         self.assertTrue(self.n.horizontal_equilibrium.ready)
         self.assertTrue(self.n.horizontal_velocity_ready)
-    def test_equilibrium_requires_half_second_below_ten_centimetres_per_second(self):
-        self.assertAlmostEqual(self.n.horizontal_equilibrium_speed,.10)
+    def test_equilibrium_requires_half_second_below_twenty_centimetres_per_second(self):
+        self.assertAlmostEqual(self.n.horizontal_equilibrium_speed,.20)
         self.assertAlmostEqual(self.n.horizontal_equilibrium.window,.5)
-        for t in (10.,10.25,10.5,10.75,11.,11.25,11.5):self.sample(t,velocity=.101)
+        for t in (10.,10.25,10.5,10.75,11.,11.25,11.5):self.sample(t,velocity=.201)
         self.assertFalse(self.n.horizontal_equilibrium.ready)
-        for t in (11.75,12.):self.sample(t,velocity=.10)
+        for t in (11.75,12.):self.sample(t,velocity=.20)
         self.assertFalse(self.n.horizontal_equilibrium.ready)
-        self.sample(12.25,velocity=.10)
+        self.sample(12.25,velocity=.20)
         self.assertTrue(self.n.horizontal_equilibrium.ready)
 
-    def test_entry_uses_only_pitch_rate_with_same_ten_degree_limit(self):
+    def test_entry_uses_only_pitch_rate_with_twenty_degree_limit(self):
         self.capture()
-        for i, (rate, expected) in enumerate(((10., True), (-10., True), (10.01, False), (-10.01, False), (float('nan'), False))):
+        for i, (rate, expected) in enumerate(((20., True), (-20., True), (20.01, False), (-20.01, False), (float('nan'), False))):
             with mock.patch.object(self.n.horizontal_equilibrium, 'observe') as observe:
                 self.sample(11.75+i*.25, rates=(60., rate, -60.))
                 self.assertEqual(observe.call_args[0][2], expected)
@@ -111,7 +111,7 @@ class EquilibriumHandoverTests(unittest.TestCase):
                 self.assertEqual(observe.call_args[0][2],expected)
 
     def test_no_entry_baseline_from_moving_or_untracked_attitude(self):
-        for t in (10.,10.25,10.5,10.75,11.):self.sample(t,velocity=.2)
+        for t in (10.,10.25,10.5,10.75,11.):self.sample(t,velocity=.3)
         self.assertFalse(self.n.horizontal_equilibrium.ready)
         for t in (11.25,11.5,11.75,12.,12.25):self.sample(t,actual=-3.)
         self.assertFalse(self.n.horizontal_equilibrium.ready)
