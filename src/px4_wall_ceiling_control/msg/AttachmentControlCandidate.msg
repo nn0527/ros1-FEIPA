@@ -38,3 +38,10 @@ bool approach_paused
 # bounded by the mux global cap; it is not a request to bypass hard limits.
 bool recovery_support_valid
 float32 recovery_thrust_limit
+
+# Atomic with this candidate's phase, attitude and collective. A range outage
+# may retain bounded support; range_feedback_valid then remains false.
+uint8 detach_task_phase
+uint32 detach_range_episode
+bool range_height_control
+bool range_feedback_valid

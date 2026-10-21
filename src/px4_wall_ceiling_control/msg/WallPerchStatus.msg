@@ -124,6 +124,8 @@ float32 detach_vertical_base_thrust
 float32 detach_vertical_integral
 bool detach_vertical_integral_active
 bool detach_vertical_saturated
+bool detach_vertical_slew_limited
+float32 detach_vertical_requested_thrust
 float32 detach_vertical_support_weight
 float32 detach_height_error_m
 # Clearance is evaluated with the front sensor after actual return to level.
@@ -133,3 +135,48 @@ string departure_clearance_reason
 float32 recovery_horizontal_integral_x
 float32 recovery_horizontal_integral_y
 bool recovery_horizontal_integral_active
+
+# Independent departure task phases. Existing STATE_* numbers stay unchanged.
+uint8 DETACH_TASK_NONE=0
+uint8 DETACH_TASK_ROTATING_TO_RANGE_ENTRY=1
+uint8 DETACH_TASK_RANGE_HEIGHT_CONTROL=2
+uint8 DETACH_TASK_HANDOVER_READY=3
+uint8 DETACH_TASK_FAULT=4
+uint8 DETACH_TASK_COMPLETED=5
+uint8 detach_task_phase
+string detach_task_phase_name
+bool detach_range_height_enabled
+uint32 detach_range_episode
+string detach_range_maneuver_id
+time detach_request_time
+time detach_rotation_start_time
+bool detach_range_target_locked
+string detach_range_source
+float32 detach_range_target_m
+float32 detach_range_height_m
+float32 detach_range_raw_m
+float32 detach_range_projected_m
+float32 detach_range_velocity_mps
+bool detach_range_velocity_valid
+bool detach_range_valid
+float32 detach_range_current_tilt_deg
+float32 detach_range_sample_tilt_deg
+float32 detach_range_pose_match_dt_s
+float32 detach_range_entry_tilt_deg
+time detach_range_source_time
+time detach_range_received_time
+time detach_range_lock_source_time
+time detach_range_lock_received_time
+float32 detach_range_lock_raw_m
+float32 detach_range_lock_height_m
+float32 detach_range_lock_tilt_deg
+uint32 detach_range_velocity_samples
+float32 detach_range_age_s
+float32 detach_range_stable_elapsed_s
+uint32 detach_range_stable_samples
+bool detach_range_handover_ready
+string detach_range_block_reason
+string detach_range_config_json
+string detach_range_rejections_json
+time detach_posctl_request_time
+time detach_posctl_confirmed_time

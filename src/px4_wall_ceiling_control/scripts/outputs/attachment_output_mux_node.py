@@ -16,6 +16,7 @@ from px4_wall_ceiling_control.adapters.kill_switch import install_kill_guard, ki
 from px4_wall_ceiling_control.adapters.mavros_setpoint import MavrosSetpointBuilder
 from px4_wall_ceiling_control.adapters.odometry import (
     odometry_is_finite,
+    odometry_attitude_horizontal_is_finite,
     vertical_speed_enu_mps,
 )
 from px4_wall_ceiling_control.domain.geometry import (
@@ -408,6 +409,13 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
             if (not math.isfinite(cap)
                     or not self.min_thrust <= cap <= self.max_thrust + 1e-6):
                 return "invalid_recovery_support_limit"
+        if getattr(message, 'range_height_control', False) and (
+                message.kind != AttachmentControlCandidate.KIND_ATTITUDE_THRUST
+                or message.detach_range_episode <= 0
+                or message.detach_task_phase not in (2, 3, 4)
+                or message.control_phase not in (WallPerchStatus.STATE_DETACH_ROTATE,
+                    WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT, WallPerchStatus.STATE_ABORT)):
+            return 'range_phase_payload_mismatch'
         return ""
 
     def _retire_wall_maneuver(self):
@@ -825,6 +833,12 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
         if getattr(self, "owner", self.OWNER_NONE) == self.OWNER_WALL and not is_fresh_source(
                 self.odom.header.stamp, self.odom_timeout_s, now):
             return False
+        snapshot = getattr(self, 'wall_candidate_snapshot', None)
+        candidate = snapshot[0] if snapshot is not None else None
+        if (getattr(self, 'owner', self.OWNER_NONE) == self.OWNER_WALL
+                and candidate is not None and getattr(candidate, 'range_height_control', False)
+                and self._wall_fresh(now)):
+            return odometry_attitude_horizontal_is_finite(self.odom, self.odom_twist_in_child_frame)
         return odometry_is_finite(self.odom)
 
     def _get_setpoint_builder(self):
@@ -1427,6 +1441,10 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
                 "maneuver_id": candidate.maneuver_id,
                 "control_sequence": candidate.control_sequence,
                 "control_phase": candidate.control_phase,
+                "detach_task_phase": candidate.detach_task_phase,
+                "detach_range_episode": candidate.detach_range_episode,
+                "range_height_control": candidate.range_height_control,
+                "range_feedback_valid": candidate.range_feedback_valid,
                 "generated_at_s": candidate.header.stamp.to_sec(),
                 "received_at_s": snapshot[1].to_sec(),
                 "published_at_s": published_at.to_sec(),

@@ -6,7 +6,9 @@ tested without importing ROS message packages.
 
 import math
 
-from px4_wall_ceiling_control.freshness import clamp
+def clamp(value, lower, upper):
+    # Keep geometry (and source-timed range replay) independent of rospy.
+    return max(lower, min(upper, value))
 
 
 def quaternion_multiply(a, b):

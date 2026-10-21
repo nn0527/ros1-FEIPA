@@ -8,6 +8,7 @@ its attitude prestream and uses MAVROS only to change flight modes.
 import threading
 import time
 import math
+import json
 
 import rospy
 from mavros_msgs.msg import EstimatorStatus, OpticalFlowRad, RCIn, State
@@ -18,6 +19,7 @@ from px4_wall_ceiling_control.adapters.kill_switch import install_kill_guard, ki
 
 from px4_wall_ceiling_control.adapters.odometry import (
     odometry_is_finite,
+    odometry_attitude_horizontal_is_finite,
     vertical_speed_enu_mps,
 )
 from px4_wall_ceiling_control.domain.geometry import euler_from_quaternion
@@ -218,6 +220,8 @@ class FlightModeManagerNode(RCTakeoverManager):
         rospy.Subscriber('/mavros/px4flow/raw/optical_flow_rad', OpticalFlowRad,
                          self._on_wall_fusion_flow, queue_size=1)
         self.set_mode = rospy.ServiceProxy("/mavros/set_mode", SetMode)
+        self.range_handover_pub = rospy.Publisher('/wall_perch/handover_readiness', String, queue_size=10)
+        self.range_posctl_request = None
         self._init_rc_takeover_manager()
         self.timer = rospy.Timer(rospy.Duration(0.1), self._on_timer)
         if rospy.get_param("~motor_output_telemetry_enabled", False):
@@ -256,6 +260,18 @@ class FlightModeManagerNode(RCTakeoverManager):
             time.sleep(2)
 
     def _on_flight(self, message):
+        if self._wall_range_mode() and message.connected and message.armed:
+            now = rospy.Time.now()
+            identity = self._wall_range_identity()
+            previous = getattr(self, 'range_flight_source', None)
+            if (not is_fresh_source(message.header.stamp, self.state_timeout_s, now)
+                    or (previous is not None and previous[0] == identity and message.header.stamp <= previous[1])):
+                return
+            request = getattr(self, 'range_posctl_request', None)
+            if (message.mode.upper() == 'POSCTL' and request is not None and request[0] == identity
+                    and message.header.stamp.to_sec() <= request[1]):
+                return  # A pre-request cached POSCTL message cannot confirm this RPC.
+            self.range_flight_source = (identity, message.header.stamp)
         if message.connected and message.mode.upper() in ("ALTCTL", "POSCTL"):
             self.last_pilot_mode = message.mode.upper()
         self.flight, self.flight_at = message, rospy.Time.now()
@@ -844,17 +860,98 @@ class FlightModeManagerNode(RCTakeoverManager):
                          or getattr(self, "completed", False)
                          or getattr(self, "wall_fault_return_ready", False)))
 
+    def _wall_range_mode(self):
+        s = getattr(self, 'wall', None)
+        return bool(getattr(self, 'selected_mode', None) == OperatorCommand.MODE_WALL and s is not None
+                    and getattr(s, 'detach_range_height_enabled', False)
+                    and getattr(s, 'detach_range_target_locked', False)
+                    and getattr(s, 'detach_vertical_active', False))
+
+    def _wall_range_identity(self):
+        s = getattr(self, 'wall', None)
+        if not self._wall_range_mode():
+            return None
+        return (s.detach_range_maneuver_id, s.detach_range_episode)
+
+    def _wall_range_feedback_ready(self, now):
+        s = getattr(self, 'wall', None)
+        if not self._wall_range_mode() or not is_fresh(getattr(self, 'wall_at', None), self.status_timeout_s, now):
+            return False
+        if not is_fresh_source(s.header.stamp, self.status_timeout_s, now, future_tolerance_s=0.):
+            return False
+        try:
+            config = json.loads(s.detach_range_config_json)
+            timeout = float(config['timeout_s'])
+            speed_limit = float(config['speed_tolerance_mps'])
+            height_limit = float(config['height_tolerance_m'])
+            future = float(config['future_tolerance_s'])
+        except (ValueError, TypeError, KeyError):
+            return False
+        return bool(s.detach_range_valid and s.detach_range_velocity_valid
+            and math.isfinite(s.detach_range_velocity_mps)
+            and abs(s.detach_range_velocity_mps) <= min(speed_limit, self.handover_max_vertical_speed_mps)
+            and math.isfinite(s.detach_range_target_m) and math.isfinite(s.detach_range_height_m)
+            and abs(s.detach_range_target_m-s.detach_range_height_m) <= height_limit
+            and is_fresh_source(s.detach_range_source_time, timeout, now, future_tolerance_s=future)
+            and is_fresh(s.detach_range_received_time, timeout, now))
+
+    def _range_px4_rc_failure(self, now):
+        """Independent FCU takeover readiness; never uses task Z or fused vz."""
+        if not getattr(self, 'enabled', True):
+            return '模式管理器未启用自动交回'
+        if getattr(self, 'wall_pilot_mode', 'POSCTL') != 'POSCTL':
+            return '测距闭环要求交回POSCTL，请核对模式管理器配置'
+        if not kill_clear(self, now):
+            return '急停或权限状态无效'
+        e = getattr(self, 'estimator', None)
+        if e is None or not is_fresh(getattr(self, 'estimator_at', None), self.estimator_timeout_s, now):
+            return 'PX4估计就绪标志过期'
+        if not (e.attitude_status_flag and e.velocity_vert_status_flag and e.pos_vert_abs_status_flag
+                and e.velocity_horiz_status_flag and (e.pos_horiz_abs_status_flag or e.pos_horiz_rel_status_flag)):
+            return 'PX4接管所需位置/速度估计未就绪'
+        if e.const_pos_mode_status_flag:
+            return 'PX4仍处于恒位置推算模式'
+        if not self._rc_fresh(now):
+            return '等待有效遥控通道'
+        if getattr(self, 'require_rc_center', False) and not all(
+                abs(self.rc_channels[i]-self.rc_pwm_center) <= self.rc_center_tolerance_pwm
+                for i in (self.rc_roll_channel_index, self.rc_pitch_channel_index, self.rc_throttle_channel_index)):
+            return '等待遥控摇杆回中'
+        return ''
+
+    def _publish_range_handover_readiness(self, now):
+        pub = getattr(self, 'range_handover_pub', None)
+        s = getattr(self, 'wall', None)
+        if pub is None or s is None:
+            return
+        reason = self._range_px4_rc_failure(now)
+        if not is_fresh(getattr(self, 'wall_at', None), self.status_timeout_s, now):
+            reason = '侧吸状态过期'
+        request = getattr(self, 'range_posctl_request', None)
+        identity = (getattr(s, 'detach_range_maneuver_id', ''), getattr(s, 'detach_range_episode', 0))
+        pub.publish(String(data=json.dumps(dict(episode=identity[1], maneuver_id=identity[0],
+            source_time=now.to_sec(), ready=not bool(reason), reason=reason,
+            posctl_request_time=request[1] if request is not None and request[0] == identity else 0.))))
+
     def _wall_return_exit_ready(self, now):
         status = getattr(self, "wall", None)
         if (status is None or not is_fresh(getattr(self, "wall_at", None), self.status_timeout_s, now)
                 or status.state != WallPerchStatus.STATE_EXIT):
             return False
+        if self._wall_range_mode():
+            return bool(self._wall_range_feedback_ready(now)
+                and (getattr(status, 'fault_recovery_completed', False)
+                     or (status.detach_task_phase_name == 'HANDOVER_READY'
+                         and status.detach_range_handover_ready
+                         and not status.fault_detected and not getattr(self, 'fault_seen', False))))
         return bool(getattr(status, "fault_recovery_completed", False)
                     or (getattr(status, "detach_completed", False)
                         and getattr(status, "recovery_completed", False)
                         and not status.fault_detected and not getattr(self, "fault_seen", False)))
 
     def _handover_ready(self, now):
+        if self._wall_range_mode() and self._range_px4_rc_failure(now):
+            return False
         if not self._wall_fusion_handover_ready(now):return False
         if getattr(self,"wall_approach_timeout_returning",False):
             return self._wall_timeout_handover_ready(now)
@@ -875,9 +972,11 @@ class FlightModeManagerNode(RCTakeoverManager):
             and self.estimator.velocity_vert_status_flag
         ):
             return False
+        finite = (odometry_attitude_horizontal_is_finite(self.odom, self.odom_twist_in_child_frame)
+                  if self._wall_range_mode() else odometry_is_finite(self.odom))
         if self.odom is None or not is_fresh(
             self.odom_at, self.odom_timeout_s, now
-        ) or not odometry_is_finite(self.odom):
+        ) or not finite:
             return False
         if getattr(self, "ceiling_approach_timeout_returning", False):
             # This is an aborted approach, so there is no HOLD pressure baseline.
@@ -900,9 +999,12 @@ class FlightModeManagerNode(RCTakeoverManager):
             (orientation.x, orientation.y, orientation.z, orientation.w)
         )
         limit = math.radians(self.handover_max_tilt_deg)
-        vertical_speed = vertical_speed_enu_mps(
-            self.odom, self.odom_twist_in_child_frame
-        )
+        if self._wall_range_mode():
+            if not self._wall_range_feedback_ready(now):
+                return False
+            vertical_speed = self.wall.detach_range_velocity_mps
+        else:
+            vertical_speed = vertical_speed_enu_mps(self.odom, self.odom_twist_in_child_frame)
         angular = self.odom.twist.twist.angular
         if any(not math.isfinite(v) or abs(v) > 0.3 for v in (angular.x, angular.y, angular.z)):
             return False
@@ -984,12 +1086,15 @@ class FlightModeManagerNode(RCTakeoverManager):
                     self.wall_fault_return_ready = True
                     if not getattr(self, "wall_failure_reason", ""):
                         self.wall_failure_reason = str(status.reason) or "侧吸故障"
-                elif (getattr(status, "detach_completed", False)
+                elif ((getattr(status, "detach_completed", False)
                       and getattr(status, "recovery_completed", False)
+                      or (self._wall_range_mode() and self._wall_return_exit_ready(now)))
                       and not status.fault_detected and not self.fault_seen):
                     self.completed = True
 
     def _wall_return_reason(self, confirmed=False):
+        if self._wall_range_mode() and not confirmed and not getattr(self, 'wall_fault_return_ready', False):
+            return '测距闭环已稳定，准备交回POSCTL；等待新鲜飞控模式确认'
         if getattr(self, "wall_fault_return_ready", False):
             result = "故障恢复后已安全交回" if confirmed else "故障恢复完成，准备安全交回"
             return result + self._pilot_mode() + "；本次侧吸未正常完成：" + getattr(self, "wall_failure_reason", "侧吸故障")
@@ -1047,10 +1152,10 @@ class FlightModeManagerNode(RCTakeoverManager):
         self.last_request_at = now
         self.request_in_flight = True
         threading.Thread(
-            target=self._send_mode_request, args=(mode, getattr(self, "takeover_attempt", 0)), daemon=True
+            target=self._send_mode_request, args=(mode, getattr(self, "takeover_attempt", 0), self._wall_range_identity()), daemon=True
         ).start()
 
-    def _send_mode_request(self, mode, attempt=None):
+    def _send_mode_request(self, mode, attempt=None, range_identity=None):
         try:
             if mode not in ("OFFBOARD", self._pilot_mode()):
                 return
@@ -1090,6 +1195,8 @@ class FlightModeManagerNode(RCTakeoverManager):
             if attempt is not None and attempt != getattr(self, "takeover_attempt", 0):
                 return  # A canceled/previous attempt must not send a late mode change.
             if mode != "OFFBOARD" and self.phase == self.RETURNING:
+                if range_identity is not None and range_identity != self._wall_range_identity():
+                    return
                 # A flight callback can arrive while this worker waits for the
                 # service, before the timer retires RETURNING. Never override a
                 # pilot-selected mode (or a disconnected/disarmed FCU) using
@@ -1104,6 +1211,10 @@ class FlightModeManagerNode(RCTakeoverManager):
                                          self.selected_mode, time.monotonic())
             request = SetModeRequest()
             request.custom_mode = mode
+            if mode != 'OFFBOARD' and self.phase == self.RETURNING and self._wall_range_mode():
+                if not self._handover_ready(rospy.Time.now()):
+                    return
+                self.range_posctl_request = (self._wall_range_identity(), rospy.Time.now().to_sec())
             response = self.set_mode(request)
             if not response.mode_sent:
                 rospy.logwarn("PX4 did not accept %s mode request", mode)
@@ -1146,6 +1257,7 @@ class FlightModeManagerNode(RCTakeoverManager):
 
     def _on_timer(self, _event):
         now = rospy.Time.now()
+        self._publish_range_handover_readiness(now)
         if self._tick_rc_takeover_manager(now):
             return
         if not kill_clear(self, now):

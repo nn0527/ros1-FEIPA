@@ -71,6 +71,7 @@ catkin_install_python(PROGRAMS
   scripts/test_support/mock_flight_inputs_node.py
   scripts/test_support/ceiling_attachment_state_monitor.py
   scripts/test_support/wall_perch_state_monitor.py
+  scripts/test_support/replay_range_height.py
   scripts/test_support/attachment_flight_logger.py
   # Legacy generic distance-control chain.
   scripts/legacy/ceiling_controller_node.py
@@ -93,6 +94,8 @@ install(FILES README.md
 if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_rc_takeover.py)
   catkin_add_nosetests(test/test_detach_vertical.py)
+  catkin_add_nosetests(test/test_range_height_feedback.py)
+  catkin_add_nosetests(test/test_range_height_integration.py)
   catkin_add_nosetests(test/test_height_continuation.py)
   catkin_add_nosetests(test/test_bounded_detach_integration.py)
   catkin_add_nosetests(test/test_detach_vertical_authority.py)

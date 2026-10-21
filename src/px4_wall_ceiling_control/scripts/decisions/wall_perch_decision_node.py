@@ -733,6 +733,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         self.odom = message
         self.odom_source_stamp = stamp
         self.odom_received_at = now
+        self._observe_range_pose(message, now)
         if hasattr(self, "takeoff_height"):
             flight = self.flight_state
             confirmed = bool(flight is not None and flight.connected and not flight.armed
@@ -788,6 +789,13 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             self._accept_flight_state(message)
 
     def _accept_flight_state(self, message):
+        if self._range_task_active() and message.connected and message.armed:
+            now = rospy.Time.now()
+            previous = getattr(self, 'detach_range_last_flight_source', None)
+            if (not is_fresh_source(message.header.stamp, self.state_timeout_s, now)
+                    or (previous is not None and message.header.stamp <= previous)):
+                return
+            self.detach_range_last_flight_source = message.header.stamp
         previous_mode = getattr(getattr(self, "flight_state", None), "mode", "")
         self.flight_state = message
         self.flight_state_received_at = rospy.Time.now()
@@ -804,6 +812,11 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             if hasattr(self, "_reset_recovery_horizontal"):
                 self._reset_recovery_horizontal("退出本次OFFBOARD：取消退墙动作", clear_departure=True)
         if not message.armed:
+            if (getattr(self, 'detach_range_enabled', False)
+                    and getattr(self, 'detach_task_phase', 'NONE') not in ('NONE', 'COMPLETED')):
+                self.detach_range_faulted = True
+                self.detach_task_phase = 'FAULT'
+                self.detach_range_block_reason = '飞控上锁，本轮未正常完成'
             self._reset_flip_vertical_support()
             self._reset_detach_vertical()
             self.approach_takeover_thrust = self.approach_base_vertical_thrust = None
@@ -829,10 +842,13 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         self.operator_received_at = rospy.Time.now()
 
     def _on_detach(self, message):
-        if (message.data and self.state == WallPerchStatus.STATE_WALL_HOLD
-                and not self.detach_requested):
-            self.detach_requested = True
-            self.detach_requested_at = rospy.Time.now()
+        with getattr(self, 'feedback_lock', nullcontext()):
+            if (message.data and self.state == WallPerchStatus.STATE_WALL_HOLD
+                    and not self.detach_requested):
+                self.detach_requested = True
+                self.detach_requested_at = rospy.Time.now()
+                if getattr(self, 'detach_range_enabled', False):
+                    self.detach_task_phase = 'ROTATING_TO_RANGE_ENTRY'
 
     def _on_cancel(self, message):
         if message.data:
@@ -915,6 +931,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         )
 
     def _detach_start_ready(self, now):
+        if getattr(self, 'detach_range_enabled', False) and not self._range_config().installation_ready:
+            return False
         if not self._detach_pose_ready(now):
             return False
         if getattr(self, "bench_wait_for_ranges", False):
@@ -936,6 +954,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         return max(0.0, (now - self.state_entered_at).to_sec())
 
     def _detach_block_reason(self, now):
+        if getattr(self, 'detach_range_enabled', False) and not self._range_config().installation_ready:
+            return '待核对下视测距设备量程、安装轴和上游几何修正'
         if not self._odom_fresh(now) or self._height_feedback() is None:
             return "离墙高度／速度反馈无效或过期"
         q = self._current_quaternion()
@@ -1186,6 +1206,13 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                     and self._top_fresh(now))
 
     def _vertical_speed_safe(self):
+        if self._range_locked():
+            s = self.detach_range.snapshot(rospy.Time.now().to_sec())
+            # Single-frame/short-loss support has no invented velocity. Stability
+            # still requires valid range velocity through _range_height_settled.
+            return bool((s.valid and (not s.velocity_valid or s.velocity >= -self.max_down_velocity_mps))
+                        or (self.detach_range.invalid_since is not None
+                            and rospy.Time.now().to_sec()-self.detach_range.invalid_since < self.detach_range.config.loss_support_s))
         if self.odom is None:
             return False
         velocity_z = vertical_speed_enu_mps(
@@ -1204,6 +1231,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         return math.isfinite(velocity_z) and velocity_z >= -self.max_down_velocity_mps
 
     def _height_feedback(self):
+        if self._range_locked():
+            return self._range_height_feedback()
         if getattr(self, "odom", None) is None:
             return None
         altitude = self.odom.pose.pose.position.z
@@ -1285,6 +1314,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         return self._vertical_height_thrust(getattr(self, "recovery_altitude_m", None))
 
     def _detach_height_settled(self):
+        if self._range_locked():
+            return self._range_height_settled(rospy.Time.now())
         if getattr(self, "bench_wait_for_ranges", False):
             return self._height_feedback() is not None
         if getattr(self, 'state', None) != WallPerchStatus.STATE_ABORT and not self._detach_height_loop_ready():
@@ -1561,6 +1592,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             self.recovery_started_at = None
             self._reset_flip_vertical_support()
             self._reset_detach_vertical()
+            if new_state == WallPerchStatus.STATE_FRONT_WALL_DETECT:
+                self._reset_range_task()
             if hasattr(self, "_reset_recovery_horizontal"):
                 self._reset_recovery_horizontal("新动作／释放：清零恢复控制", clear_departure=True)
         rospy.loginfo(
@@ -1581,10 +1614,14 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         if new_state == WallPerchStatus.STATE_WALL_HOLD:
             self.hold_achieved = True
         if new_state == WallPerchStatus.STATE_EXIT and self.state == WallPerchStatus.STATE_RECOVER:
-            self.detach_completed = True
+            self.detach_completed = not self._range_task_active()
             self.reached_state = new_state
         if new_state == WallPerchStatus.STATE_EXIT and self.state == WallPerchStatus.STATE_RECOVER:
-            self.recovery_completed = True
+            self.recovery_completed = not self._range_task_active()
+            if self._range_task_active():
+                self.detach_task_phase = 'HANDOVER_READY'
+                if self.detach_range_handover_started is None:
+                    self.detach_range_handover_started = now.to_sec()
         elif new_state == WallPerchStatus.STATE_EXIT and self.state == WallPerchStatus.STATE_ABORT:
             self.recovery_completed = False
             self.fault_recovery_completed = True
@@ -1662,6 +1699,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             self.detach_stable_last_stamp = None
             self.detach_stable_samples = 0
         elif new_state == WallPerchStatus.STATE_RECOVER:
+            if self._range_task_active() and not self.detach_range_faulted:
+                self.detach_task_phase = 'RANGE_HEIGHT_CONTROL'
             if getattr(self, "recovery_started_at", None) is None:
                 self.recovery_started_at = now
             self.detach_completed = self.recovery_completed = False
@@ -1687,6 +1726,10 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 self.detach_recovered_samples = 0
                 self._begin_departure_clearance(now)
         elif new_state == WallPerchStatus.STATE_ABORT:
+            if self._range_task_active():
+                self.detach_range_faulted = True
+                self.detach_task_phase = 'FAULT'
+                self.detach_range_block_reason = reason
             self.recovery_completed = False
             if hasattr(self, "_reset_recovery_horizontal"):
                 self._reset_recovery_horizontal("异常恢复：取消主动退墙", clear_departure=True)
@@ -1706,6 +1749,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             self.cancel_requested = False
             self.detach_requested = False
         elif new_state == WallPerchStatus.STATE_EXIT:
+            if self._range_task_active():
+                self.detach_range_exit_entered_at = now.to_sec()
             # Require a switch release before another maneuver. The reference
             # level-trigger would otherwise restart immediately after auto-detach.
             self.rearm_required = True
@@ -1735,6 +1780,16 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         return abs(self._euler_from_quaternion(quaternion)[1]) >= self.pin_pitch_rad
 
     def _update_state_machine(self, now):
+        if self._range_task_active() and self.state != WallPerchStatus.STATE_EXIT:
+            flight = self.flight_state
+            if (flight is not None and flight.connected and flight.mode.upper() != 'OFFBOARD'
+                    and is_fresh(self.flight_state_received_at, self.state_timeout_s, now)):
+                self.detach_range_faulted = True
+                self.detach_task_phase = 'FAULT'
+                self.detach_range_block_reason = '人工/外部模式接管，本轮未正常完成'
+                self.detach_completed = self.recovery_completed = False
+                self._enter_state(WallPerchStatus.STATE_IDLE, now, '人工/外部模式接管，本轮未正常完成')
+                return
         self._prepare_detach_vertical_feedback(now)
         mode_requested = self._mode_requested(now)
         cancel = self.cancel_requested or (
@@ -1910,6 +1965,9 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 if (self.detach_requested and (now - requested_at).to_sec() >=
                         getattr(self, "detach_request_timeout_s", 8.)):
                     self.detach_requested = False
+                    if getattr(self, 'detach_range_enabled', False):
+                        self.detach_task_phase = 'FAULT'
+                        self.detach_range_block_reason = '离墙请求准入超时'
                     self.last_reason = "离墙等待超时，请求已取消；" + self._detach_block_reason(now)
                 elif self._detach_start_ready(now):
                     self._enter_state(WallPerchStatus.STATE_DETACH_ROTATE, now, "detach requested")
@@ -1930,7 +1988,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             if getattr(self, "detach_vertical_fault", ""):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, self.detach_vertical_fault)
-            elif not self._safety_ok(now) or self._height_feedback() is None:
+            elif not self._safety_ok(now) or (not self._range_locked() and self._height_feedback() is None):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "detach safety input lost")
             elif not bench and (self.detach_clock_reversed or self._state_age(now) >= self.detach_duration_timeout_s):
@@ -1945,12 +2003,12 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, self.detach_vertical_fault)
                 return
-            if (not getattr(self, "bench_wait_for_ranges", False)
+            if (not self._range_locked() and not getattr(self, "bench_wait_for_ranges", False)
                     and self._recovery_total_age(now) >= getattr(self, "recover_timeout_s", 15.)):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "recovery timeout; normal detach incomplete")
                 return
-            if not self._safety_ok(now) or self._height_feedback() is None:
+            if not self._safety_ok(now) or (not self._range_locked() and self._height_feedback() is None):
                 self.fault_count += 1
                 self._enter_state(
                     WallPerchStatus.STATE_ABORT,
@@ -1963,6 +2021,10 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 and self._rates_safe(self.recover_max_rate_rps)
                 and self._vertical_speed_safe()
             )
+            if self._range_locked():
+                if self._range_stability_ready(now):
+                    self._enter_state(WallPerchStatus.STATE_EXIT, now, '测距闭环稳定，准备交回POSCTL')
+                return
             if (
                 self._state_age(now) >= self.recover_time_s
                 and stable
@@ -1973,6 +2035,35 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 self._enter_state(WallPerchStatus.STATE_EXIT, now, "recovery complete")
 
         elif self.state == WallPerchStatus.STATE_EXIT:
+            if self._range_locked():
+                flight = self.flight_state
+                if (flight is not None and flight.connected
+                        and flight.mode.upper() == 'POSCTL'
+                        and is_fresh(self.flight_state_received_at, self.state_timeout_s, now)
+                        and is_fresh_source(flight.header.stamp, self.state_timeout_s, now)
+                        and flight.header.stamp.to_sec() > (self.detach_range_exit_entered_at or now.to_sec())
+                        and self.flight_state_received_at.to_sec() > (self.detach_range_exit_entered_at or now.to_sec())):
+                    self.detach_range_posctl_confirmed_at = self.flight_state_received_at.to_sec()
+                    if not self.detach_range_faulted:
+                        self.detach_task_phase = 'COMPLETED'
+                        self.detach_completed = self.recovery_completed = True
+                    self._enter_state(WallPerchStatus.STATE_IDLE, now, 'POSCTL新鲜反馈已确认，释放ROS控制')
+                    return
+                if self.detach_vertical_fault and not self.detach_range_faulted:
+                    self.detach_range_faulted = True
+                if self.detach_range_faulted:
+                    self.detach_task_phase = 'FAULT'
+                    if not self.fault_recovery_completed:
+                        self._enter_state(WallPerchStatus.STATE_ABORT, now, self.detach_vertical_fault or '本轮测距控制异常')
+                    return
+                if flight is not None and flight.mode.upper() == 'OFFBOARD':
+                    if not self._range_stability_ready(now):
+                        self._enter_state(WallPerchStatus.STATE_RECOVER, now, self.detach_range_block_reason)
+                elif is_fresh(self.flight_state_received_at, self.state_timeout_s, now):
+                    self.detach_range_faulted = True
+                    self.detach_task_phase = 'FAULT'
+                    self._enter_state(WallPerchStatus.STATE_IDLE, now, '人工/外部模式接管，本轮未正常完成')
+                return
             # Keep a bounded level target until fresh FCU feedback confirms
             # OFFBOARD has ended. Owner release alone is not RC handover.
             normal_departure = not getattr(self, "fault_recovery_completed", False)
@@ -2459,6 +2550,11 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         candidate.approach_paused = status.approach_paused
         candidate.recovery_support_valid = status.recovery_support_valid
         candidate.recovery_thrust_limit = status.recovery_thrust_limit
+        candidate.detach_task_phase = status.detach_task_phase
+        candidate.detach_range_episode = status.detach_range_episode
+        candidate.range_height_control = bool(status.detach_range_height_enabled and status.detach_range_target_locked
+                                              and status.detach_vertical_active)
+        candidate.range_feedback_valid = status.detach_range_valid
         candidate.source = AttachmentControlCandidate.SOURCE_WALL
         candidate.acquire_request = status.acquire_request
         candidate.keep_ownership = status.keep_ownership

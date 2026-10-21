@@ -79,6 +79,40 @@ wall_perch_decision_node:
   detach_vertical_integral_limit: 0.06
   detach_vertical_correction_limit: 0.12
   detach_support_max_thrust: 0.85
+  # Only the flight console opts into range height control. Other entries keep
+  # their existing vertical loop. Hardware installation MUST be verified.
+  detach_range_height_enabled: false
+  detach_range_entry_tilt_deg: 10.0
+  detach_range_operating_tilt_deg: 15.0
+  detach_range_timeout_s: 0.60
+  detach_range_pose_match_max_dt_s: 0.03
+  detach_range_velocity_window_s: 0.8
+  detach_range_velocity_min_dt_s: 0.05
+  detach_range_height_only_kp: 0.15
+  detach_range_control_blend_s: 0.30
+  detach_range_loss_support_s: 0.30
+  detach_range_control_timeout_s: 15.0
+  detach_range_handover_wait_s: 6.0
+  detach_range_height_tolerance_m: 0.10
+  detach_range_speed_tolerance_mps: 0.20
+  detach_range_stable_time_s: 1.0
+  detach_range_stable_min_samples: 4
+  # Installed MicoAir MTF-02P, confirmed by operator 2026-10-21.
+  # Manufacturer: 0.02-6 m @90% reflectivity/70 klux; not a quality guarantee.
+  # https://micoair.cn/zh/docs/sensors/sensors/mtf-02-02p-sensors
+  detach_range_min_distance_m: 0.02
+  detach_range_max_distance_m: 6.0
+  detach_range_sensor_axis_body: [0.0, 0.0, -1.0]
+  # FLU vector from sensor to controlled reference; projected once into world Z.
+  detach_range_reference_offset_body_m: [0.0, 0.0, 0.0]
+  # Operator confirmed downward installation; distance is RAW AXIAL range.
+  # Zero offset selects the sensor origin as the reference point.
+  detach_range_geometry_confirmed: true
+  detach_range_future_tolerance_s: 0.10
+  detach_range_height_filter_tau_s: 0.10
+  detach_range_velocity_filter_tau_s: 0.25
+  detach_range_jump_m: 0.25
+  detach_range_max_vertical_speed_mps: 2.0
   return_thrust_slew_per_s: 0.50
   recovery_horizontal_velocity_ki: 0.30
   recovery_horizontal_integral_limit_mps2: 0.20

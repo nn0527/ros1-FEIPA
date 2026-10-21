@@ -54,6 +54,7 @@ class DepartureHeightController:
         self.target_speed = self.correction = 0.
         self.support_weight = 0.
         self.saturated = False
+        self.slew_limited = False
         self.requested = actual_thrust
         self.reason = 'departure support initialized from final output'
 
@@ -64,8 +65,12 @@ class DepartureHeightController:
         self.reference = height
         self.clear_integral()
 
-    def _requested(self, vertical_fraction, velocity_error, integral, correction_weight=1.):
-        correction = bounded(self.velocity_kp*velocity_error+integral,
+    def _requested(self, vertical_fraction, velocity_error, integral, correction_weight=1.,
+                   height_correction=None, velocity_weight=1.):
+        correction = (self.velocity_kp*velocity_error+integral if velocity_error is not None else 0.)
+        if height_correction is not None:
+            correction = height_correction+velocity_weight*(correction-height_correction)
+        correction = bounded(correction,
                              -self.correction_limit, self.correction_limit)*correction_weight
         demand = max(0., self.base+correction)
         support = bounded(demand/max(vertical_fraction, .001), .1, self.max_thrust)
@@ -75,16 +80,23 @@ class DepartureHeightController:
                 demand/max(vertical_fraction, .001))
 
     def update(self, height, velocity, vertical_fraction, now, source_stamp,
-               actual_thrust, integrate=True, correction_weight=1.):
+               actual_thrust, integrate=True, correction_weight=1.,
+               height_only_kp=None, velocity_weight=1.):
         if not self.active:
             raise ValueError('departure controller has no seed')
-        values = (height, velocity, vertical_fraction, now, source_stamp, actual_thrust, correction_weight)
+        values = (height, vertical_fraction, now, source_stamp, actual_thrust, correction_weight, velocity_weight)
+        if velocity is not None:
+            values += (velocity,)
+        elif height_only_kp is None:
+            raise ValueError('missing velocity requires explicit height-only control')
+        if height_only_kp is not None and (not math.isfinite(height_only_kp) or height_only_kp <= 0):
+            raise ValueError('invalid height-to-thrust gain')
         if not all(math.isfinite(v) for v in values) or source_stamp <= 0:
             raise ValueError('invalid departure feedback')
         if not .1-1e-6 <= actual_thrust <= self.max_thrust+1e-6:
             raise ValueError('actual collective outside departure bounds')
         actual_thrust = bounded(actual_thrust, .1, self.max_thrust)
-        if not 0. <= correction_weight <= 1.:
+        if not 0. <= correction_weight <= 1. or not 0. <= velocity_weight <= 1.:
             raise ValueError('invalid departure correction weight')
         if correction_weight < 1.:
             self.clear_integral()
@@ -96,13 +108,20 @@ class DepartureHeightController:
             return self.value
         dt = min(.05, now-self.at)
         self.at = now
-        self.integral_budget = min(.05, self.integral_budget+dt)
+        # Low-rate range control needs its full elapsed interval. Keep the
+        # original budget for legacy/other entry points.
+        budget_limit = .5 if height_only_kp is not None else .05
+        self.integral_budget = min(budget_limit, self.integral_budget+dt)
         vertical_fraction = bounded(vertical_fraction, 0., 1.)
-        self.target_speed = bounded(self.height_kp*(self.reference-height),
-                                    -self.down_speed, self.up_speed)
+        self.target_speed = (bounded(self.height_kp*(self.reference-height),
+                                     -self.down_speed, self.up_speed) if velocity is not None else math.nan)
         if correction_weight == 0.:
             self.target_speed = 0.
-        error = self.target_speed-velocity
+        error = self.target_speed-velocity if velocity is not None else None
+        height_correction = (height_only_kp*(self.reference-height) if height_only_kp is not None else None)
+        if velocity is None or velocity_weight < 1.:
+            self.clear_integral()
+            integrate = False
         previous_source = self.last_source_stamp
         fresh_sample = previous_source is None or source_stamp > previous_source
         source_gap = 0. if previous_source is None else source_stamp-previous_source
@@ -116,7 +135,8 @@ class DepartureHeightController:
         if fresh_sample:
             self.last_source_stamp = source_stamp
             self.integral_budget = 0. if previous_source is None or source_gap > .5 else max(0., self.integral_budget-source_dt)
-        requested, correction, weight, unlimited = self._requested(vertical_fraction, error, self.integral, correction_weight)
+        requested, correction, weight, unlimited = self._requested(
+            vertical_fraction, error, self.integral, correction_weight, height_correction, velocity_weight)
         self.integral_active = False
         self.saturated = unlimited > self.max_thrust or abs(correction) >= self.correction_limit-1e-9
         if integrate and fresh_sample and source_dt > 0 and vertical_fraction >= math.cos(math.radians(30.)):
@@ -139,7 +159,8 @@ class DepartureHeightController:
         self.value = bounded(requested, max(.1, actual_thrust-step),
                              min(self.max_thrust, actual_thrust+step))
         self.requested, self.correction, self.support_weight = requested, correction, weight
-        self.saturated |= abs(requested-self.value) > 1e-9
+        self.slew_limited = abs(requested-self.value) > 1e-9
+        self.saturated |= self.slew_limited
         self.reason = ('wall support required at current tilt' if weight < 1.-1e-9 else
                        'departure height support limited' if self.saturated else 'departure height support active')
         return self.value

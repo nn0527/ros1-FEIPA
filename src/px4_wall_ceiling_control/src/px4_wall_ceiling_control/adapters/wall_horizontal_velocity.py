@@ -530,7 +530,8 @@ class WallHorizontalVelocityMixin:
         snapshot=self.horizontal_flow_snapshot
         flow,flow_at,frame_error=snapshot if snapshot is not None else (None,None,'')
         reason = ''
-        if not all(math.isfinite(v) for v in velocity):reason = '水平速度数值无效'
+        required_velocity = velocity[:2] if getattr(self, '_range_locked', lambda: False)() else velocity
+        if not all(math.isfinite(v) for v in required_velocity):reason = '水平速度数值无效'
         elif not is_fresh_receipt(self.horizontal_estimator_at,1.,now) or estimate is None:reason = '估计器反馈过期'
         elif not (estimate.attitude_status_flag and estimate.velocity_horiz_status_flag) or estimate.const_pos_mode_status_flag:reason = 'PX4水平速度估计未有效（或处于恒位置推算）'
         elif not is_fresh_receipt(flow_at,self.horizontal_flow_timeout,now) or flow is None:reason = '光流反馈过期'

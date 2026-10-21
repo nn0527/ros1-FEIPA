@@ -56,6 +56,23 @@ def linear_velocity_parent_frame(odometry, twist_in_child_frame=True):
     return rotate_vector(quaternion_tuple(odometry), vector)
 
 
+def odometry_attitude_horizontal_is_finite(odometry, twist_in_child_frame=True):
+    """Validate only fields used by attitude/rate and horizontal control.
+
+    Body-frame z velocity contributes to world x/y under tilt and is therefore
+    still needed for that transform. World-frame vertical velocity and local
+    position Z have no role in the range height controller.
+    """
+    if odometry is None:
+        return False
+    q = quaternion_tuple(odometry)
+    a, v = odometry.twist.twist.angular, odometry.twist.twist.linear
+    values = (*q, a.x, a.y, a.z, v.x, v.y)
+    if twist_in_child_frame:
+        values += (v.z,)
+    return all(math.isfinite(x) for x in values) and abs(sum(x*x for x in q)-1.) <= .01
+
+
 def vertical_speed_enu_mps(odometry, twist_in_child_frame=True):
     return linear_velocity_parent_frame(odometry, twist_in_child_frame)[2]
 

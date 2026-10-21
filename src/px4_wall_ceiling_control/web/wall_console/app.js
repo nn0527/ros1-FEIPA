@@ -117,10 +117,17 @@ function paint(s){
   if(recovered)step=8;
   if(phase==="RETURNING"){title="等待遥控接管";reason="保持稳定控制输出，等待飞控确认 "+pilotMode+"；未确认前不结束交接";}
   if(returned){title=history?.fault_detected?"异常恢复完成，已交还遥控":"离墙完成，已交还遥控";reason="已确认 "+pilotMode+"，输出已释放，由飞手接管";}
+  const rangeTask=wall?.detach_range_height_enabled && wall.detach_task_phase_name!=="NONE";
+  if(rangeTask && !["CANCELING_ENTRY","RC_TAKEOVER"].includes(phase)){
+    const taskNames={ROTATING_TO_RANGE_ENTRY:"阶段 1：离墙翻转",RANGE_HEIGHT_CONTROL:"阶段 2：测距闭环",HANDOVER_READY:"阶段 3：稳定、准备交回",FAULT:"离墙异常",COMPLETED:"离墙完成，POSCTL 已确认"};
+    title=taskNames[wall.detach_task_phase_name] || title;
+    reason=wall.detach_task_phase_name==="COMPLETED"?"飞控已确认 POSCTL，ROS 控制已释放":wall.detach_range_block_reason || wall.detach_vertical_reason || wall.reason;
+    if(wall.detach_task_phase_name==="RANGE_HEIGHT_CONTROL" && wall.state_name==="DETACH_ROTATE")reason+="；姿态轨迹仍在回平";
+  }
   if(kill?.active){title="急停已生效";reason=state?.armed?"电机已停，飞控等待自动上锁；动作请求已禁用":"飞控已上锁，急停开关仍生效";}
   if(!live){title=!session.push?"实时反馈已暂停":"等待实时反馈";reason=!session.push?"本机停止接收数据；飞行程序与记录继续运行，动作已禁用":"需要收到新反馈后才能操作";}
   text("stageTitle",title);text("stageReason",translate[reason] || reason);
-  document.querySelector(".stage").classList.toggle("error",!!kill?.active || !!s.launch_error || phase==="LOCKED" || wall?.fault_detected || wall?.state_name==="ABORT");
+  document.querySelector(".stage").classList.toggle("error",!!kill?.active || !!s.launch_error || phase==="LOCKED" || wall?.fault_detected || wall?.state_name==="ABORT" || (rangeTask && wall.detach_task_phase_name==="FAULT"));
   $("successNote").hidden=!history?.hold_achieved || !live;
   text("successNote",s.success?"本轮已确认贴墙保持；当前仍在保持。":history?.hold_achieved?"本轮曾成功进入贴墙保持，记录已保留。当前状态见上方；历史结果不代表现在仍贴墙。":"");
   document.querySelectorAll(".steps li").forEach((el,i)=>{el.classList.toggle("done",i<step || (history?.hold_achieved && i===5) || (returned && i===step));el.classList.toggle("current",live && !returned && wall?.state_name!=="ABORT" && i===step);});
@@ -128,7 +135,13 @@ function paint(s){
   text("ceiling",health?.ceiling_valid?n(fresh(s,"ceiling")?.range_m):"—");
   text("angles",odom?.angles ? n(odom.angles[0],1)+" / "+n(odom.angles[1],1) : "—");
   const thrust=fresh(s,"setpoint")?.thrust;text("thrust",typeof thrust==="number"?n(thrust*100,1):"—");
-  text("velocity",n(odom?.vertical_speed));text("battery",n(fresh(s,"battery")?.voltage,1));
+  text("velocity",rangeTask && wall.detach_range_target_locked?(wall.detach_range_velocity_valid?n(wall.detach_range_velocity_mps):"测距速度未就绪"):n(odom?.vertical_speed));text("battery",n(fresh(s,"battery")?.voltage,1));
+  text("rangeHeightState",rangeTask?
+    "本轮 "+wall.detach_range_episode+" · 测距原值 "+n(wall.detach_range_raw_m)+" m · 对地高度 "+n(wall.detach_range_height_m)+" m · 固定目标 "+(wall.detach_range_target_locked?n(wall.detach_range_target_m)+" m":"等待首帧")+
+    " · "+(wall.detach_range_valid?"反馈有效":"反馈无效")+" · 年龄 "+n(wall.detach_range_age_s,2)+" s · 连续稳定 "+n(wall.detach_range_stable_elapsed_s,2)+" s / "+wall.detach_range_stable_samples+" 条新测距":"测距离墙闭环：未开始");
+  text("rangeHeightEvidence",rangeTask?
+    "首帧原值 / 几何高度 / 采样倾角："+n(wall.detach_range_lock_raw_m)+" m / "+n(wall.detach_range_lock_height_m)+" m / "+n(wall.detach_range_lock_tilt_deg,2)+"°；源 / 接收时间："+n(wall.detach_range_lock_source_time,6)+" / "+n(wall.detach_range_lock_received_time,6)+
+    "；入口 "+n(wall.detach_range_entry_tilt_deg,1)+"°；当前采样角 "+n(wall.detach_range_sample_tilt_deg,2)+"°；姿态匹配差 "+n(wall.detach_range_pose_match_dt_s,3)+" s。阶段 2、3 中，相对起飞高度仅作融合诊断，新垂直闭环未使用。":"首帧按消息源时间与姿态匹配；距离字段无独立硬件测距时间时，不代表硬件首次测距瞬间。");
   text("height",n(wall?.height_above_takeoff_m));
   if(runtime?.front_sensor_masked)text("front","已屏蔽");
   text("rangeWarning",(s.sensor_warnings || []).join("；") +
@@ -189,6 +202,8 @@ async function poll(){
     document.querySelectorAll(".ageRow").forEach(el=>{el.lastChild.textContent="反馈中断";el.lastChild.classList.add("stale");});
     paintSensorFusion(null);
     text("horizontalVelocityState","水平速度闭环：实时反馈中断");
+    text("rangeHeightState","测距离墙闭环：实时反馈中断，当前高度/速度及交回资格无法确认");
+    text("rangeHeightEvidence","首帧历史证据请以记录为准，等待新鲜反馈");
     text("recording","试飞日志：无法确认");
   }finally{polling=false;}
 }
