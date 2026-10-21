@@ -36,6 +36,8 @@ class RangeDetachNodeTests(unittest.TestCase):
         patch.start(); self.addCleanup(patch.stop)
         patch = mock.patch.object(rospy, 'loginfo')
         patch.start(); self.addCleanup(patch.stop)
+        patch = mock.patch.object(rospy, 'Service')
+        patch.start(); self.addCleanup(patch.stop)
         self.fx = state_fixtures.DetachStateMachineTests()
         self.n = self.new_node()
 
@@ -219,7 +221,7 @@ class RangeDetachNodeTests(unittest.TestCase):
         self.assertEqual(self.n.detach_task_phase, 'FAULT')
         self.assertIn('总时间', self.n.detach_vertical_fault)
 
-    def test_parameter_update_is_deferred_to_next_episode(self):
+    def test_parameter_update_does_not_change_active_episode(self):
         self.params['~detach_range_entry_tilt_deg'] = 8.
         self.frame(10.25, angle=9.)
         self.assertTrue(self.n.detach_range.locked)

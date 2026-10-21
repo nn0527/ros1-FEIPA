@@ -6,6 +6,7 @@
   <arg name="preflip_right_roll_deg" default="1.7" />
   <arg name="restrained_bench" default="false" />
   <arg name="detach_range_height_enabled" default="true" />
+  <arg name="detach_range_manual_target_m" default="1.5" />
   <arg name="detach_range_entry_tilt_deg" default="" />
   <arg name="detach_range_operating_tilt_deg" default="" />
   <arg name="detach_range_min_distance_m" default="" />
@@ -45,6 +46,7 @@
     <arg name="wall_bench_wait_for_ranges" value="$(arg restrained_bench)" />
   </include>
   <param name="/wall_perch_decision_node/detach_range_height_enabled" value="$(eval arg('detach_range_height_enabled') and not arg('restrained_bench'))" />
+  <param name="/wall_perch_decision_node/detach_range_manual_target_m" value="$(arg detach_range_manual_target_m)" />
   <param if="$(eval arg('detach_range_entry_tilt_deg') != '')" name="/wall_perch_decision_node/detach_range_entry_tilt_deg" value="$(arg detach_range_entry_tilt_deg)" />
   <param if="$(eval arg('detach_range_operating_tilt_deg') != '')" name="/wall_perch_decision_node/detach_range_operating_tilt_deg" value="$(arg detach_range_operating_tilt_deg)" />
   <param if="$(eval arg('detach_range_min_distance_m') != '')" name="/wall_perch_decision_node/detach_range_min_distance_m" value="$(arg detach_range_min_distance_m)" />

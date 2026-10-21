@@ -871,7 +871,7 @@ class FlightModeManagerNode(RCTakeoverManager):
         s = getattr(self, 'wall', None)
         if not self._wall_range_mode():
             return None
-        return (s.detach_range_maneuver_id, s.detach_range_episode)
+        return (s.detach_range_maneuver_id, s.detach_range_episode, s.detach_range_target_revision)
 
     def _wall_range_feedback_ready(self, now):
         s = getattr(self, 'wall', None)
@@ -928,8 +928,10 @@ class FlightModeManagerNode(RCTakeoverManager):
         if not is_fresh(getattr(self, 'wall_at', None), self.status_timeout_s, now):
             reason = '侧吸状态过期'
         request = getattr(self, 'range_posctl_request', None)
-        identity = (getattr(s, 'detach_range_maneuver_id', ''), getattr(s, 'detach_range_episode', 0))
+        identity = (getattr(s, 'detach_range_maneuver_id', ''), getattr(s, 'detach_range_episode', 0),
+                    getattr(s, 'detach_range_target_revision', 0))
         pub.publish(String(data=json.dumps(dict(episode=identity[1], maneuver_id=identity[0],
+            target_revision=identity[2],
             source_time=now.to_sec(), ready=not bool(reason), reason=reason,
             posctl_request_time=request[1] if request is not None and request[0] == identity else 0.))))
 

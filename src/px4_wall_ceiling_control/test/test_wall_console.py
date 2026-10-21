@@ -23,6 +23,26 @@ spec.loader.exec_module(server)
 
 
 class ConsoleTests(unittest.TestCase):
+    def test_manual_height_admission_requires_live_authority_and_node_permission(self):
+        self.ready()
+        self.state.update('state', dict(connected=True, armed=True, mode='OFFBOARD'))
+        self.state.update('owner', 2)
+        self.state.update('operator', dict(mode=3, enabled=True))
+        self.state.update('setpoint', dict(thrust=.5))
+        self.state.update('wall', dict(state_name='RECOVER', reason='test', detach_range_manual_available=True))
+        self.assertTrue(self.state.snapshot()['can_set_range_height'])
+        self.state.update('wall', dict(state_name='RECOVER', reason='test', detach_range_manual_available=False, detach_range_manual_block_reason='等待有效测距'))
+        self.assertFalse(self.state.snapshot()['can_set_range_height'])
+        self.state.update('wall', dict(state_name='RECOVER', reason='test', detach_range_manual_available=True))
+        self.state.update('kill', dict(valid=True, active=True))
+        self.assertFalse(self.state.snapshot()['can_set_range_height'])
+
+    def test_manual_height_parameter_is_fixed_at_launch_and_validated(self):
+        self.assertIn('detach_range_manual_target_m:=1.5', launch_arguments(DEFAULT_CONFIG))
+        for target in (0., float('nan'), -1., 6., True):
+            with self.assertRaises(ValueError):
+                validate_config(dict(DEFAULT_CONFIG, detach_range_manual_target_m=target))
+
     def test_fusion_status_serializes_ros_times_and_expires(self):
         runtime = object.__new__(server.RemoteRuntime)
         runtime.state = self.state
@@ -114,7 +134,8 @@ class ConsoleTests(unittest.TestCase):
         runtime.ros = None
         with self.assertRaisesRegex(ValueError, '明确确认'):
             runtime.stop()
-        with mock.patch.object(server.Path, 'glob', return_value=[]):
+        with mock.patch.object(server.Path, 'glob', return_value=[]), \
+                mock.patch.object(runtime, 'stop_ros_residuals', return_value=[]):
             self.assertIn('已终止', runtime.stop({'grounded_confirmed': True})['message'])
 
     def test_stop_without_remaining_processes_updates_runtime(self):
@@ -124,13 +145,86 @@ class ConsoleTests(unittest.TestCase):
         runtime.children = {'mavros': mock.Mock(), 'wall_flight': mock.Mock()}
         runtime.ros = None
         runtime.state.launch_error = 'mavros 已退出，请查看启动日志'
-        with mock.patch.object(server.Path, 'glob', return_value=[]):
+        with mock.patch.object(server.Path, 'glob', return_value=[]), \
+                mock.patch.object(runtime, 'stop_ros_residuals', return_value=[]):
             self.assertIn('已终止', runtime.stop()['message'])
         self.assertEqual(runtime.children, {})
         self.assertEqual(runtime.state.launch_error, '')
         self.assertFalse(runtime.state.snapshot()['status']['runtime']['value']['enabled'])
         self.assertTrue(runtime.stop_requested)
         self.assertIsNone(runtime.state.snapshot()["status"]["state"]["value"])
+
+    def stop_runtime(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = ConsoleState()
+        runtime.state.update('state', {'connected': True, 'armed': False, 'mode': 'POSCTL'})
+        runtime.state.update('wall', {'state_name': 'ABORT', 'reason': 'previous fault'})
+        runtime.children = {}
+        runtime.ros = None
+        return runtime
+
+    def test_stop_does_not_report_success_for_node_missed_by_process_scan(self):
+        runtime = self.stop_runtime()
+        with mock.patch.object(runtime, 'stop_processes', return_value={}), \
+                mock.patch.object(runtime, 'stop_ros_residuals', return_value=['/renamed_wall']), \
+                mock.patch.object(runtime, 'port_owners', return_value=[]):
+            with self.assertRaisesRegex(ValueError, '仍存活 ROS 节点.*renamed_wall'):
+                runtime.stop()
+        self.assertEqual(runtime.state.snapshot()['status']['wall']['value']['state_name'], 'ABORT')
+        self.assertIn('停止核验失败', runtime.state.launch_error)
+        self.assertFalse(runtime.stopping)
+        with self.assertRaisesRegex(ValueError, '上次停止未完成'):
+            runtime.start(dict(DEFAULT_CONFIG))
+
+    def test_stop_rejects_process_appearing_after_signal_passes(self):
+        runtime = self.stop_runtime()
+        with mock.patch.object(runtime, 'stop_processes', side_effect=[{}, {}, {}, {}, {987: b'new'}]), \
+                mock.patch.object(runtime, 'stop_ros_residuals', return_value=[]), \
+                mock.patch.object(runtime, 'port_owners', return_value=[]):
+            with self.assertRaisesRegex(ValueError, '残留 PID.*987'):
+                runtime.stop()
+
+    def test_stop_rejects_occupied_serial_or_inconclusive_graph(self):
+        for graph_error in (False, True):
+            runtime = self.stop_runtime()
+            with mock.patch.object(runtime, 'stop_processes', return_value={}), \
+                    mock.patch.object(runtime, 'stop_ros_residuals',
+                        side_effect=TimeoutError('graph timeout') if graph_error else None,
+                        return_value=[]), \
+                    mock.patch.object(runtime, 'port_owners', return_value=[123] if not graph_error else []):
+                with self.assertRaisesRegex(ValueError, 'graph timeout' if graph_error else '仍被 PID'):
+                    runtime.stop()
+
+    def test_stop_inventory_finds_alternate_path_and_unknown_launch_child(self):
+        runtime = self.stop_runtime()
+        with tempfile.TemporaryDirectory() as folder:
+            files = []
+            for pid, parent, args in [(901, 1, ['python3', '/alternate/install/wall_perch_decision_node.py']),
+                                      (902, 901, ['/custom/worker']),
+                                      (903, 1, ['python3', '/root/wall_console_server.py']),
+                                      (904, 1, ['/usr/bin/roscore'])]:
+                directory = pathlib.Path(folder) / str(pid)
+                directory.mkdir()
+                path = directory / 'cmdline'
+                path.write_bytes(b'\0'.join(a.encode() for a in args) + b'\0')
+                (directory / 'status').write_text('PPid:\t%d\n' % parent)
+                files.append(path)
+            with mock.patch.object(server.Path, 'glob', return_value=files):
+                targets = runtime.stop_processes()
+            self.assertEqual(set(targets), {901, 902})
+
+    def test_graph_check_distinguishes_stale_registration_from_live_renamed_node(self):
+        master = mock.Mock()
+        master.getSystemState.return_value = (1, '', [[['/wall_perch/status', ['/renamed_wall']]], [], []])
+        master.lookupNode.return_value = (1, '', 'http://localhost:4567')
+        for live in (True, False):
+            node = mock.Mock()
+            if live:
+                node.getPid.return_value = (1, '', 987)
+            else:
+                node.getPid.side_effect = ConnectionRefusedError()
+            with mock.patch.object(server.xmlrpc.client, 'ServerProxy', side_effect=[master, node]):
+                self.assertEqual(server.RemoteRuntime.stop_ros_residuals(), ['/renamed_wall'] if live else [])
 
     def test_mavros_replacement_clears_old_exit_and_reports_new_failure(self):
         runtime = object.__new__(server.RemoteRuntime)
@@ -690,6 +784,7 @@ class ConsoleTests(unittest.TestCase):
         values = {"/mavros/fcu_url": "/dev/ttyUSB3:230400",
                   "/ceiling_lidar_node/serial_port": "/dev/ttyUSB1",
                   "/front_lidar_node/serial_port": "/dev/ttyUSB4",
+                  "/wall_perch_decision_node/detach_range_manual_target_m": 1.5,
                   "/wall_perch_decision_node/hover_thrust": 0.52}
         runtime.ros = SimpleNamespace(get_param=lambda name, default=False:
             values.get(name, False if name.endswith(("require_rc_center", "rc_assist_enabled")) else True))
@@ -709,7 +804,8 @@ class ConsoleTests(unittest.TestCase):
             values = {"/mavros/fcu_url": "/dev/ttyUSB3:230400",
                       "/ceiling_lidar_node/serial_port": "/dev/ttyUSB1",
                       "/front_lidar_node/serial_port": "/dev/ttyUSB4",
-                      "/wall_perch_decision_node/hover_thrust": 0.52,
+                      "/wall_perch_decision_node/detach_range_manual_target_m": 1.5,
+                  "/wall_perch_decision_node/hover_thrust": 0.52,
                       "/attachment_output_mux_node/rc_assist_enabled": True,
                       "/attachment_output_mux_node/rc_roll_yaw_enabled": roll_yaw}
             runtime.ros = SimpleNamespace(get_param=lambda name, default=False:

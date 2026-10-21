@@ -96,6 +96,8 @@ wall_perch_decision_node:
   detach_range_control_blend_s: 0.30
   detach_range_loss_support_s: 0.30
   detach_range_control_timeout_s: 15.0
+  # Explicit one-click target in vertical metres; does not replace measured height.
+  detach_range_manual_target_m: 1.5
   detach_range_handover_wait_s: 6.0
   detach_range_height_tolerance_m: 0.10
   detach_range_speed_tolerance_mps: 0.20

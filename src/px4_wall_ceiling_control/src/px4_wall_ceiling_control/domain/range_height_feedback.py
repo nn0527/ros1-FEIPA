@@ -22,6 +22,7 @@ class RangeHeightConfig:
     control_blend_s: float = .30
     loss_support_s: float = .30
     control_timeout_s: float = 15.
+    manual_target_m: float = 1.5
     handover_wait_s: float = 6.
     height_tolerance_m: float = .10
     speed_tolerance_mps: float = .20
@@ -64,6 +65,8 @@ class RangeHeightConfig:
         if not (math.isfinite(self.min_distance_m) and math.isfinite(self.max_distance_m)
                 and 0 <= self.min_distance_m <= self.max_distance_m):
             raise ValueError('invalid device range limits')
+        if not math.isfinite(self.manual_target_m) or self.manual_target_m <= 0:
+            raise ValueError('manual height target must be finite and positive')
 
     @property
     def installation_ready(self):
@@ -115,6 +118,25 @@ class RangeHeightFeedback:
         self.last_height = None
         self.last_tick = None
         self.velocity_ready_at = None
+        self.target_revision = 0
+        self.target_source = 'range_first_qualified_message'
+        self.action_started = None
+
+    def set_manual_target(self, now):
+        """Explicit operator override; measurement and immutable lock evidence survive."""
+        c = self.config
+        # Conservative vertical envelope throughout the permitted operating tilt.
+        offset = math.sqrt(sum(v*v for v in c.reference_offset_body_m))
+        low = c.min_distance_m + offset
+        high = c.max_distance_m*math.cos(math.radians(c.operating_tilt_deg))-offset
+        if not self.locked or not low < c.manual_target_m < high:
+            raise ValueError('固定目标超出已核对的测距垂直工作范围')
+        if not math.isfinite(now) or now < self.lock_time:
+            raise ValueError('定高请求时钟无效')
+        self.target = c.manual_target_m
+        self.target_revision += 1
+        self.target_source = 'manual_fixed_range_height'
+        self.action_started = now
 
     @property
     def locked(self):
@@ -248,6 +270,7 @@ class RangeHeightFeedback:
             if first:
                 self.target = height  # Deterministic geometry, never a delayed average.
                 self.lock_source, self.lock_received, self.lock_time = source, received, now
+                self.action_started = now
                 self.lock_raw, self.lock_height, self.lock_tilt = distance, height, tilt
             gap = source-self.source
             self.height = (height if first or not self.samples else self.height+

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import xmlrpc.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PACKAGE = Path(__file__).resolve().parents[2]
@@ -225,8 +226,8 @@ class RemoteRuntime:
                       "hold_achieved", "reached_state_name", "detach_ready", "detach_completed", "recovery_completed",
                       "detach_pending", "detach_block_reason", "flip_ready", "front_range_fresh", "top_range_fresh",
                       "auto_approach_enabled", "approach_paused", "horizontal_velocity_enabled", "approach_takeover_thrust", "approach_base_vertical_thrust", "horizontal_velocity_ready", "horizontal_velocity_active", "horizontal_velocity_stable", "horizontal_velocity_reason", "horizontal_forward_target_mps", "horizontal_forward_measured_mps", "horizontal_integral_x_enu_mps2", "horizontal_integral_y_enu_mps2", "horizontal_integral_active", "horizontal_integral_reason", "horizontal_control_saturated",  "horizontal_velocity_x_enu_mps", "horizontal_velocity_y_enu_mps", "horizontal_target_x_enu_mps", "horizontal_target_y_enu_mps", "optical_flow_quality", "horizontal_equilibrium_enabled", "horizontal_equilibrium_valid", "horizontal_equilibrium_frozen", "horizontal_equilibrium_reason", "horizontal_prestream_valid", "fault_recovery_completed", "recovery_support_valid", "recovery_thrust_limit", "detach_vertical_active", "detach_vertical_reason", "detach_vertical_base_source", "detach_vertical_base_thrust", "detach_vertical_integral", "detach_vertical_integral_active", "detach_vertical_saturated", "detach_vertical_slew_limited", "detach_vertical_requested_thrust", "detach_vertical_support_weight", "detach_height_error_m", "departure_clearance_ready", "departure_clearance_distance_m", "departure_clearance_reason", "recovery_horizontal_integral_x", "recovery_horizontal_integral_y", "recovery_horizontal_integral_active",
-                      "detach_task_phase", "detach_task_phase_name", "detach_range_height_enabled", "detach_range_episode", "detach_range_maneuver_id", "detach_request_time", "detach_rotation_start_time", "detach_range_target_locked", "detach_range_source", "detach_range_target_m", "detach_range_height_m", "detach_range_raw_m", "detach_range_projected_m", "detach_range_velocity_mps", "detach_range_velocity_valid", "detach_range_valid", "detach_range_current_tilt_deg", "detach_range_sample_tilt_deg", "detach_range_pose_match_dt_s", "detach_range_entry_tilt_deg", "detach_range_source_time", "detach_range_received_time", "detach_range_lock_source_time", "detach_range_lock_received_time", "detach_range_lock_raw_m", "detach_range_lock_height_m", "detach_range_lock_tilt_deg", "detach_range_velocity_samples", "detach_range_age_s", "detach_range_stable_elapsed_s", "detach_range_stable_samples", "detach_range_handover_ready", "detach_range_block_reason", "detach_range_config_json", "detach_range_rejections_json", "detach_posctl_request_time", "detach_posctl_confirmed_time")}
-            for key in ('detach_request_time', 'detach_rotation_start_time', 'detach_range_source_time', 'detach_range_received_time', 'detach_range_lock_source_time', 'detach_range_lock_received_time', 'detach_posctl_request_time', 'detach_posctl_confirmed_time'):
+                      "detach_task_phase", "detach_task_phase_name", "detach_range_height_enabled", "detach_range_episode", "detach_range_maneuver_id", "detach_request_time", "detach_rotation_start_time", "detach_range_target_locked", "detach_range_source", "detach_range_target_m", "detach_range_height_m", "detach_range_raw_m", "detach_range_projected_m", "detach_range_velocity_mps", "detach_range_velocity_valid", "detach_range_valid", "detach_range_current_tilt_deg", "detach_range_sample_tilt_deg", "detach_range_pose_match_dt_s", "detach_range_entry_tilt_deg", "detach_range_source_time", "detach_range_received_time", "detach_range_lock_source_time", "detach_range_lock_received_time", "detach_range_lock_raw_m", "detach_range_lock_height_m", "detach_range_lock_tilt_deg", "detach_range_velocity_samples", "detach_range_age_s", "detach_range_stable_elapsed_s", "detach_range_stable_samples", "detach_range_handover_ready", "detach_range_block_reason", "detach_range_config_json", "detach_range_rejections_json", "detach_posctl_request_time", "detach_posctl_confirmed_time", "detach_range_manual_target_m", "detach_range_target_revision", "detach_range_target_source", "detach_range_action_started_time", "detach_range_manual_request_id", "detach_range_manual_recovery", "detach_range_previous_fault", "detach_range_manual_available", "detach_range_manual_block_reason")}
+            for key in ('detach_request_time', 'detach_rotation_start_time', 'detach_range_source_time', 'detach_range_received_time', 'detach_range_lock_source_time', 'detach_range_lock_received_time', 'detach_posctl_request_time', 'detach_posctl_confirmed_time', 'detach_range_action_started_time'):
                 value[key] = getattr(msg, key).to_sec()
         elif name in ("front_diagnostic", "ceiling_diagnostic", "kill"):
             value = json.loads(msg.data)
@@ -292,7 +293,8 @@ class RemoteRuntime:
                     running.update(fcu_port=port, baud=int(baud),
                         ceiling_port=self.ros.get_param("/ceiling_lidar_node/serial_port", running["ceiling_port"]),
                         front_port=self.ros.get_param("/front_lidar_node/serial_port", running["front_port"]),
-                        hover_thrust=self.ros.get_param("/wall_perch_decision_node/hover_thrust", running["hover_thrust"]))
+                        hover_thrust=self.ros.get_param("/wall_perch_decision_node/hover_thrust", running["hover_thrust"]),
+                        detach_range_manual_target_m=self.ros.get_param("/wall_perch_decision_node/detach_range_manual_target_m", running["detach_range_manual_target_m"]))
                     for name, alias in STABLE_PORTS.items():
                         if Path(running[name]).resolve() == Path(alias).resolve():
                             running[name] = alias
@@ -351,6 +353,9 @@ class RemoteRuntime:
     def start(self, config):
         if getattr(self, "stopping", False):
             raise ValueError("正在终止现有进程，请等待结束")
+        if (getattr(self, "stop_requested", False)
+                and self.state.launch_error.startswith("停止核验失败：")):
+            raise ValueError("上次停止未完成，请重新停止基础链路并通过核验后再启动")
         self.stop_requested = False
         config = validate_config(migrate_legacy_ports(config))
         # After SSH reconnection, inspect the already-running nodes before
@@ -681,6 +686,25 @@ class RemoteRuntime:
         self.state.send_detach(publish)
         return {"message": "离墙请求已发送；控制节点等待连续稳定后旋转，8 秒未满足会取消"}
 
+    def set_range_height(self):
+        from px4_wall_ceiling_control.srv import SetRangeHeight, SetRangeHeightRequest
+        if self.ros is None:
+            raise ValueError("ROS 尚未连接")
+        with self.state.lock:
+            snapshot = self.state.snapshot()
+            if not snapshot["can_set_range_height"]:
+                raise ValueError(snapshot["set_range_height_blockers"][0])
+            wall = snapshot["status"]["wall"]["value"]
+            request = SetRangeHeightRequest(request_id=secrets.token_hex(12),
+                maneuver_id=wall["detach_range_maneuver_id"], episode=wall["detach_range_episode"],
+                expected_target_revision=wall["detach_range_target_revision"], requested_at=self.ros.Time.now())
+        self.ros.wait_for_service("/wall_perch/set_range_height", timeout=.2)
+        reply = self.ros.ServiceProxy("/wall_perch/set_range_height", SetRangeHeight)(request)
+        if not reply.success:
+            raise ValueError(reply.message)
+        self.state.event(reply.message)
+        return {"message": reply.message}
+
     def rc_takeover(self):
         from std_srvs.srv import Trigger
         if self.ros is None:
@@ -702,6 +726,109 @@ class RemoteRuntime:
             self.state.event("已请求取消手动接近等待；以模式阶段反馈为准")
         return {"message": "取消等待已提交；仅等待阶段接受，开始接管后不会中断动作"}
 
+    def stop_processes(self):
+        """Take a fresh inventory, including alternate paths and launch children."""
+        scripts = {p.name for p in (PACKAGE / "scripts").rglob("*.py")}
+        scripts -= {"wall_console_server.py", "ceiling_wall_console.py", "wall_console.py"}
+        launches = {p.name for p in (PACKAGE / "launch").rglob("*.launch")}
+        processes, targets = {}, {}
+        for item in Path("/proc").glob("[0-9]*/cmdline"):
+            try:
+                original = item.read_bytes()
+                args = [a.decode(errors="replace") for a in original.split(b"\0") if a]
+                if not args:
+                    continue
+                parent = int(next(line.split()[1] for line in
+                    item.with_name("status").read_text().splitlines() if line.startswith("PPid:")))
+                pid = int(item.parent.name)
+                processes[pid] = (original, parent)
+                names = {Path(a).name for a in args}
+                if names & {"wall_console_server.py", "ceiling_wall_console.py"}:
+                    continue
+                if (names & scripts or "mavros_node" in names
+                        or ("roslaunch" in names and (names & launches or
+                            "px4_wall_ceiling_control" in args or
+                            ("mavros" in args and "px4.launch" in names)))
+                        or (names & {"record", "rosbag"} and any(
+                            "/wall_test_records/" in a or "/ceiling_test/" in a for a in args))):
+                    targets[pid] = original
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+        # A launcher can have children with unrelated executable names.
+        changed = True
+        while changed:
+            changed = False
+            for pid, (original, parent) in processes.items():
+                if parent in targets and pid not in targets:
+                    targets[pid] = original
+                    changed = True
+        return targets
+
+    @staticmethod
+    def stop_ros_residuals():
+        """Independent graph check catches nodes missed by the process matcher."""
+        class TimeoutTransport(xmlrpc.client.Transport):
+            def make_connection(self, host):
+                connection = super().make_connection(host)
+                connection.timeout = .4
+                return connection
+
+        def proxy(uri):
+            return xmlrpc.client.ServerProxy(uri, transport=TimeoutTransport())
+
+        caller = "/wall_console_stop_check"
+        master = proxy(os.environ.get("ROS_MASTER_URI", "http://localhost:11311"))
+        try:
+            code, message, state = master.getSystemState(caller)
+        except ConnectionRefusedError:
+            return []  # No master; process and serial checks still apply.
+        if code != 1:
+            raise ValueError("停止后无法核验 ROS 节点：" + str(message))
+        topics = {"/mavros/state", "/mavros/setpoint_raw/attitude",
+                  "/wall_perch/status", "/wall_perch/control_candidate",
+                  "/ceiling_attachment/status", "/ceiling_attachment/control_candidate",
+                  "/sensor/front/raw", "/sensor/ceiling/raw", "/sensor/health",
+                  "/attachment/output_owner", "/attachment/flight_phase", "/operator/command"}
+        names = {node for topic, nodes in state[0] if topic in topics for node in nodes}
+        names.update(node for group in state for _, nodes in group for node in nodes
+                     if node.rsplit("/", 1)[-1] in {
+                         "wall_perch_decision_node", "ceiling_attachment_decision_node",
+                         "flight_mode_manager_node", "attachment_output_mux_node",
+                         "terminal_operator_node", "mavros", "attachment_flight_logger",
+                         "ceiling_flight_logger", "wall_sensor_fusion_manager_node"})
+        remaining = []
+        for name in sorted(names):
+            code, _, uri = master.lookupNode(caller, name)
+            if code != 1:
+                continue  # Unregistered during verification.
+            try:
+                code, _, _ = proxy(uri).getPid(caller)
+                if code == 1:
+                    remaining.append(name)
+                else:
+                    raise ValueError("无法确认节点已停止：" + name)
+            except ConnectionRefusedError:
+                continue  # Stale master registration, no live node.
+            except (OSError, xmlrpc.client.Error) as error:
+                raise ValueError("无法确认节点已停止：" + name + "；" + str(error))
+        return remaining
+
+    def verify_stopped(self):
+        remaining = self.stop_processes()
+        failures = ["残留 PID: " + str(sorted(remaining))] if remaining else []
+        nodes = self.stop_ros_residuals()
+        if nodes:
+            failures.append("仍存活 ROS 节点: " + ", ".join(nodes))
+        for key in ("fcu_port", "ceiling_port", "front_port"):
+            owners = self.port_owners(self.state.config[key])
+            if owners:
+                failures.append(self.state.config[key] + " 仍被 PID " + str(owners) + " 占用")
+        for name, child in self.children.items():
+            if child.poll() is None:
+                failures.append("启动进程仍存活: " + name)
+        if failures:
+            raise ValueError("停止未完成；" + "；".join(failures))
+
     def stop(self, config=None):
         """Stop this console's test pipeline, preserving ROS master and SSH."""
         with self.state.lock:
@@ -719,30 +846,15 @@ class RemoteRuntime:
             self.stopping = True
             self.stop_requested = True
         try:
-            targets = {}
-            for item in Path("/proc").glob("[0-9]*/cmdline"):
-                try:
-                    args = item.read_bytes().split(b"\0")
-                    text_args = [a.decode(errors="replace") for a in args if a]
-                    is_launch = any("roslaunch" in a for a in text_args) and (
-                        "wall_console_flight.launch" in text_args or "wall_console_mavros.launch" in text_args or
-                        ("mavros" in text_args and "px4.launch" in text_args))
-                    is_node = any(a.startswith(str(PACKAGE / "scripts") + "/") or
-                                  a.startswith(str(PACKAGE.parents[1] / "devel/lib/px4_wall_ceiling_control") + "/")
-                                  for a in text_args) and not any("wall_console_server.py" in a for a in text_args)
-                    is_mavros = "/opt/ros/noetic/lib/mavros/mavros_node" in text_args
-                    is_record = any("rosbag" in a for a in text_args) and any(
-                        a.startswith(("/root/wall_test_records/", "/root/ceiling_test/")) for a in text_args)
-                    if is_launch or is_node or is_mavros or is_record:
-                        targets[int(item.parent.name)] = item.read_bytes()
-                except (OSError, ValueError):
-                    continue
+            targets = self.stop_processes()
             def alive(pid, original):
                 try:
                     return Path('/proc', str(pid), 'cmdline').read_bytes() == original
                 except OSError:
                     return False
             for sig, delay in ((signal.SIGINT, 3.0), (signal.SIGTERM, 2.0), (signal.SIGKILL, .3)):
+                # Include replacements/children created after the first scan.
+                targets.update(self.stop_processes())
                 for pid, original in list(targets.items()):
                     if alive(pid, original):
                         try: os.kill(pid, sig)
@@ -751,19 +863,26 @@ class RemoteRuntime:
                 while time.monotonic() < deadline and any(alive(pid, original) for pid, original in targets.items()):
                     time.sleep(.1)
             remaining = [pid for pid, original in targets.items() if alive(pid, original)]
+            if remaining:
+                raise ValueError("停止未完成；残留 PID: " + str(remaining))
+            self.verify_stopped()
+            time.sleep(.3)
+            self.verify_stopped()
             for name in ("wall_flight", "mavros"):
                 self.children.pop(name, None)
             with self.state.lock:
                 self.state.pending_since = self.state.detach_pending_since = None
                 self.state.starting = False
-                self.state.launch_error = "终止失败，残留 PID: " + str(remaining) if remaining else ""
-            if remaining:
-                raise ValueError(self.state.launch_error)
+                self.state.launch_error = ""
             with self.state.lock:
                 self.state.samples.clear()  # Removed producers must not leave stale action state.
             self.state.update("runtime", self.inspect_runtime() if self.ros else {"enabled": False, "nodes": [], "missing": []})
             self.state.event("已终止试验控制、MAVROS、雷达及记录进程；可以重新启动")
             return {"message": "现有试验进程已终止，可以重新启动基础程序"}
+        except Exception as error:
+            with self.state.lock:
+                self.state.launch_error = "停止核验失败：" + str(error)
+            raise ValueError(self.state.launch_error) from error
         finally:
             self.stopping = False
 
@@ -897,6 +1016,10 @@ class SSHTransport:
                     for check in result["checks"]:
                         check["ok"] = False
             detach_sources = required_feedback + (("setpoint",) if range_diagnostic_only else ("health", "setpoint"))
+            manual_sources = ("runtime", "state", "wall", "kill", "owner", "operator", "setpoint")
+            if not connected or not self.session.get("control") or any(not result["status"][n]["fresh"] for n in manual_sources):
+                result["can_set_range_height"] = False
+                result["set_range_height_blockers"] = ["定高所需实时反馈或控制权缺失"]
             if not connected or any(not result["status"][n]["fresh"] for n in detach_sources):
                 if not connected or result["can_detach"]:
                     result["detach_blockers"] = ["离墙所需实时反馈中断或过期"]
@@ -930,7 +1053,7 @@ class SSHTransport:
                 raise ValueError("SSH 未连接，操作未发送")
             if action == "stop" and not self.session.get("control"):
                 raise ValueError("需要控制权，终止未发送")
-            if action in ("start", "wall", "detach", "cancel_wait", "rc_takeover") and (not self.push_enabled or not self.session.get("control") or time.monotonic() - self.arrived >= 2):
+            if action in ("start", "wall", "detach", "cancel_wait", "rc_takeover", "set_range_height") and (not self.push_enabled or not self.session.get("control") or time.monotonic() - self.arrived >= 2):
                 raise ValueError("需要控制权和有效的实时反馈，操作未发送")
             if action == "push":
                 self.push_enabled = bool(config["enabled"])
@@ -1027,6 +1150,8 @@ def http_main(args):
                     result = transport.request("stop", data)
                 elif self.path == "/api/detach":
                     result = transport.request("detach")
+                elif self.path == "/api/set-range-height":
+                    result = transport.request("set_range_height")
                 else:
                     return self.respond(404, {"error": "Not found"})
                 return self.respond(200, result)

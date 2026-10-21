@@ -32,6 +32,8 @@ add_message_files(
   SupervisorState.msg
 )
 
+add_service_files(FILES SetRangeHeight.srv)
+
 generate_messages(
   DEPENDENCIES
   geometry_msgs
@@ -61,6 +63,7 @@ catkin_install_python(PROGRAMS
   scripts/operator/terminal_operator_node.py
   scripts/operator/flight_mode_manager_node.py
   scripts/operator/wall_console_server.py
+  scripts/operator/ceiling_wall_console.py
   scripts/outputs/attachment_mechanism_output_node.py
   scripts/outputs/attachment_output_mux_node.py
   scripts/sensors/lidar_distance_node.py
@@ -92,10 +95,12 @@ install(FILES README.md
 )
 
 if(CATKIN_ENABLE_TESTING)
+  catkin_add_nosetests(test/test_ceiling_wall_console.py)
   catkin_add_nosetests(test/test_rc_takeover.py)
   catkin_add_nosetests(test/test_detach_vertical.py)
   catkin_add_nosetests(test/test_range_height_feedback.py)
   catkin_add_nosetests(test/test_range_height_integration.py)
+  catkin_add_nosetests(test/test_hold_config_latency.py)
   catkin_add_nosetests(test/test_height_continuation.py)
   catkin_add_nosetests(test/test_bounded_detach_integration.py)
   catkin_add_nosetests(test/test_detach_vertical_authority.py)

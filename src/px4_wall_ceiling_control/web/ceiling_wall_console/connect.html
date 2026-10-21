@@ -1,0 +1,11 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="theme-color" content="#2e644b"><title>选择地址 · ceiling_wall_console</title><link rel="stylesheet" href="style.css"><script src="connect.js" defer></script></head>
+<body><main class="login"><div class="eyebrow">CEILING + WALL / 连接设置</div><h1>选择控制台地址</h1><p>先选择树莓派 IP，再进入测试台登录。</p>
+<section class="panel"><h2>接入测试台</h2><form id="connectForm">
+<label for="consolePreset">控制台 IP</label><select id="consolePreset"><option value="172.20.10.2">172.20.10.2</option><option value="10.187.58.66">10.187.58.66</option><option value="192.168.2.20">192.168.2.20</option><option value="127.0.0.1">127.0.0.1（本机离线预览）</option><option value="custom">手动输入其他 IP</option></select>
+<label for="consoleIp">树莓派 IPv4 地址</label><input id="consoleIp" name="ip" value="172.20.10.2" inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="例如：172.20.10.2" required>
+<label for="consolePort">控制台端口</label><input id="consolePort" name="port" type="number" min="1" max="65535" step="1" value="8790" required>
+<p id="targetAddress" class="muted" role="status">http://172.20.10.2:8790/login</p><button id="connectButton" type="submit">连接并进入登录</button>
+</form><p id="connectMessage" class="error" role="status" aria-live="polite"></p></section>
+<p class="muted">电脑或手机需连接能访问树莓派的网络。选择 IP 只改变本设备的访问地址，不修改树莓派网络配置。</p></main></body></html>

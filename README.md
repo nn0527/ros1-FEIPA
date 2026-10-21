@@ -48,3 +48,12 @@ Build outputs, Python environments, logs, ROS bags and generated telemetry are
 excluded from Git. The PowerShell and `runtime/` observation tools contain
 paths for the original Windows/WSL installation; adjust those paths for your
 machine before using them.
+
+## ceiling_wall_console
+
+顶吸与侧吸测试台源码已迁入 `src/px4_wall_ceiling_control`。
+本机离线预览可双击 `Start-CeilingWallConsole.command`（Mac）或 `Start-CeilingWallConsole.cmd`（Windows），
+打开 `http://127.0.0.1:8791/login`，使用离线访问码 `offline`。
+申请控制权后可切换阶段、定高及异常场景，无需连接树莓派。
+真实树莓派测试台继续使用 8790 端口。
+目录、启动、部署与验证说明见 [ceiling_wall_console](src/px4_wall_ceiling_control/docs/ceiling_wall_console.md)。

@@ -1649,6 +1649,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         if new_state == WallPerchStatus.STATE_EXIT and self.state == WallPerchStatus.STATE_RECOVER:
             self.recovery_completed = not self._range_task_active()
             if self._range_task_active():
+                self.fault_recovery_completed = self.detach_range_manual_recovery
                 self.detach_task_phase = 'HANDOVER_READY'
                 if self.detach_range_handover_started is None:
                     self.detach_range_handover_started = now.to_sec()
@@ -1757,6 +1758,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                 self._begin_departure_clearance(now)
         elif new_state == WallPerchStatus.STATE_ABORT:
             if self._range_task_active():
+                self.detach_range_failure_cause = self.detach_range_failure_cause or reason
                 self.detach_range_faulted = True
                 self.detach_task_phase = 'FAULT'
                 self.detach_range_block_reason = reason
@@ -2076,7 +2078,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                     self.detach_range_posctl_confirmed_at = self.flight_state_received_at.to_sec()
                     if not self.detach_range_faulted:
                         self.detach_task_phase = 'COMPLETED'
-                        self.detach_completed = self.recovery_completed = True
+                        self.detach_completed = self.recovery_completed = not self.detach_range_manual_recovery
                     self._enter_state(WallPerchStatus.STATE_IDLE, now, 'POSCTL新鲜反馈已确认，释放ROS控制')
                     return
                 if self.detach_vertical_fault and not self.detach_range_faulted:
@@ -2449,9 +2451,11 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         status.recovery_completed = getattr(self, "recovery_completed", False)
         status.fault_recovery_completed = getattr(self, "fault_recovery_completed", False)
         status.detach_pending = bool(getattr(self, "detach_requested", False) and self.state == WallPerchStatus.STATE_WALL_HOLD)
-        status.detach_block_reason = self._detach_block_reason(now) if self.state == WallPerchStatus.STATE_WALL_HOLD and not self._detach_start_ready(now) else ""
+        detach_start_ready = bool(self.state == WallPerchStatus.STATE_WALL_HOLD
+                                  and self._detach_start_ready(now))
+        status.detach_block_reason = self._detach_block_reason(now) if self.state == WallPerchStatus.STATE_WALL_HOLD and not detach_start_ready else ""
         status.detach_ready = bool(self.state == WallPerchStatus.STATE_WALL_HOLD
-            and self._safety_ok(now) and self._detach_start_ready(now)
+            and self._safety_ok(now) and detach_start_ready
             and (self._manual_wall_recovery_active(now) or not self._top_clear_ready(now)))
         status.flight_state_fresh = self._flight_ready(now)
         status.auto_approach_enabled = getattr(self, "auto_approach", False)

@@ -15,6 +15,7 @@ from px4_wall_ceiling_control.domain.range_height_feedback import RangeHeightCon
 from px4_wall_ceiling_control.freshness import is_fresh_receipt, is_fresh_source
 from px4_wall_ceiling_control.msg import AttachmentControlCandidate as C
 from px4_wall_ceiling_control.msg import WallPerchStatus as W
+from px4_wall_ceiling_control.srv import SetRangeHeight, SetRangeHeightResponse
 
 
 @dataclass(frozen=True)
@@ -56,9 +57,15 @@ class WallDetachVerticalMixin:
             for key, value in limits.items()})
         self._reset_detach_vertical()
         self.detach_range_enabled = bool(rospy.get_param('~detach_range_height_enabled', False))
-        self.detach_range = RangeHeightFeedback(self._range_config())
+        # Parameter RPCs belong to startup, never to the timed control path.
+        # The immutable configuration is shared by every departure until restart.
+        self.detach_range_config = self._load_range_config()
+        self.detach_range = RangeHeightFeedback(self.detach_range_config)
         self.detach_range_episode = 0
         self._reset_range_task()
+        if self.detach_range_enabled:
+            self.range_height_service = rospy.Service('/wall_perch/set_range_height',
+                                                      SetRangeHeight, self._on_set_range_height)
         # Vertical range capture must never depend on horizontal flow readiness.
         rospy.Subscriber('/mavros/px4flow/raw/optical_flow_rad', OpticalFlowRad,
                          self._on_detach_range, queue_size=100)
@@ -274,6 +281,7 @@ class WallDetachVerticalMixin:
         sample = self._snapshot_departure_feedback()
         self.detach_height_continuation.observe(now.to_sec(), sample.source, sample.height, sample.velocity, sample.tilt_deg)
         if getattr(self, 'detach_range_enabled', False):
+            self._reset_range_task()
             self.detach_range_episode += 1
             self.detach_range.begin(self.detach_range_episode, now.to_sec(), range_config)
             self.detach_task_phase = 'ROTATING_TO_RANGE_ENTRY'
@@ -403,6 +411,9 @@ class WallDetachVerticalMixin:
         self._fill_range_status(status)
 
     def _range_config(self):
+        return self.detach_range_config
+
+    def _load_range_config(self):
         default = RangeHeightConfig()
         values = {f.name: rospy.get_param('~detach_range_'+f.name, getattr(default, f.name))
                   for f in fields(default)}
@@ -422,6 +433,107 @@ class WallDetachVerticalMixin:
         self.detach_range_posctl_confirmed_at = None
         self.detach_range_exit_entered_at = None
         self.detach_range_block_reason = '未开始脱离'
+        self.detach_range_manual_request_id = ''
+        self.detach_range_manual_response = None
+        self.detach_range_manual_recovery = False
+        self.detach_range_previous_fault = ''
+        self.detach_range_failure_cause = ''
+
+    def _manual_range_height_block_reason(self, now):
+        """Admission for an explicit bounded action, never a fault auto-retry."""
+        if not self._range_locked() or self.state not in (W.STATE_DETACH_ROTATE, W.STATE_RECOVER, W.STATE_EXIT, W.STATE_ABORT):
+            return '仅本轮离墙测距接管后允许一键定高'
+        r = self.detach_range
+        if r.target_revision:
+            return '本轮已提交一键定高，重复点击不会重置预算'
+        if self.detach_range_posctl_request_at is not None:
+            return 'POSCTL交回请求已发出，不能再改变高度目标'
+        fault = self.detach_range_failure_cause or self.detach_vertical_fault or self.last_reason
+        if self.detach_range_faulted and fault not in ('测距闭环总时间预算超时', '测距交回等待超时'):
+            return '仅测距控制或交回超时可重新准入；'+fault
+        if self.cancel_requested or not self._mode_requested(now):
+            return '贴墙控制请求已取消或过期'
+        flight = self.flight_state
+        if not (self._flight_ready(now) and flight and flight.connected and flight.armed
+                and flight.mode.upper() == 'OFFBOARD'
+                and is_fresh_source(flight.header.stamp, self.state_timeout_s, now)):
+            return '等待有效急停反馈及新鲜已解锁OFFBOARD权限'
+        s = r.snapshot(now.to_sec())
+        if not s.valid or not s.velocity_valid:
+            return '等待新鲜测距高度和有效测距速度窗口'
+        output = self._valid_wall_output(now)
+        if not self._detach_vertical_feedback_ok(now) or output is None:
+            return '姿态反馈或实际侧吸输出无效'
+        controller = self.detach_vertical_controller
+        if (not self.detach_range_synced or not controller.active
+                or not math.isfinite(controller.base) or not .1 <= controller.base < controller.max_thrust
+                or not .1-1.e-6 <= output.thrust <= controller.max_thrust+1.e-6):
+            return '定高支撑基准或实际推力超出控制器限制'
+        if self._detach_progress() < 1. or not self._detach_rotation_pose_valid() or not self._published_recovery_target_ready(now):
+            return '等待旋转完成、实测与发送姿态回平及角速度稳定'
+        if not self._horizontal_recovery_ready(now) or not self._wall_fusion_samples_ready(now):
+            return '等待水平速度稳定及光流融合恢复确认'
+        if self.detach_range_faulted:
+            front = getattr(self, 'front_range', None)
+            if (front is None or not self._front_fresh(now) or not self._sensor_health_fresh(now)
+                    or not self.sensor_health.front_valid or not math.isfinite(front.range)
+                    or front.range < self.departure_clearance_distance
+                    or getattr(self, 'horizontal_takeover_yaw', None) is None):
+                return '超时后重新准入需新鲜有效的安全离墙间隙和原接管航向'
+        return ''
+
+    def _on_set_range_height(self, request):
+        with getattr(self, 'feedback_lock', nullcontext()):
+            now = rospy.Time.now()
+            r = self.detach_range
+            # Same successful request is idempotent, including after a timeout.
+            if (request.request_id and request.request_id == self.detach_range_manual_request_id
+                    and request.maneuver_id == getattr(self, 'maneuver_id', '')
+                    and request.episode == r.episode and self.detach_range_manual_response is not None):
+                return self.detach_range_manual_response
+            reason = ''
+            if (not request.request_id or len(request.request_id) > 80
+                    or request.maneuver_id != getattr(self, 'maneuver_id', '')
+                    or request.episode != r.episode or request.expected_target_revision != r.target_revision
+                    or not 0 <= now.to_sec()-request.requested_at.to_sec() <= .5):
+                reason = '定高请求过期、本轮身份或目标版本不匹配'
+            if not reason:
+                self._prepare_range_feedback(now)
+                reason = self._manual_range_height_block_reason(now)
+            if not reason:
+                try:
+                    r.set_manual_target(now.to_sec())
+                except ValueError as error:
+                    reason = str(error)
+            if reason:
+                return SetRangeHeightResponse(False, reason, r.target_revision, r.target)
+            previous_fault = (self.detach_range_failure_cause or self.detach_vertical_fault or self.last_reason
+                              if self.detach_range_faulted else '')
+            self.detach_range_previous_fault = previous_fault
+            self.detach_range_manual_recovery = bool(self.detach_range_faulted)
+            self.detach_range_manual_request_id = request.request_id
+            self.detach_range_faulted = False  # This new admitted action has its own budget.
+            self.detach_range_failure_cause = ''
+            self.detach_vertical_fault = ''
+            self.detach_vertical_controller.begin(r.target, self.detach_vertical_controller.base,
+                                                  float(self.horizontal_output.thrust), now.to_sec())
+            self.detach_altitude_m = self.recovery_altitude_m = r.target
+            self.vertical_reference_source = r.target_source
+            self.detach_range_stable_since = self.detach_range_stable_source = None
+            self.detach_range_stable_samples = 0
+            self.detach_range_handover_started = self.detach_range_exit_entered_at = None
+            self.detach_range_posctl_request_at = self.detach_range_posctl_confirmed_at = None
+            self.manager_handover_snapshot = None
+            self.detach_completed = self.recovery_completed = self.fault_recovery_completed = False
+            self.detach_feedback_prepared_at = None
+            if self.detach_range_manual_recovery:
+                self._begin_departure_clearance(now)  # Recollect fresh clearance; preserve frozen heading.
+            self._enter_state(W.STATE_RECOVER, now, '人工一键定高：目标 %.2f m' % r.target)
+            self.detach_range_manual_response = SetRangeHeightResponse(True, self.last_reason,
+                                                                       r.target_revision, r.target)
+            rospy.loginfo('wall manual range height: request=%s episode=%s revision=%s first=%.6f target=%.6f previous_fault=%s',
+                          request.request_id, r.episode, r.target_revision, r.lock_height, r.target, previous_fault)
+            return self.detach_range_manual_response
 
     def _range_task_active(self):
         return bool(getattr(self, 'detach_range_enabled', False)
@@ -435,6 +547,7 @@ class WallDetachVerticalMixin:
                 now = rospy.Time.now()
                 if (value.get('episode') != self.detach_range.episode
                         or value.get('maneuver_id') != getattr(self, 'maneuver_id', '')
+                        or value.get('target_revision', 0) != self.detach_range.target_revision
                         or not 0 <= now.to_sec()-float(value['source_time']) <= .5):
                     return
                 self.manager_handover_snapshot = (value, now)
@@ -502,16 +615,17 @@ class WallDetachVerticalMixin:
         self.detach_feedback_valid = bool(s.valid and self._detach_vertical_feedback_ok(now))
         seconds = now.to_sec()
         failure = ''
-        if seconds < r.lock_time:
+        if seconds < r.action_started:
             failure = '测距控制时钟倒退'
-        elif seconds-r.lock_time >= r.config.control_timeout_s:
+        elif seconds-r.action_started >= r.config.control_timeout_s:
             failure = '测距闭环总时间预算超时'
         elif r.invalid_since is not None and seconds-r.invalid_since >= r.config.loss_support_s:
             failure = '测距失效超过短时支撑上限'
         elif (self.detach_range_handover_started is not None
               and seconds-self.detach_range_handover_started >= r.config.handover_wait_s):
             failure = '测距交回等待超时'
-        if failure:
+        if failure and not self.detach_range_faulted:
+            self.detach_range_failure_cause = failure
             self.detach_range_faulted = True
             self.detach_task_phase = 'FAULT'
             self.detach_vertical_fault = failure
@@ -553,7 +667,7 @@ class WallDetachVerticalMixin:
             self.recovery_support_valid = True
             self.recovery_thrust_limit = c.max_thrust
             return self.detach_vertical_value
-        weight = min(1., max(0., (now.to_sec()-r.lock_time)/r.config.control_blend_s))
+        weight = min(1., max(0., (now.to_sec()-r.action_started)/r.config.control_blend_s))
         velocity_weight = (min(1., max(0., (now.to_sec()-r.velocity_ready_at)/r.config.control_blend_s))
                            if s.velocity_valid and r.velocity_ready_at is not None else 0.)
         try:
@@ -565,6 +679,7 @@ class WallDetachVerticalMixin:
                 velocity_weight=velocity_weight)
         except ValueError as error:
             self.detach_vertical_fault = str(error)
+            self.detach_range_failure_cause = self.detach_range_failure_cause or str(error)
             self.detach_range_faulted = True
             self.detach_task_phase = 'FAULT'
             return math.nan
@@ -625,6 +740,7 @@ class WallDetachVerticalMixin:
             and snapshot is not None and snapshot[0].get('ready', False)
             and snapshot[0].get('episode') == self.detach_range.episode
             and snapshot[0].get('maneuver_id') == getattr(self, 'maneuver_id', '')
+            and snapshot[0].get('target_revision', 0) == self.detach_range.target_revision
             and 0 <= now.to_sec()-snapshot[0]['source_time'] <= .5
             and is_fresh_receipt(snapshot[1], .5, now))
 
@@ -641,6 +757,15 @@ class WallDetachVerticalMixin:
         status.detach_range_height_enabled = getattr(self, 'detach_range_enabled', False)
         status.detach_range_episode = r.episode
         status.detach_range_maneuver_id = getattr(self, 'maneuver_id', '')
+        status.detach_range_manual_target_m = r.config.manual_target_m
+        status.detach_range_target_revision = r.target_revision
+        status.detach_range_target_source = r.target_source
+        status.detach_range_action_started_time = rospy.Time.from_sec(r.action_started or 0.)
+        status.detach_range_manual_request_id = self.detach_range_manual_request_id
+        status.detach_range_manual_recovery = self.detach_range_manual_recovery
+        status.detach_range_previous_fault = self.detach_range_previous_fault
+        status.detach_range_manual_block_reason = self._manual_range_height_block_reason(status.header.stamp)
+        status.detach_range_manual_available = not bool(status.detach_range_manual_block_reason)
         status.detach_request_time = getattr(self, 'detach_requested_at', None) or rospy.Time()
         status.detach_rotation_start_time = rospy.Time.from_sec(r.started or 0.)
         status.detach_range_target_locked = r.locked
@@ -672,7 +797,7 @@ class WallDetachVerticalMixin:
         status.detach_posctl_confirmed_time = rospy.Time.from_sec(getattr(self, 'detach_range_posctl_confirmed_at', None) or 0.)
         if self._range_locked():
             status.detach_height_error_m = s.target-s.height if s.valid else math.nan
-            status.vertical_reference_source = 'range_first_qualified_message'
+            status.vertical_reference_source = r.target_source
             status.vertical_reference_valid = r.locked
             status.vertical_reference_m = r.target
             status.vertical_control_active = bool(s.valid and self.recovery_support_valid)

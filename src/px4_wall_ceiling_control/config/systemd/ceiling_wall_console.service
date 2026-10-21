@@ -1,0 +1,16 @@
+[Unit]
+Description=ceiling_wall_console - ceiling and wall flight test console
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/ros_ws
+ExecStart=/usr/bin/python3 -B -u %h/ros_ws/src/px4_wall_ceiling_control/scripts/operator/ceiling_wall_console.py --bridge local --public-host 192.168.2.20 --public-host 10.187.58.66 --public-host 172.20.10.2
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+UMask=0077
+
+[Install]
+WantedBy=default.target
