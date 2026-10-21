@@ -90,15 +90,16 @@ class ManualWallRecoveryTests(unittest.TestCase):
             else: n.odom.twist.twist.angular.z = math.nan
             self.assertFalse(n._safety_ok(at(10.02)), component)
 
-    def test_no_top_frame_does_not_bypass_prehold_descent_protection(self):
+    def test_low_pitch_does_not_bypass_prehold_descent_protection(self):
         for phase in (W.STATE_FLIP_TO_WALL, W.STATE_WALL_CAPTURE):
             n = self.node(); n.state = phase
             n.top_hold_accept_after = at(10.); n.top_hold_frame_at = None
-            self.f.feedback(n, 10.02, vz=-1.2)
+            n.flip_elapsed_s = n.flip_time_s
+            self.f.feedback(n, 10.02, tilt=79., vz=-1.2)
             self.assertFalse(n._manual_wall_recovery_active(at(10.02)))
             self.assertFalse(n._safety_ok(at(10.02)))
 
-    def test_late_top_frame_admits_hold_before_kinematic_abort(self):
+    def test_completed_flip_and_pitch_admit_hold_without_top_before_kinematic_abort(self):
         for phase in (W.STATE_FLIP_TO_WALL, W.STATE_WALL_CAPTURE):
             n = self.node(); n.state = phase; n.state_entered_at = at(10.)
             n.top_hold_accept_after = at(10.); n.top_hold_frame_at = None
@@ -106,10 +107,20 @@ class ManualWallRecoveryTests(unittest.TestCase):
             n.flip_step_at = at(10.02)
             n.q_flip_start = n.q_hover
             self.f.feedback(n, 10.02, vz=-1.2, rate=350.)
-            self.f.top(n, 10.02, .26)
+            self.assertIsNone(n.top_range)
             self.assertTrue(n._manual_wall_recovery_active(at(10.02)))
             self.f.tick(n, 10.02)
             self.assertEqual(n.state, W.STATE_WALL_HOLD)
+
+    def test_top_frame_cannot_enable_manual_recovery_before_flip_completion(self):
+        n = self.node(); n.state = W.STATE_FLIP_TO_WALL
+        n.top_hold_accept_after = at(10.)
+        n.flip_elapsed_s = .9 * n.flip_time_s
+        self.f.feedback(n, 10.02, vz=-1.2)
+        self.f.top(n, 10.02, .04)
+        self.assertTrue(n._late_top_frame_ready(at(10.02)))
+        self.assertFalse(n._manual_wall_recovery_active(at(10.02)))
+        self.assertFalse(n._safety_ok(at(10.02)))
 
     def test_disabling_parameter_keeps_original_hold_abort(self):
         n = self.node(); n.manual_wall_recovery_enabled = False
@@ -128,7 +139,7 @@ class ManualWallRecoveryTests(unittest.TestCase):
         for a, b in zip(rotate_vector(followed, (0, 0, 1)), rotate_vector(n.q_contact, (0, 0, 1))):
             self.assertAlmostEqual(a, b)
 
-    def test_recorded_1224_capture_window_reaches_hold_instead_of_abort(self):
+    def test_recorded_1224_top_frame_cannot_bypass_new_pitch_gate(self):
         path = pathlib.Path(__file__).parent/'fixtures/manual_wall_recovery_20261020_1224.json'
         data = json.loads(path.read_text())
         n = self.node(); n.state = W.STATE_WALL_CAPTURE
@@ -156,10 +167,10 @@ class ManualWallRecoveryTests(unittest.TestCase):
                     m.header.stamp = at(e['header_unix_s']); n._on_top_range(m)
         now = at(data['original_abort_header_unix_s'])
         self.f.tick(n, now.to_sec())
-        self.assertEqual(n.state, W.STATE_WALL_HOLD)
-        _, q, thrust, _ = n._candidate(now)
-        self.assertLess(quaternion_angle(q, n.q_contact), 1.e-7)
-        self.assertGreaterEqual(thrust, .648)
+        self.assertLess(math.degrees(n._euler_from_quaternion(n._current_quaternion())[1]), 80.)
+        self.assertFalse(n.hold_achieved)
+        self.assertEqual(n.state, W.STATE_ABORT)
+        self.assertEqual(n.last_reason, 'capture safety failure')
 
 
 if __name__ == '__main__':

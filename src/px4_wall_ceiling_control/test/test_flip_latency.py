@@ -23,7 +23,7 @@ class FlipLatencyTests(unittest.TestCase):
         angle = math.radians(entry_pitch)
         n.horizontal_output.orientation.y = math.sin(angle / 2.)
         n.horizontal_output.orientation.w = math.cos(angle / 2.)
-        n.flip_duration_timeout_s = 4.
+        n.flip_duration_timeout_s = 6.
         n.flip_max_tracking_error_rad = math.radians(90.)
         n.flip_top_start_fraction = .9
         n._prepare_vertical_reference = lambda now: None
@@ -104,7 +104,9 @@ class FlipLatencyTests(unittest.TestCase):
     def test_absolute_timeout_aborts_even_if_feedback_is_fresh(self):
         n = self.node()
         self.state_machine(n)
-        n._update_state_machine(at(14.))
+        n._update_state_machine(at(15.99))
+        self.assertEqual(n.state, W.STATE_FLIP_TO_WALL)
+        n._update_state_machine(at(16.))
         self.assertEqual(n.state, W.STATE_ABORT)
         self.assertEqual(n.fault_count, 1)
         self.assertIn('wall-clock duration timeout', n.last_reason)

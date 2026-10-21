@@ -98,6 +98,17 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         self.top_contact_distance_m = float(
             rospy.get_param("~top_contact_distance_m", 0.05)
         )
+        # Retained for the legacy top-frame diagnostic only. HOLD admission
+        # uses completed trajectory + measured pitch, without top feedback.
+        self.hold_entry_top_distance_check_enabled = bool(
+            rospy.get_param("~hold_entry_top_distance_check_enabled", False)
+        )
+        self.hold_entry_min_pitch_rad = math.radians(float(
+            rospy.get_param("~hold_entry_min_pitch_deg", 80.0)
+        ))
+        if (not math.isfinite(self.hold_entry_min_pitch_rad)
+                or not 0.0 < self.hold_entry_min_pitch_rad <= math.pi / 2.):
+            raise ValueError("hold_entry_min_pitch_deg must be in (0, 90]")
         self.top_contact_hold_s = float(
             rospy.get_param("~top_contact_hold_s", 1.0)
         )
@@ -125,7 +136,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         # A stalled callback must not catch up the attitude trajectory in one
         # command. The hard deadline remains wall-clock based and independent.
         self.flip_duration_timeout_s = float(rospy.get_param(
-            "~flip_duration_timeout_s", max(4.0, 2.0 * self.flip_time_s)))
+            "~flip_duration_timeout_s", max(6.0, 2.0 * self.flip_time_s)))
         if (not math.isfinite(self.flip_duration_timeout_s)
                 or self.flip_duration_timeout_s <= self.flip_time_s):
             raise ValueError("flip_duration_timeout_s must exceed flip_time_s")
@@ -141,7 +152,8 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         self.flip_clock_reversed = False
         self.flip_thrust_evaluated_at = None
         self.q_flip_start = None
-        # Top input cannot authorize HOLD before the final 10% of the flip.
+        # Retain the late-flip top window for diagnostics/pressure feedback;
+        # it no longer authorizes HOLD.
         self.flip_top_start_fraction = clamp(
             float(rospy.get_param("~flip_top_start_fraction", 0.90)), 0.0, 1.0
         )
@@ -1336,9 +1348,9 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         return abs(roll) < self.recover_angle_rad and abs(pitch) < self.recover_angle_rad
 
     def _manual_wall_recovery_active(self, now):
-        """Allow wheel correction after the existing late-top HOLD gate.
+        """Allow wheel correction after trajectory completion and pitch entry.
 
-        A completed flip without a fresh accepted top frame is insufficient.
+        Top measurements do not authorize or block this control-phase latch.
         This is a control-phase latch, not proof of physical wall contact.
         """
         if not getattr(self, "manual_wall_recovery_enabled", False):
@@ -1346,7 +1358,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         return bool(self.state == WallPerchStatus.STATE_WALL_HOLD or (
             self.state in (WallPerchStatus.STATE_FLIP_TO_WALL,
                            WallPerchStatus.STATE_WALL_CAPTURE)
-            and self._late_top_frame_ready(now)))
+            and self._hold_entry_ready(now)))
 
     def _manual_wall_recovery_reason(self, now):
         if not self._manual_wall_recovery_active(now) or self.state != WallPerchStatus.STATE_WALL_HOLD:
@@ -1498,10 +1510,29 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
                          or self._flip_progress() >= getattr(self, "flip_top_start_fraction", .90)))
 
     def _late_top_frame_ready(self, now):
+        """Legacy top-frame diagnostic, never a HOLD admission condition."""
         frame_at = getattr(self, "top_hold_frame_at", None)
         return bool(self._late_top_window_open(now) and frame_at is not None
                     and is_fresh(frame_at, self.sensor_timeout_s, now)
-                    and self._top_fresh(now))
+                    and self._top_fresh(now)
+                    and (not getattr(self, "hold_entry_top_distance_check_enabled", False)
+                         or self._top_contact_detected(now)))
+
+    def _hold_entry_ready(self, now):
+        if self.state not in (WallPerchStatus.STATE_FLIP_TO_WALL,
+                              WallPerchStatus.STATE_WALL_CAPTURE):
+            return False
+        if (self.state == WallPerchStatus.STATE_FLIP_TO_WALL
+                and self._flip_progress() < 1.0):
+            return False
+        if not self._odom_fresh(now):
+            return False
+        quaternion = self._current_quaternion()
+        if quaternion is None:
+            return False
+        pitch = self._euler_from_quaternion(quaternion)[1]
+        return bool(math.isfinite(pitch) and pitch + 1.e-9 >= getattr(
+            self, "hold_entry_min_pitch_rad", math.radians(80.0)))
 
     def _top_contact_ready(self, now):
         fresh = self._top_fresh(now)
@@ -1560,8 +1591,7 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             new_state in (WallPerchStatus.STATE_WALL_CAPTURE, WallPerchStatus.STATE_WALL_HOLD)
             and self.state == WallPerchStatus.STATE_FLIP_TO_WALL
         ):
-            # Contact can arrive before the flip timer ends. Preserve the
-            # current commanded attitude instead of jumping to q_wall.
+            # Preserve the current commanded attitude at the phase boundary.
             progress = self._flip_progress()
             self.q_contact = self._quat_slerp(
                 self.q_flip_start, self.q_wall, self._smoothstep5(progress)
@@ -1924,30 +1954,30 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
             if getattr(self, "flip_clock_reversed", False):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "flip clock moved backwards")
-            elif self._state_age(now) >= getattr(self, "flip_duration_timeout_s", max(4., 2.*self.flip_time_s)):
+            elif self._state_age(now) >= getattr(self, "flip_duration_timeout_s", max(6., 2.*self.flip_time_s)):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "flip wall-clock duration timeout")
             elif not self._safety_ok(now):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "flip sensor or flight failure")
-            elif self._late_top_frame_ready(now):
-                self._enter_state(WallPerchStatus.STATE_WALL_HOLD, now, "late flip top frame valid")
+            elif self._hold_entry_ready(now):
+                self._enter_state(WallPerchStatus.STATE_WALL_HOLD, now, "flip complete; measured pitch ready")
             elif self._pin_triggered():
                 self._enter_state(WallPerchStatus.STATE_WALL_PIN, now, "pin pitch reached")
             elif self._flip_progress() >= 1.0:
-                self._enter_state(WallPerchStatus.STATE_WALL_CAPTURE, now, "flip complete; waiting for one valid top frame")
+                self._enter_state(WallPerchStatus.STATE_WALL_CAPTURE, now, "flip complete; waiting for measured pitch")
 
         elif self.state == WallPerchStatus.STATE_WALL_CAPTURE:
             if not self._safety_ok(now):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "capture safety failure")
-            elif self._pin_triggered():
-                self._enter_state(WallPerchStatus.STATE_WALL_PIN, now, "pin pitch reached")
-            elif self._late_top_frame_ready(now):
-                self._enter_state(WallPerchStatus.STATE_WALL_HOLD, now, "top frame valid after flip")
-            elif self._state_age(now) > self.capture_timeout_s:
+            elif self._state_age(now) >= self.capture_timeout_s:
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "wall capture timeout")
+            elif self._pin_triggered():
+                self._enter_state(WallPerchStatus.STATE_WALL_PIN, now, "pin pitch reached")
+            elif self._hold_entry_ready(now):
+                self._enter_state(WallPerchStatus.STATE_WALL_HOLD, now, "measured pitch ready after flip")
 
         elif self.state == WallPerchStatus.STATE_WALL_HOLD:
             contact_lost = self._top_clear_ready(now)

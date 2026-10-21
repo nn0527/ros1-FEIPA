@@ -1,4 +1,4 @@
-"""Forward-only flip entry and one-frame top capture in the final 10%."""
+"""Forward-only flip entry, retained top diagnostics and pitch-only HOLD entry."""
 import math
 import unittest
 from unittest import mock
@@ -32,7 +32,7 @@ class FrontOnlyLateTopTests(unittest.TestCase):
         n._filter_range = lambda message, previous: message.range
         n.flip_time_s = 2.
         n.flip_top_start_fraction = .9
-        n.flip_duration_timeout_s = 4.
+        n.flip_duration_timeout_s = 6.
         n.flip_max_tracking_error_rad = math.radians(15.)
         n.flip_elapsed_s = n.flip_step_dt = 0.
         n.flip_step_at = rospy.Time.from_sec(10.)
@@ -52,6 +52,8 @@ class FrontOnlyLateTopTests(unittest.TestCase):
         n.top_capture_near_samples = 0
         n.top_capture_window_samples = 3
         n.top_contact_distance_m = .056
+        n.hold_entry_top_distance_check_enabled = False
+        n.hold_entry_min_pitch_rad = math.radians(80.)
         n.top_clear_distance_m = .1
         n.filter_alpha = n.top_flip_filter_alpha = n.top_hold_filter_alpha = 1.
         n._pin_triggered = lambda: False
@@ -112,12 +114,12 @@ class FrontOnlyLateTopTests(unittest.TestCase):
         n._update_state_machine(rospy.Time.from_sec(11.8))
         self.assertEqual(n.state, S.STATE_FLIP_TO_WALL)
 
-    def test_one_valid_frame_at_90_percent_enters_hold_without_distance_gate(self):
+    def test_valid_top_frame_at_90_percent_cannot_enter_hold_before_completion(self):
         n = self.node(); n.state = S.STATE_FLIP_TO_WALL
         self.advance_flip(n, 11.8)
         self.sample(n, 11.8, 2.)  # Valid measurement, not a near-distance requirement.
         n._update_state_machine(rospy.Time.from_sec(11.8))
-        self.assertEqual(n.state, S.STATE_WALL_HOLD)
+        self.assertEqual(n.state, S.STATE_FLIP_TO_WALL)
         self.assertEqual(n.top_capture_near_samples, 0)
 
     def test_invalid_or_old_header_frame_cannot_authorize_hold(self):
@@ -127,6 +129,18 @@ class FrontOnlyLateTopTests(unittest.TestCase):
             self.sample(n, 11.8, value, stamp=stamp)
             n._update_state_machine(rospy.Time.from_sec(11.8))
             self.assertEqual(n.state, S.STATE_FLIP_TO_WALL, (value, stamp))
+
+    def test_retained_distance_gate_only_affects_legacy_diagnostic(self):
+        for phase in (S.STATE_FLIP_TO_WALL, S.STATE_WALL_CAPTURE):
+            n = self.node(); n.state = S.STATE_FLIP_TO_WALL
+            self.advance_flip(n, 11.8)
+            n.state = phase
+            n.hold_entry_top_distance_check_enabled = True
+            self.sample(n, 11.8, .20)
+            self.assertFalse(n._late_top_frame_ready(rospy.Time.from_sec(11.8)))
+            self.sample(n, 11.82, .04)
+            self.sample(n, 11.84, .04)
+            self.assertTrue(n._late_top_frame_ready(rospy.Time.from_sec(11.84)))
 
     def test_cached_preflip_top_range_cannot_authorize_hold(self):
         n = self.node(); n.state = S.STATE_FLIP_TO_WALL
@@ -138,30 +152,74 @@ class FrontOnlyLateTopTests(unittest.TestCase):
         n._update_state_machine(rospy.Time.from_sec(11.8))
         self.assertEqual(n.state, S.STATE_FLIP_TO_WALL)
 
-    def test_flip_completes_without_top_then_waits_for_one_frame(self):
+    @staticmethod
+    def measured_pitch(n, degrees):
+        angle = math.radians(degrees) / 2.
+        n._current_quaternion = lambda: (0., math.sin(angle), 0., math.cos(angle))
+
+    def test_completed_flip_enters_hold_without_any_top_measurement(self):
         n = self.node(); n.state = S.STATE_FLIP_TO_WALL
         self.advance_flip(n, 12.)
+        self.assertIsNone(n.top_range)
+        n._late_top_frame_ready = mock.Mock(side_effect=AssertionError('top gate used'))
+        n._update_state_machine(rospy.Time.from_sec(12.))
+        self.assertEqual(n.state, S.STATE_WALL_HOLD)
+        n._late_top_frame_ready.assert_not_called()
+
+    def test_completed_flip_below_80_waits_then_enters_hold_at_80_without_top(self):
+        n = self.node(); n.state = S.STATE_FLIP_TO_WALL
+        self.advance_flip(n, 12.)
+        self.measured_pitch(n, 79.9)
         n._update_state_machine(rospy.Time.from_sec(12.))
         self.assertEqual(n.state, S.STATE_WALL_CAPTURE)
-        self.sample(n, 12.1, .2)
+        self.measured_pitch(n, 80.)
         n._update_state_machine(rospy.Time.from_sec(12.1))
         self.assertEqual(n.state, S.STATE_WALL_HOLD)
+        self.assertIsNone(n.top_range)
 
-    def test_capture_still_times_out_without_any_valid_top_frame(self):
+    def test_capture_times_out_at_8_seconds_even_if_pitch_becomes_ready(self):
         n = self.node(); n.state = S.STATE_FLIP_TO_WALL
         self.advance_flip(n, 12.)
+        self.measured_pitch(n, 79.)
         n._update_state_machine(rospy.Time.from_sec(12.))
-        n._update_state_machine(rospy.Time.from_sec(20.1))
+        n._update_state_machine(rospy.Time.from_sec(19.99))
+        self.assertEqual(n.state, S.STATE_WALL_CAPTURE)
+        self.measured_pitch(n, 80.)
+        n._update_state_machine(rospy.Time.from_sec(20.))
         self.assertEqual(n.state, S.STATE_ABORT)
         self.assertEqual(n.last_reason, 'wall capture timeout')
 
-    def test_invalid_frame_after_one_valid_frame_does_not_erase_latched_success(self):
+    def test_top_missing_invalid_stale_or_far_never_blocks_pitch_admission(self):
+        for value, stamp in [(None, None), (float('nan'), 12.), (.04, 10.), (2., 12.)]:
+            n = self.node(); n.state = S.STATE_FLIP_TO_WALL
+            self.advance_flip(n, 12.)
+            if value is not None:
+                self.sample(n, 12., value, stamp=stamp)
+            n.hold_entry_top_distance_check_enabled = True
+            n._update_state_machine(rospy.Time.from_sec(12.))
+            self.assertEqual(n.state, S.STATE_WALL_HOLD, (value, stamp))
+
+    def test_pitch_gate_uses_fresh_measured_attitude_and_rejects_opposite_pitch(self):
         n = self.node(); n.state = S.STATE_FLIP_TO_WALL
-        self.advance_flip(n, 11.8)
-        self.sample(n, 11.8)
-        self.sample(n, 11.81, float('nan'))
-        n._update_state_machine(rospy.Time.from_sec(11.82))
-        self.assertEqual(n.state, S.STATE_WALL_HOLD)
+        self.advance_flip(n, 12.)
+        self.measured_pitch(n, -85.)
+        self.assertFalse(n._hold_entry_ready(rospy.Time.from_sec(12.)))
+        self.measured_pitch(n, 85.)
+        n._odom_fresh = lambda now: False
+        self.assertFalse(n._hold_entry_ready(rospy.Time.from_sec(12.)))
+        n._odom_fresh = lambda now: True
+        n._current_quaternion = lambda: None
+        self.assertFalse(n._hold_entry_ready(rospy.Time.from_sec(12.)))
+
+    def test_valid_top_frame_does_not_bypass_low_pitch_capture_wait(self):
+        n = self.node(); n.state = S.STATE_FLIP_TO_WALL
+        self.advance_flip(n, 12.)
+        self.measured_pitch(n, 79.)
+        self.sample(n, 12., .04)
+        n._update_state_machine(rospy.Time.from_sec(12.))
+        self.assertEqual(n.state, S.STATE_WALL_CAPTURE)
+        n._update_state_machine(rospy.Time.from_sec(12.1))
+        self.assertEqual(n.state, S.STATE_WALL_CAPTURE)
 
     def test_top_absence_does_not_bypass_flight_odom_or_rate_failure(self):
         n = self.node()
@@ -182,7 +240,7 @@ class FrontOnlyLateTopTests(unittest.TestCase):
         n.hold_thrust_multiplier = 1.5; n.hold_entry_blend_s = .5
         n.q_hover, n.q_wall = n._hover_and_wall_quaternions(0., math.pi/2)
         n.q_contact = n.q_wall; n.odom = None
-        now = self.advance_flip(n, 11.8)
+        now = self.advance_flip(n, 12.)
         before = n._candidate(now)[1]
         WallDecision._enter_state(n, S.STATE_WALL_HOLD, now, 'late frame')
         after = n._candidate(now)[1]

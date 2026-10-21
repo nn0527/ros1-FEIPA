@@ -24,6 +24,10 @@ wall_perch_decision_node:
   flip_trigger_hold_s: 0.30
   # WP_TOP_CT_DIST / WP_TOP_CT_HLD
   top_contact_distance_m: 0.056
+  # 旧顶部准入判断仅保留作诊断；顶部距离、有效帧和新鲜度均不参与HOLD准入。
+  hold_entry_top_distance_check_enabled: false
+  # 翻转轨迹完成且实测俯仰角≥80°才进入HOLD，否则进入CAPTURE等待。
+  hold_entry_min_pitch_deg: 80.0
   # 保留为HOLD后的接触诊断；进入HOLD不再等待连续近距确认。
   top_contact_hold_s: 1.00
   top_clear_distance_m: 0.10
@@ -39,19 +43,19 @@ wall_perch_decision_node:
   approach_timeout_s: 20.00
   flip_time_s: 2.00
   # Independent wall-clock limit: bounded control steps never catch up after stalls.
-  flip_duration_timeout_s: 4.00
+  flip_duration_timeout_s: 6.00
   # Bound target lead over fresh measured attitude; height braking remains active.
   flip_max_tracking_error_deg: 15.0
-  # 最后10%才接入顶部雷达：2秒翻转从1.8秒起，一帧新鲜有效测距即进入HOLD。
+  # 最后10%才接入顶部雷达用于诊断和压墙反馈，不参与HOLD准入。
   flip_top_start_fraction: 0.90
   capture_time_s: 0.50
-  # Safety input failures still abort immediately; these are phase limits only.
+  # 翻转完成但实测俯仰角不足80°时，最多等待8秒；安全输入失效仍立即中止。
   capture_timeout_s: 8.00
   # Remain against the wall until the operator stops the wheels and requests detach.
   hold_time_s: 0.00
   # Keep bounded wall pressure during slip/wheel correction; only a manual
   # detach request advances after the normal pose/rate stability gates pass.
-  # Enabled after the existing final-flip valid top-frame gate; not before it.
+  # Enabled after trajectory completion + measured pitch gate; not before it.
   manual_wall_recovery_enabled: true
   hold_entry_blend_s: 0.50
   # Detach admission requires stable measured pose and bounded vertical speed.
