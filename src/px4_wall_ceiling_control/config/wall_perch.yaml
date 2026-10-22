@@ -89,7 +89,10 @@ wall_perch_decision_node:
   detach_range_entry_tilt_deg: 10.0
   detach_range_operating_tilt_deg: 15.0
   detach_range_timeout_s: 0.60
-  detach_range_pose_match_max_dt_s: 0.03
+  # Source-time bracket interpolation. 0.20 s wait is an initial replay/bench
+  # value, not a validated flight transport limit.
+  detach_range_pose_interp_max_span_s: 0.10
+  detach_range_pose_wait_s: 0.20
   detach_range_velocity_window_s: 0.8
   detach_range_velocity_min_dt_s: 0.05
   detach_range_height_only_kp: 0.15
@@ -117,8 +120,12 @@ wall_perch_decision_node:
   detach_range_future_tolerance_s: 0.10
   detach_range_height_filter_tau_s: 0.10
   detach_range_velocity_filter_tau_s: 0.25
+  # Parallel observer only; it does not drive thrust until separately validated.
+  detach_range_fast_velocity_filter_tau_s: 0.10
+  detach_range_fast_velocity_max_gap_s: 0.60
   detach_range_jump_m: 0.25
   detach_range_max_vertical_speed_mps: 2.0
+  detach_range_output_sync_timeout_s: 0.30
   return_thrust_slew_per_s: 0.50
   recovery_horizontal_velocity_ki: 0.30
   recovery_horizontal_integral_limit_mps2: 0.20

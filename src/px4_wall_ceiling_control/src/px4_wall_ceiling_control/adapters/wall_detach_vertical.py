@@ -588,12 +588,13 @@ class WallDetachVerticalMixin:
         if not self._range_locked() or self.detach_range_synced:
             return
         c, r = self.detach_vertical_controller, self.detach_range
-        # Last actual publication seeds continuity, never a proposed candidate.
-        output = getattr(self, 'horizontal_output', None)
-        actual = float(output.thrust) if output is not None else math.nan
-        if not math.isfinite(actual) or not .1-1.e-6 <= actual <= c.max_thrust+1.e-6:
-            self.detach_vertical_fault = '测距首帧已锁定但实际输出推力不可用'
+        # Seed only from a fresh, owned, source-valid final publication. Longer
+        # pose waits make a cached numeric thrust alone insufficient evidence.
+        output = self._detach_vertical_output(now, allow_recovery=False)
+        if output is None:
+            self.detach_range_block_reason = '测距目标已锁定；等待新鲜实际输出同步'
             return
+        actual = float(output.thrust)
         c.begin(r.target, c.base, actual, now.to_sec())
         c.target_speed = math.nan  # First range has no measured velocity yet.
         self.detach_altitude_m = self.recovery_altitude_m = r.target
@@ -602,7 +603,6 @@ class WallDetachVerticalMixin:
         self.detach_task_phase = 'FAULT' if self.detach_range_faulted else 'RANGE_HEIGHT_CONTROL'
         # Old Z continuity/reanchors have no authority after this atomic switch.
         self.detach_height_continuation.reset()
-        self.detach_vertical_fault = ''
         self.detach_feedback_valid = self.recovery_support_valid = False
         rospy.loginfo('wall range: episode=%s target=%.6f raw=%.6f source=%.9f receipt=%.9f tilt=%.3f pose_dt=%.6f',
                       r.episode, r.target, r.raw_distance, r.lock_source, r.lock_received,
@@ -630,6 +630,9 @@ class WallDetachVerticalMixin:
             failure = '测距控制时钟倒退'
         elif seconds-r.action_started >= r.config.control_timeout_s:
             failure = '测距闭环总时间预算超时'
+        elif (not self.detach_range_synced and r.lock_time is not None
+              and seconds-r.lock_time >= r.config.output_sync_timeout_s):
+            failure = '测距锁定后实际输出同步超时'
         elif r.invalid_since is not None and seconds-r.invalid_since >= r.config.loss_support_s:
             failure = '测距失效超过短时支撑上限'
         elif (self.detach_range_handover_started is not None
@@ -784,8 +787,20 @@ class WallDetachVerticalMixin:
         status.detach_range_target_m, status.detach_range_height_m = s.target, s.height
         status.detach_range_velocity_mps = s.velocity
         status.detach_range_velocity_valid, status.detach_range_valid = s.velocity_valid, s.valid
+        status.detach_range_height_invalid_since_s = s.height_invalid_since
+        status.detach_range_velocity_age_s = s.velocity_age
+        status.detach_range_velocity_invalid_since_s = s.velocity_invalid_since
+        status.detach_range_velocity_reason = s.velocity_reason
+        status.detach_range_fast_velocity_mps = s.fast_velocity
+        status.detach_range_fast_velocity_valid = s.fast_velocity_valid
+        status.detach_range_fast_velocity_age_s = s.fast_velocity_age
+        status.detach_range_fast_velocity_reason = s.fast_velocity_reason
         status.detach_range_raw_m, status.detach_range_projected_m = s.raw_distance, s.projected_height
         status.detach_range_sample_tilt_deg, status.detach_range_pose_match_dt_s = s.sample_tilt_deg, s.pose_match_dt_s
+        status.detach_range_pose_before_dt_s = s.pose_before_dt_s
+        status.detach_range_pose_after_dt_s = s.pose_after_dt_s
+        status.detach_range_pose_span_s = s.pose_span_s
+        status.detach_range_pose_wait_s = s.pose_wait_s
         status.detach_range_entry_tilt_deg = r.config.entry_tilt_deg
         q = self._current_quaternion()
         status.detach_range_current_tilt_deg = math.degrees(math.acos(max(-1., min(1., rotate_vector(q, (0., 0., 1.))[2])))) if q else math.nan

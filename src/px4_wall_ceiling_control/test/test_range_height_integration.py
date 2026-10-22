@@ -105,6 +105,7 @@ class RangeDetachNodeTests(unittest.TestCase):
         n._prepare_range_feedback(tick)
         self.assertFalse(n.detach_range_faulted)
         self.seconds = 10.30
+        self.fx.feedback(n, self.seconds, source=10.28, tilt=6.)
         n._prepare_range_feedback(at(self.seconds))
         self.assertTrue(n.detach_range.locked)
         self.assertEqual(n.detach_range.action_started, self.seconds)
@@ -118,6 +119,23 @@ class RangeDetachNodeTests(unittest.TestCase):
         self.n._prepare_range_feedback(at(self.seconds))
         self.assertTrue(self.n.detach_range_faulted)
         self.assertIn('时钟倒退', self.n.detach_vertical_fault)
+
+    def test_locked_target_requires_fresh_owned_output_before_controller_sync(self):
+        n = self.n
+        self.seconds = 10.25
+        self.fx.feedback(n, self.seconds, tilt=7.)
+        n.horizontal_output_at = at(9.)
+        n.horizontal_output.header.stamp = at(9.)
+        message = OpticalFlowRad(distance=1.13)
+        message.header.stamp = at(self.seconds)
+        n._on_detach_range(message)
+        self.assertTrue(n.detach_range.locked)
+        self.assertFalse(n.detach_range_synced)
+        self.assertFalse(n.detach_range_faulted)
+        self.seconds = 10.56
+        n._prepare_range_feedback(at(self.seconds))
+        self.assertTrue(n.detach_range_faulted)
+        self.assertIn('实际输出同步超时', n.detach_vertical_fault)
 
     def test_cycle_time_is_shared_and_cleared_after_exception(self):
         n = self.n
@@ -281,6 +299,9 @@ class RangeDetachNodeTests(unittest.TestCase):
         self.assertTrue(c.range_height_control)
         self.assertTrue(c.range_feedback_valid)
         self.assertTrue(math.isnan(s.detach_range_velocity_mps))
+        self.assertFalse(s.detach_range_fast_velocity_valid)
+        self.assertAlmostEqual(s.detach_range_pose_span_s, 0.)
+        self.assertGreaterEqual(s.detach_range_pose_wait_s, 0.)
         self.assertTrue(math.isnan(s.vertical_target_enu_mps))
 
 

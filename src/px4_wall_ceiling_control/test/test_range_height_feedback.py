@@ -23,9 +23,9 @@ class RangeHeightTests(unittest.TestCase):
         self.assertFalse(r.locked)
         self.assertEqual(r.last_tick, last_tick)
         self.assertEqual(tuple(r.pending), pending)
-        r.process(10.30)
+        r.observe_pose(10.26, 10.29, pitch(6.))
         self.assertTrue(r.locked)
-        self.assertEqual(r.action_started, 10.30)
+        self.assertEqual(r.action_started, 10.29)
 
     def test_read_snapshot_does_not_invalidate_history_but_still_reports_expiry(self):
         r = self.tracker()
@@ -123,9 +123,10 @@ class RangeHeightTests(unittest.TestCase):
         target = r.target
         self.frame(r, 10.35, 1.3)
         self.frame(r, 10.6, 1.3, 16.)
-        self.assertFalse(r.snapshot(10.6).valid)
+        self.assertTrue(r.snapshot(10.6).valid)
+        self.assertFalse(r.snapshot(10.6).velocity_valid)
         self.assertEqual(r.target, target)
-        self.assertFalse(self.frame(r, 10.8, 1.25, 12.).velocity_valid)
+        self.assertTrue(self.frame(r, 10.8, 1.25, 12.).velocity_valid)
         self.assertTrue(self.frame(r, 11.05, 1.25, 5.).velocity_valid)
         self.assertEqual(r.target, target)
 
@@ -168,8 +169,9 @@ class RangeHeightTests(unittest.TestCase):
         r = self.tracker()
         self.frame(r, 10.1)
         s = self.frame(r, 10.35, 4.5)
-        self.assertFalse(s.valid)
+        self.assertTrue(s.valid)
         self.assertFalse(s.velocity_valid)
+        self.assertAlmostEqual(s.height, 1.24)
         self.assertEqual(r.target, 1.24)
 
     def test_invalid_numbers_and_device_limits(self):
@@ -192,19 +194,64 @@ class RangeHeightTests(unittest.TestCase):
     def test_pending_pose_timeout_does_not_fabricate_height(self):
         r = self.tracker()
         r.observe_range(10.1, 10.1, 1.24)
-        r.snapshot(10.2)
+        r.snapshot(10.31)
         self.assertFalse(r.locked)
         self.assertIn('采样时刻姿态缺失或匹配超时', r.rejected)
 
-    def test_low_rate_pose_uses_nearest_source_within_tolerance_after_brief_wait(self):
+    def test_low_rate_pose_requires_bounded_bracketing_interpolation(self):
         r = self.tracker()
         r.observe_pose(10.09, 10.09, pitch(7.))
         r.observe_range(10.1, 10.11, 1.24)
-        self.assertFalse(r.locked)  # Give a bracketing pose its short opportunity.
-        r.snapshot(10.14)
+        self.assertFalse(r.locked)
+        r.observe_pose(10.17, 10.18, pitch(5.))
         self.assertTrue(r.locked)
-        self.assertAlmostEqual(r.pose_match_dt_s, .01)
-        self.assertAlmostEqual(r.target, 1.24*math.cos(math.radians(7.)))
+        self.assertAlmostEqual(r.pose_match_dt_s, .08)
+        self.assertAlmostEqual(r.pose_before_dt_s, .01)
+        self.assertAlmostEqual(r.pose_after_dt_s, .07)
+        self.assertAlmostEqual(r.target, 1.24*math.cos(math.radians(6.75)), places=7)
+
+    def test_nearest_pose_is_not_used_after_wait_budget(self):
+        r = self.tracker()
+        r.observe_pose(10.09, 10.09, pitch(7.))
+        r.observe_range(10.1, 10.11, 1.24)
+        r.snapshot(10.32)
+        self.assertFalse(r.locked)
+        self.assertIn('采样时刻姿态缺失或匹配超时', r.rejected)
+
+    def test_full_eighty_ms_pose_span_is_accepted(self):
+        r = self.tracker()
+        r.observe_pose(10.08, 10.09, pitch(8.))
+        r.observe_range(10.10, 10.11, 1.24)
+        r.observe_pose(10.16, 10.17, pitch(4.))
+        s = r.snapshot(10.17)
+        self.assertTrue(s.valid)
+        self.assertAlmostEqual(s.pose_span_s, .08)
+        self.assertAlmostEqual(s.pose_before_dt_s, .02)
+        self.assertAlmostEqual(s.pose_after_dt_s, .06)
+
+    def test_speed_confidence_failure_keeps_fresh_height_valid(self):
+        r = self.tracker(jump_m=5.)
+        self.frame(r, 10.1, 1.)
+        s = self.frame(r, 10.35, 2.)
+        self.assertTrue(s.valid)
+        self.assertFalse(s.velocity_valid)
+        self.assertIsNone(r.height_invalid_since)
+        self.assertIsNotNone(r.velocity_invalid_since)
+
+    def test_height_expiry_starts_at_earlier_source_or_receipt_deadline(self):
+        r = self.tracker()
+        self.frame(r, 10.1, received=10.2)
+        r.process(10.71)
+        self.assertFalse(r.read_snapshot(10.71).valid)
+        self.assertAlmostEqual(r.height_invalid_since, 10.7)
+
+    def test_fast_velocity_is_parallel_observer(self):
+        r = self.tracker()
+        self.frame(r, 10.1, 1.)
+        s = self.frame(r, 10.35, 1.05)
+        self.assertTrue(s.fast_velocity_valid)
+        self.assertAlmostEqual(s.fast_velocity, .2)
+        self.assertTrue(s.velocity_valid)
 
     def test_nearest_pose_outside_tolerance_never_qualifies(self):
         r = self.tracker()

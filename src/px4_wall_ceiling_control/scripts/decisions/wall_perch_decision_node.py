@@ -2640,6 +2640,10 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         self._prepare_vertical_reference(now)
         self._prepare_horizontal_velocity(now)
         self._prepare_horizontal_equilibrium(now)
+        # Range fault budgets must be visible to the state machine in the same
+        # cycle, rather than first changing while the candidate is built.
+        if self._range_task_active():
+            self._prepare_range_feedback(now)
         self._update_state_machine(now)
         status = self._build_status(now)
         self.status_publisher.publish(status)

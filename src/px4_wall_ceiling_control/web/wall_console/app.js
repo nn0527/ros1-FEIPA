@@ -145,7 +145,7 @@ function paint(s){
     (wall.detach_range_manual_recovery?" · 异常后的人工恢复":"")+" · "+(wall.detach_range_valid?"反馈有效":"反馈无效")+" · 年龄 "+n(wall.detach_range_age_s,2)+" s · 连续稳定 "+n(wall.detach_range_stable_elapsed_s,2)+" s / "+wall.detach_range_stable_samples+" 条新测距":"测距离墙闭环：未开始");
   text("rangeHeightEvidence",rangeTask?
     "首帧原值 / 几何高度 / 采样倾角："+n(wall.detach_range_lock_raw_m)+" m / "+n(wall.detach_range_lock_height_m)+" m / "+n(wall.detach_range_lock_tilt_deg,2)+"°；源 / 接收时间："+n(wall.detach_range_lock_source_time,6)+" / "+n(wall.detach_range_lock_received_time,6)+
-    "；入口 "+n(wall.detach_range_entry_tilt_deg,1)+"°；当前采样角 "+n(wall.detach_range_sample_tilt_deg,2)+"°；姿态匹配差 "+n(wall.detach_range_pose_match_dt_s,3)+" s。阶段 2、3 中，相对起飞高度仅作融合诊断，新垂直闭环未使用。":"首帧按消息源时间与姿态匹配；距离字段无独立硬件测距时间时，不代表硬件首次测距瞬间。");
+    "；快速速度 "+(wall.detach_range_fast_velocity_valid?n(wall.detach_range_fast_velocity_mps,3)+" m/s":"未就绪")+"；入口 "+n(wall.detach_range_entry_tilt_deg,1)+"°；当前采样角 "+n(wall.detach_range_sample_tilt_deg,2)+"°；姿态跨度/等待 "+n(wall.detach_range_pose_span_s,3)+" / "+n(wall.detach_range_pose_wait_s,3)+" s。快速速度仅并行观察，不接管推力。":"首帧按消息源时间与姿态匹配；距离字段无独立硬件测距时间时，不代表硬件首次测距瞬间。");
   text("height",n(wall?.height_above_takeoff_m));
   if(runtime?.front_sensor_masked)text("front","已屏蔽");
   text("rangeWarning",(s.sensor_warnings || []).join("；") +
