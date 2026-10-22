@@ -69,7 +69,7 @@ wall_perch_decision_node:
   # Detach attitude trajectory duration.
   # 90 deg over 3 s (quintic setpoint).
   detach_time_s: 3.00
-  detach_duration_timeout_s: 8.00
+  detach_duration_timeout_s: 10.00
   detach_max_tracking_error_deg: 30.0
   detach_recovered_tilt_deg: 5.0
   detach_recovered_rate_deg_s: 10.0
