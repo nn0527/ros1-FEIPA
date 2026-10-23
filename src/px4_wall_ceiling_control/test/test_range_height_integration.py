@@ -134,8 +134,11 @@ class RangeDetachNodeTests(unittest.TestCase):
         self.assertFalse(n.detach_range_faulted)
         self.seconds = 10.56
         n._prepare_range_feedback(at(self.seconds))
-        self.assertTrue(n.detach_range_faulted)
-        self.assertIn('实际输出同步超时', n.detach_vertical_fault)
+        self.assertFalse(n.detach_range_faulted)
+        self.assertFalse(n.detach_range_synced)
+        self.fx.output(n, self.seconds, tilt=7.)
+        n._prepare_range_feedback(at(self.seconds))
+        self.assertTrue(n.detach_range_synced)
 
     def test_cycle_time_is_shared_and_cleared_after_exception(self):
         n = self.n
@@ -172,12 +175,12 @@ class RangeDetachNodeTests(unittest.TestCase):
         self.fx.output(n, self.seconds, tilt=0., thrust=.68)
         self.assertAlmostEqual(n._detach_vertical_thrust(at(self.seconds), .02), .68)
         self.assertFalse(n.detach_range.snapshot(self.seconds).velocity_valid)
-        self.seconds = 11.17
+        self.seconds = 12.87
         n._prepare_detach_vertical_feedback(at(self.seconds))
         self.assertEqual(n.detach_task_phase, 'FAULT')
         self.assertTrue(n.detach_vertical_fault)
         self.fx.enter(n, W.STATE_ABORT, self.seconds)
-        self.frame(11.2, distance=1.3)
+        self.frame(12.9, distance=1.3)
         self.assertEqual(n.detach_range.target, reference)
         self.assertEqual(n.detach_vertical_controller.reference, reference)
         self.assertEqual(n.detach_task_phase, 'FAULT')
@@ -275,12 +278,12 @@ class RangeDetachNodeTests(unittest.TestCase):
             self.n._range_stability_ready(at(t))
         self.assertEqual(self.n.detach_range_stable_samples, 1)
 
-    def test_total_timeout_survives_phase_changes(self):
+    def test_automatic_control_does_not_add_a_convergence_deadline(self):
         self.stable_exit()
         self.frame(25.3)
         self.n._prepare_detach_vertical_feedback(at(self.seconds))
-        self.assertEqual(self.n.detach_task_phase, 'FAULT')
-        self.assertIn('总时间', self.n.detach_vertical_fault)
+        self.assertFalse(self.n.detach_range_faulted)
+        self.assertFalse(self.n.detach_vertical_fault)
 
     def test_parameter_update_does_not_change_active_episode(self):
         self.params['~detach_range_entry_tilt_deg'] = 8.
@@ -465,49 +468,39 @@ class FastRangeVelocityControlTests(unittest.TestCase):
         return n, snapshot
 
     def test_direction_reversal_uses_fast_velocity_before_slow_turns_negative(self):
-        n, s = self.seeded(height=1.966, velocity=.478, fast_velocity=-.389)
+        n, s = self.seeded(height=1.26, velocity=.478, fast_velocity=-.389)
         c = n.detach_vertical_controller
         target, base = c.reference, c.base
-        with mock.patch.object(c, 'update', wraps=c.update) as update:
+        with mock.patch.object(c, 'update_range', wraps=c.update_range) as update:
             value = n._range_vertical_thrust(at(self.seconds))
         self.assertEqual(update.call_args.args[1], -.389)
         self.assertGreater(c.requested, base)
         self.assertGreater(value, .50)
         self.assertLessEqual(value-.50, c.thrust_slew*.05+1.e-9)
         self.assertEqual((c.reference, c.base), (target, base))
-        self.assertIn('control_velocity=fast', n.detach_vertical_reason)
+        self.assertIn('range PD', n.detach_vertical_reason)
 
     def test_initial_missing_fast_velocity_holds_valid_actual_output(self):
         self.frame(10.25)
         self.seconds = 10.27
         self.fx.output(self.n, self.seconds, tilt=0., thrust=.61)
         self.n.detach_vertical_controller.integral = .02
-        self.assertAlmostEqual(self.n._range_vertical_thrust(at(self.seconds)), .61)
+        self.assertAlmostEqual(self.n._range_vertical_thrust(at(self.seconds)), .60)
         self.assertEqual(self.n.detach_vertical_controller.integral, 0.)
-        self.assertIn('control_velocity=hold', self.n.detach_vertical_reason)
+        self.assertIn('range P', self.n.detach_vertical_reason)
 
-    def test_fast_loss_timeout_is_latched_through_abort_even_if_slow_valid(self):
+    def test_missing_fast_velocity_uses_height_p_without_latching_fault(self):
         n, s = self.seeded(fast_velocity_valid=False, velocity=.1)
-        n.detach_fast_invalid_since = self.seconds
-        n.detach_vertical_controller.integral = .03
-        for seconds in (10.82, 11.119):
+        for seconds in (10.82, 11.12, 11.32):
             self.seconds = seconds
+            self.fx.feedback(n, seconds, tilt=0.)
             self.fx.output(n, seconds, tilt=0., thrust=.52)
-            self.assertAlmostEqual(n._range_vertical_thrust(at(seconds)), .52)
+            value = n._range_vertical_thrust(at(seconds))
+            self.assertTrue(math.isfinite(value))
             self.assertEqual(n.detach_vertical_controller.integral, 0.)
-        self.seconds = 11.12
-        self.fx.output(n, self.seconds, tilt=0., thrust=.52)
-        self.assertTrue(math.isnan(n._range_vertical_thrust(at(self.seconds))))
-        self.assertTrue(n.detach_fast_velocity_fault)
-        self.assertIn('快速测距速度失效', n.detach_vertical_fault)
-        self.fx.tick(n, self.seconds)
-        self.assertEqual(n.state, W.STATE_ABORT)
-        self.assertTrue(math.isnan(n._range_vertical_thrust(at(self.seconds))))
-        self.assertFalse(n.recovery_support_valid)
-        status = n._build_status(at(self.seconds))
-        candidate = n._build_control_candidate(status, 'faulted-fast-source', 1)
-        self.assertFalse(candidate.valid)
-        self.assertEqual(candidate.kind, candidate.KIND_NONE)
+            self.assertFalse(n.detach_fast_velocity_fault)
+            self.assertFalse(n.detach_range_faulted)
+            self.assertIn('range P', n.detach_vertical_reason)
 
     def test_nan_expired_and_future_fast_samples_cannot_drive_control(self):
         n, s = self.seeded()
@@ -516,8 +509,9 @@ class FastRangeVelocityControlTests(unittest.TestCase):
             bad = replace(s, **changes)
             n.detach_range.read_snapshot.return_value = bad
             n._reset_range_control_velocity()
-            self.assertAlmostEqual(n._range_vertical_thrust(at(self.seconds)), .50)
-            self.assertIn('control_velocity=hold', n.detach_vertical_reason)
+            self.assertAlmostEqual(n._range_vertical_thrust(at(self.seconds)),
+                                   n.detach_vertical_controller.base)
+            self.assertIn('range P', n.detach_vertical_reason)
 
     def test_output_loss_precedes_fast_timeout_and_cannot_hold_stale_collective(self):
         n, s = self.seeded(fast_velocity_valid=False)
@@ -538,22 +532,17 @@ class FastRangeVelocityControlTests(unittest.TestCase):
         self.assertEqual(n.state, W.STATE_ABORT)
         self.assertIn('detach safety input lost', n.last_reason)
 
-    def test_fast_recovery_restarts_blend_without_reanchoring(self):
+    def test_fast_recovery_adds_damping_without_reanchoring_or_extra_blend(self):
         n, s = self.seeded(fast_velocity_valid=False)
         target, base = n.detach_range.target, n.detach_vertical_controller.base
         n._range_vertical_thrust(at(self.seconds))
         self.seconds = 10.90
         self.fx.output(n, self.seconds, tilt=0., thrust=.50)
         n.detach_range.read_snapshot.return_value = replace(s, fast_velocity_valid=True, fast_velocity=-.3)
-        with mock.patch.object(n.detach_vertical_controller, 'update', wraps=n.detach_vertical_controller.update) as update:
+        with mock.patch.object(n.detach_vertical_controller, 'update_range', wraps=n.detach_vertical_controller.update_range) as update:
             n._range_vertical_thrust(at(self.seconds))
-            self.assertEqual(update.call_args.kwargs['velocity_weight'], 0.)
-            self.assertFalse(update.call_args.kwargs['integrate'])
-            self.seconds = 11.05
-            self.fx.output(n, self.seconds, tilt=0., thrust=.50)
-            n._range_vertical_thrust(at(self.seconds))
-            self.assertAlmostEqual(update.call_args.kwargs['velocity_weight'], .5)
-        self.assertEqual(n.detach_fast_ready_since, 10.90)
+        self.assertEqual(update.call_args.args[1], -.3)
+        self.assertAlmostEqual(n.detach_vertical_controller.correction, .18*.3)
         self.assertEqual(n.detach_range.target, target)
         self.assertEqual(n.detach_vertical_controller.base, base)
 
@@ -582,7 +571,7 @@ class FastRangeVelocityControlTests(unittest.TestCase):
         n, s = self.seeded(velocity=.05, fast_velocity=-.4)
         for state, revision in ((W.STATE_ABORT, 0), (W.STATE_RECOVER, 1)):
             n.state, n.detach_range.target_revision = state, revision
-            with mock.patch.object(n.detach_vertical_controller, 'update', wraps=n.detach_vertical_controller.update) as update:
+            with mock.patch.object(n.detach_vertical_controller, 'update_range', wraps=n.detach_vertical_controller.update_range) as update:
                 n._range_vertical_thrust(at(self.seconds))
                 self.assertEqual(update.call_args.args[1], -.4)
             self.seconds += .02

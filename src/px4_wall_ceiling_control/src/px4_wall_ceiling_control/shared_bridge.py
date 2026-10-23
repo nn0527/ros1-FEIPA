@@ -180,7 +180,9 @@ def serve(runtime_factory, socket_path):
                     try:
                         data = broker.request(identifier, request.get("action"), request.get("config"))
                         send({"type": "reply", "id": request["id"], "ok": True, "data": data})
-                    except (ValueError, KeyError, TypeError, OSError) as error:
+                    except Exception as error:
+                        # Unexpected startup failures must reply, not kill this
+                        # client thread and turn into an ambiguous UI timeout.
                         send({"type": "reply", "id": request.get("id"), "ok": False, "error": str(error)})
             except (OSError, ValueError, KeyError, TypeError):
                 pass

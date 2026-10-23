@@ -36,8 +36,8 @@ class ManualRangeHeightTests(unittest.TestCase):
     def timeout(self):
         self.frame(25.3)
         self.frame(25.5)
-        self.n._prepare_range_feedback(fixtures.at(25.5))
-        self.n._update_state_machine(fixtures.at(25.5))
+        # Seed an explicit prior timeout fault; automatic convergence has no deadline now.
+        self.n._enter_state(W.STATE_ABORT, fixtures.at(25.5), '测距闭环总时间预算超时')
         self.assertEqual(self.n.state, W.STATE_ABORT)
         self.n._front_fresh = self.n._sensor_health_fresh = lambda now: True
         self.n.front_range = SimpleNamespace(range=1.)

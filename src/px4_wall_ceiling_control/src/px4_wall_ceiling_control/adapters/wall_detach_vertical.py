@@ -71,6 +71,9 @@ class WallDetachVerticalMixin:
                       self.detach_range_config.control_velocity_kp, c.velocity_kp, c.height_kp,
                       c.velocity_ki, c.correction_limit, c.thrust_slew, c.up_speed, c.down_speed)
         self.detach_range = RangeHeightFeedback(self.detach_range_config)
+        self.departure_trace_publisher = rospy.Publisher('/wall_perch/departure_trace', String, queue_size=20)
+        self.departure_trace_at = None
+        self.departure_trace_key = None
         self.detach_range_episode = 0
         self._reset_range_task()
         if self.detach_range_enabled:
@@ -124,7 +127,7 @@ class WallDetachVerticalMixin:
     def _detach_height_loop_ready(self):
         if self._range_task_active():
             s = self.detach_range.read_snapshot(self._range_feedback_now().to_sec())
-            return bool(s.valid and s.velocity_valid and not self.detach_vertical_fault)
+            return bool(s.valid and self.detach_range_synced and not self.detach_vertical_fault)
         continuation = getattr(self, 'detach_height_continuation', None)
         return not getattr(self, 'detach_vertical_active', False) or continuation is None or continuation.ready
 
@@ -141,6 +144,19 @@ class WallDetachVerticalMixin:
             self._prepare_range_feedback(now)
             if self.detach_range.locked:
                 return
+            # Before range, only attitude and owned output are admissible.
+            # Do not snapshot local Z/vz or enter the old continuity/reanchor loop.
+            self.detach_feedback_valid = self.recovery_support_valid = False
+            self.detach_feedback_snapshot = self.detach_feedback_output = None
+            flight = getattr(self, 'flight_state', None)
+            if not (flight and flight.connected and flight.armed and flight.mode.upper() == 'OFFBOARD'
+                    and is_fresh_receipt(getattr(self, 'flight_state_received_at', None), self.state_timeout_s, now)
+                    and self._detach_vertical_feedback_ok(now)):
+                self.detach_vertical_reason = '仅支撑等待新鲜姿态及OFFBOARD权限'
+                return
+            self.detach_feedback_output = self._detach_vertical_output(now, allow_recovery=True)
+            self.detach_feedback_valid = self.detach_feedback_output is not None
+            return
         # Recheck live authority even on duplicate evaluations. The feedback
         # lock keeps odometry fixed; repeated source samples add no evidence.
         self.detach_feedback_prepared_at = now
@@ -196,13 +212,13 @@ class WallDetachVerticalMixin:
             controller.clear_integral()
 
     def _detach_vertical_feedback_ok(self, now):
-        if self._range_locked():
+        if getattr(self, 'detach_range_enabled', False):
             estimate = getattr(self, 'horizontal_estimator', None)
             valid = bool(self._odom_fresh(now) and self._current_quaternion() is not None
                          and estimate is not None and estimate.attitude_status_flag
                          and is_fresh_receipt(getattr(self, 'horizontal_estimator_at', None), 1., now))
             if not valid:
-                self.detach_vertical_reason = '等待有效实际姿态；测距闭环不读取旧Z/融合竖直速度'
+                self.detach_vertical_reason = '等待有效实际姿态；脱离全程不读取局部Z/融合竖直速度'
             return valid
         if not self._odom_fresh(now) or self._height_feedback() is None or self._current_quaternion() is None:
             self.detach_vertical_reason = '脱离高度、速度或姿态反馈无效/过期'
@@ -269,7 +285,8 @@ class WallDetachVerticalMixin:
         if output is not actual:
             self.detach_vertical_reason = '脱离初始化期间最终输出消息已变化，等待一致的姿态与推力快照'
             return False
-        feedback = self._height_feedback()
+        range_departure = getattr(self, 'detach_range_enabled', False)
+        feedback = None if range_departure else self._height_feedback()
         base = getattr(self, 'approach_base_vertical_thrust', None)
         source = 'POSCTL接管垂直支撑'
         if base is None or not math.isfinite(base):
@@ -278,21 +295,25 @@ class WallDetachVerticalMixin:
         if base is None or not math.isfinite(base):
             base, source = self.hover_thrust, '配置悬停基准（未采集接管支撑）'
         try:
-            self.detach_vertical_controller.begin(feedback[0], base, float(actual.thrust), now.to_sec())
+            if range_departure:
+                self.detach_vertical_controller.begin_support(base, float(actual.thrust), now.to_sec())
+            else:
+                self.detach_vertical_controller.begin(feedback[0], base, float(actual.thrust), now.to_sec())
         except ValueError as error:
             self.detach_vertical_reason = str(error)
             return False
-        self.detach_altitude_m = self.recovery_altitude_m = feedback[0]
+        self.detach_altitude_m = self.recovery_altitude_m = None if range_departure else feedback[0]
         self.recovery_wait_for_level = False
-        self.vertical_reference_source = 'detach_start_height'
+        self.vertical_reference_source = 'attitude_support_until_range' if range_departure else 'detach_start_height'
         self.detach_vertical_base_source = source
         self.detach_vertical_active = self.recovery_support_valid = True
         self.detach_vertical_value = self.detach_vertical_controller.value
         self.recovery_thrust_limit = self.detach_vertical_controller.max_thrust
-        self.detach_vertical_reason = '已锁定脱离开始高度，继承实际输出推力'
-        self.detach_vertical_last_feedback = (self.odom.header.stamp.to_sec(), feedback[0], feedback[1])
-        sample = self._snapshot_departure_feedback()
-        self.detach_height_continuation.observe(now.to_sec(), sample.source, sample.height, sample.velocity, sample.tilt_deg)
+        self.detach_vertical_reason = '仅姿态推力支撑，等待测距锁定；无高度目标' if range_departure else '已锁定脱离开始高度，继承实际输出推力'
+        if not range_departure:
+            self.detach_vertical_last_feedback = (self.odom.header.stamp.to_sec(), feedback[0], feedback[1])
+            sample = self._snapshot_departure_feedback()
+            self.detach_height_continuation.observe(now.to_sec(), sample.source, sample.height, sample.velocity, sample.tilt_deg)
         if getattr(self, 'detach_range_enabled', False):
             self._reset_range_task()
             self.detach_range_episode += 1
@@ -316,6 +337,23 @@ class WallDetachVerticalMixin:
         self._prepare_detach_vertical_feedback(now)
         if self._range_locked():
             return self._range_vertical_thrust(now)
+        if self._range_task_active():
+            if not self.detach_feedback_valid:
+                return math.nan
+            controller = self.detach_vertical_controller
+            q = self._current_quaternion()
+            try:
+                thrust = controller.update_support(rotate_vector(q, (0., 0., 1.))[2], now.to_sec(),
+                                                   float(self.detach_feedback_output.thrust))
+            except ValueError as error:
+                self.detach_vertical_fault = self.detach_vertical_reason = str(error)
+                return math.nan
+            self.detach_vertical_value = thrust
+            self.recovery_support_valid = True
+            self.recovery_thrust_limit = controller.max_thrust
+            self.vertical_target_speed, self.vertical_correction = math.nan, 0.
+            self.detach_vertical_reason = '仅姿态推力支撑，等待测距锁定；无高度目标'
+            return thrust
         controller = self.detach_vertical_controller
         self.recovery_support_valid = False
         if not self.detach_feedback_valid:
@@ -380,6 +418,9 @@ class WallDetachVerticalMixin:
         self.recovery_support_valid = True
         self.recovery_thrust_limit = controller.max_thrust
         self.vertical_target_speed, self.vertical_correction = controller.target_speed, controller.correction
+        if controller.reference_tracking:
+            self.detach_altitude_m = self.recovery_altitude_m = controller.reference
+            self.vertical_reference_source = 'wall_support_reference_tracking'
         self.detach_vertical_reason = ('近竖直仍需墙面/机构承重，保持连续压力' if controller.support_weight < 1.-1e-9
             else '脱离保高输出受限' if controller.saturated else '脱离保高闭环有效')
         if self.detach_vertical_output_reason:
@@ -394,6 +435,8 @@ class WallDetachVerticalMixin:
                 continuation.total_used, continuation.total_s, continuation.weight))
         if self.detach_height_reanchor_note:
             self.detach_vertical_reason += '；'+self.detach_height_reanchor_note
+        if controller.reference_tracking:
+            self.detach_vertical_reason += '；reference_tracking=True'
         return thrust
 
     def _fill_detach_vertical_status(self, status):
@@ -421,6 +464,10 @@ class WallDetachVerticalMixin:
             status.vertical_reference_source = self.vertical_reference_source
             status.vertical_target_enu_mps = controller.target_speed
             status.vertical_thrust_correction = controller.correction
+            if self._range_task_active() and not self._range_locked():
+                status.vertical_control_active = status.vertical_reference_valid = False
+                status.vertical_reference_m = status.vertical_target_enu_mps = math.nan
+                status.detach_height_error_m = math.nan
         self._fill_range_status(status)
 
     def _range_config(self):
@@ -462,8 +509,8 @@ class WallDetachVerticalMixin:
     def _range_control_velocity(self, snapshot, now):
         """One velocity selection for both thrust feedback and descent safety.
 
-        Missing fast feedback is a bounded-hold/fault condition, never authority
-        to substitute the slower regression velocity for either consumer.
+        Missing fast feedback selects height P only. It never substitutes
+        fused local velocity or a fictitious zero velocity.
         """
         if self._range_fast_control_active():
             valid = self._range_fast_velocity_valid(snapshot, now)
@@ -487,33 +534,17 @@ class WallDetachVerticalMixin:
         return detail
 
     def _prepare_range_control_velocity(self, now, snapshot):
+        """Observe availability; missing velocity never latches a task fault."""
         if not self._range_fast_control_active():
             return
         if self._range_fast_velocity_valid(snapshot, now.to_sec()):
             self.detach_fast_invalid_since = None
             if self.detach_fast_ready_since is None:
                 self.detach_fast_ready_since = now.to_sec()
-            return
-        self.detach_fast_ready_since = None
-        self.detach_vertical_controller.clear_integral()
-        if self.detach_fast_invalid_since is None:
-            self.detach_fast_invalid_since = now.to_sec()
-        if now.to_sec()-self.detach_fast_invalid_since < self.detach_range.config.loss_support_s-2.e-9:
-            return
-        # Existing safety/authority/output failures retain priority. This new
-        # fault only describes a live, owned, otherwise safe control channel.
-        if (not snapshot.valid or not self._safety_ok(now)
-                or not self._detach_vertical_feedback_ok(now)
-                or self._detach_vertical_output(now, allow_recovery=True) is None):
-            return
-        reason = '快速测距速度失效超过短时支撑上限'
-        self.detach_fast_velocity_fault = True
-        self.detach_vertical_fault = reason
-        self.detach_range_failure_cause = self.detach_range_failure_cause or reason
-        self.detach_range_faulted = True
-        self.detach_task_phase = 'FAULT'
-        self.detach_range_block_reason = reason
-        self._range_control_velocity_reason('fault', snapshot, now)
+        else:
+            self.detach_fast_ready_since = None
+            if self.detach_fast_invalid_since is None:
+                self.detach_fast_invalid_since = now.to_sec()
 
     def _reset_range_task(self):
         self._reset_range_control_velocity()
@@ -533,6 +564,82 @@ class WallDetachVerticalMixin:
         self.detach_range_manual_recovery = False
         self.detach_range_previous_fault = ''
         self.detach_range_failure_cause = ''
+        self.detach_level_stable_at = None
+
+    def _publish_departure_trace(self, now, status):
+        """10 Hz source-labelled evidence; actual output may precede this cycle."""
+        if not getattr(self, 'detach_range_enabled', False):
+            return
+        if not (getattr(self, 'detach_requested', False) or self._range_task_active()):
+            return
+        seconds = now.to_sec()
+        r, c = self.detach_range, self.detach_vertical_controller
+        snapshot = r.read_snapshot(seconds)
+        velocity, velocity_valid = self._range_control_velocity(snapshot, seconds)
+        mode = ('SUPPORT' if not r.locked else 'WAIT_OUTPUT' if not self.detach_range_synced
+                else 'RANGE_LOSS_SUPPORT' if not snapshot.valid
+                else 'RANGE_PD' if velocity_valid else 'RANGE_P')
+        stage = ('FAULT' if self.state == W.STATE_ABORT or self.detach_range_faulted
+                 else 'LEVEL_STABLE' if self.detach_level_stable_at is not None
+                 else 'REQUEST_WAIT' if self.state == W.STATE_WALL_HOLD
+                 else 'ROTATE' if self._detach_progress() < 1. else 'WAIT_LEVEL')
+        key = (stage, mode)
+        last = self.departure_trace_at
+        if last is not None and 0 <= seconds-last < .1-1.e-9 and key == self.departure_trace_key:
+            return
+        self.departure_trace_at, self.departure_trace_key = seconds, key
+        def tilt(q):
+            return math.degrees(math.acos(max(-1., min(1., rotate_vector(q, (0., 0., 1.))[2]))))
+        measured = self._current_quaternion()
+        output = getattr(self, 'horizontal_output', None)
+        sent_q = (tuple(getattr(output.orientation, k) for k in 'xyzw') if output else None)
+        command_q = tuple(getattr(status.attitude_setpoint, k) for k in 'xyzw')
+        omega = self.odom.twist.twist.angular if self.odom else None
+        requested_at = getattr(self, 'detach_requested_at', None)
+        error = r.target-snapshot.height if snapshot.valid else math.nan
+        row = dict(version='departure_demo_v1', time_s=seconds, stage=stage, state=status.state_name,
+            mode=mode, episode=r.episode, maneuver_id=self.maneuver_id,
+            request_time_s=requested_at.to_sec() if requested_at else None,
+            rotation_time_s=r.started, level_stable_time_s=self.detach_level_stable_at,
+            progress=self._detach_progress(), trajectory_duration_s=self.detach_time_s,
+            measured_tilt_deg=tilt(measured) if measured else None,
+            measured_rate_deg_s=math.degrees(math.sqrt(sum(getattr(omega, k)**2 for k in 'xyz'))) if omega else None,
+            measured_body_rate_rad_s=tuple(getattr(omega, k) for k in 'xyz') if omega else None,
+            attitude_source='odom',
+            vertical_fraction=rotate_vector(measured, (0., 0., 1.))[2] if measured else None,
+            attitude_source_time_s=self.odom.header.stamp.to_sec() if self.odom else None,
+            candidate_q=command_q, candidate_tilt_deg=tilt(command_q) if status.attitude_setpoint_valid else None,
+            candidate_thrust=status.thrust_normalized,
+            candidate_valid=status.candidate_valid, odom_fresh=status.odom_fresh,
+            flight_ready=self._flight_ready(now),
+            body_rates_safe=self._rates_safe(self.recover_max_rate_rps),
+            sent_q=sent_q, sent_tilt_deg=tilt(sent_q) if sent_q else None,
+            sent_thrust=output.thrust if output else None,
+            sent_source_time_s=output.header.stamp.to_sec() if output else None,
+            sent_fresh_owned=self._valid_wall_output(now) is not None,
+            range_target_m=r.target, range_height_m=snapshot.height,
+            range_raw_m=snapshot.raw_distance, range_projected_m=snapshot.projected_height,
+            range_sample_tilt_deg=snapshot.sample_tilt_deg, range_pose_match_dt_s=snapshot.pose_match_dt_s,
+            range_source_time_s=snapshot.source, range_age_s=snapshot.age,
+            range_valid=snapshot.valid, range_velocity_mps=velocity,
+            range_velocity_valid=velocity_valid, range_error_m=error,
+            descent_limit_exceeded=velocity_valid and velocity < -self.max_down_velocity_mps,
+            height_p=r.config.height_only_kp*error,
+            velocity_d=-r.config.control_velocity_kp*velocity if velocity_valid else 0.,
+            base_thrust=c.base if c.active else None, correction=c.correction if c.active else None,
+            base_source=self.detach_vertical_base_source, support_weight=c.support_weight if c.active else None,
+            requested_thrust=c.requested if c.active else None,
+            slew_limited=c.slew_limited if c.active else False,
+            saturated=c.saturated if c.active else False,
+            reason=status.reason, range_reason=snapshot.reason)
+        def clean(value):
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            if isinstance(value, (list, tuple)):
+                return [clean(item) for item in value]
+            return value
+        row = {k: clean(v) for k, v in row.items()}
+        self.departure_trace_publisher.publish(String(data=json.dumps(row, ensure_ascii=False, allow_nan=False)))
 
     def _manual_range_height_block_reason(self, now):
         """Admission for an explicit bounded action, never a fault auto-retry."""
@@ -722,16 +829,10 @@ class WallDetachVerticalMixin:
         failure = ''
         if clock_reversed or seconds < r.action_started:
             failure = '测距控制时钟倒退'
-        elif seconds-r.action_started >= r.config.control_timeout_s:
-            failure = '测距闭环总时间预算超时'
-        elif (not self.detach_range_synced and r.lock_time is not None
-              and seconds-r.lock_time >= r.config.output_sync_timeout_s):
-            failure = '测距锁定后实际输出同步超时'
+        elif r.target_revision and seconds-r.action_started >= r.config.control_timeout_s:
+            failure = '手动测距闭环总时间预算超时'
         elif r.invalid_since is not None and seconds-r.invalid_since >= r.config.loss_support_s:
             failure = '测距失效超过短时支撑上限'
-        elif (self.detach_range_handover_started is not None
-              and seconds-self.detach_range_handover_started >= r.config.handover_wait_s):
-            failure = '测距交回等待超时'
         if failure and not self.detach_range_faulted:
             self.detach_range_failure_cause = failure
             self.detach_range_faulted = True
@@ -752,6 +853,30 @@ class WallDetachVerticalMixin:
                          or (self._range_fast_velocity_valid(s, now.to_sec())
                              and abs(s.fast_velocity) <= c.speed_tolerance_mps)))
 
+    def _range_hold_thrust(self, now, actual):
+        """Hold fresh output with a slew-bounded hover floor, without velocity."""
+        c = self.detach_vertical_controller
+        seconds = now.to_sec()
+        fraction = rotate_vector(self._current_quaternion(), (0., 0., 1.))[2]
+        if not math.isfinite(fraction) or seconds < c.at:
+            return math.nan
+        if seconds > c.at:
+            requested = max(actual, c.base/max(fraction, .001))
+            target = min(c.max_thrust, requested)
+            step = c.thrust_slew*min(.05, seconds-c.at)
+            c.value = max(.1, min(c.max_thrust, max(actual-step, min(target, actual+step))))
+            c.requested = target
+            c.at = seconds
+            c.slew_limited = abs(target-c.value) > 1.e-9
+            c.saturated = requested > c.max_thrust or c.slew_limited
+        c.correction, c.target_speed = 0., math.nan
+        c.reference_tracking = False
+        self.vertical_target_speed, self.vertical_correction = c.target_speed, c.correction
+        self.detach_vertical_value = c.value
+        self.recovery_support_valid = True
+        self.recovery_thrust_limit = c.max_thrust
+        return c.value
+
     def _range_vertical_thrust(self, now):
         self.recovery_support_valid = False
         c, r = self.detach_vertical_controller, self.detach_range
@@ -766,59 +891,19 @@ class WallDetachVerticalMixin:
         if output is None or not self.detach_range_synced:
             c.clear_integral()
             return math.nan
-        # A fast-velocity timeout is latched through ABORT. In particular, it
-        # cannot quietly re-enter the old slow-velocity/old-Z control path.
-        if self.detach_fast_velocity_fault:
-            c.clear_integral()
-            self.detach_vertical_reason = self.detach_vertical_fault
-            return math.nan
-        fast_control = self._range_fast_control_active()
-        if fast_control:
-            self._prepare_range_control_velocity(now, s)
-            if self.detach_fast_velocity_fault:
-                self.detach_vertical_reason = self.detach_vertical_fault
-                return math.nan
-            if not self._range_fast_velocity_valid(s, now.to_sec()) and s.valid:
-                c.clear_integral()
-                if now.to_sec()-self.detach_fast_invalid_since >= r.config.loss_support_s-2.e-9:
-                    return math.nan
-                # Hold only a newly validated actual collective; do not drive
-                # on height error without measured velocity damping.
-                self.detach_vertical_value = float(output.thrust)
-                c.value = c.requested = self.detach_vertical_value
-                c.at = now.to_sec()
-                c.correction, c.target_speed = 0., math.nan
-                c.slew_limited = c.saturated = False
-                self.recovery_support_valid = True
-                self.recovery_thrust_limit = c.max_thrust
-                self.detach_vertical_reason = self._range_control_velocity_reason('hold', s, now)
-                return self.detach_vertical_value
         if not s.valid:
             c.clear_integral()
             self.detach_vertical_reason = s.reason+'；目标保留，禁止旧Z回退'
-            # Bounded hold uses the last actual collective, no stale error drive.
+            # No stale error drive; the same hover floor applies to short loss.
             if r.invalid_since is None or now.to_sec()-r.invalid_since >= r.config.loss_support_s:
                 return math.nan
-            self.detach_vertical_value = float(output.thrust)
-            c.value = c.requested = self.detach_vertical_value
-            c.correction, c.target_speed = 0., math.nan
-            c.slew_limited = c.saturated = False
-            self.recovery_support_valid = True
-            self.recovery_thrust_limit = c.max_thrust
-            return self.detach_vertical_value
-        weight = min(1., max(0., (now.to_sec()-r.action_started)/r.config.control_blend_s))
-        velocity_weight = (min(1., max(0., (now.to_sec()-r.velocity_ready_at)/r.config.control_blend_s))
-                           if s.velocity_valid and r.velocity_ready_at is not None else 0.)
+            return self._range_hold_thrust(now, float(output.thrust))
         velocity, velocity_valid = self._range_control_velocity(s, now.to_sec())
-        if fast_control:
-            velocity_weight = min(1., max(0., (now.to_sec()-self.detach_fast_ready_since)/r.config.control_blend_s))
         try:
-            thrust = c.update(s.height, velocity if velocity_valid else None,
+            thrust = c.update_range(s.height, velocity if velocity_valid else None,
                 rotate_vector(self._current_quaternion(), (0., 0., 1.))[2],
-                now.to_sec(), s.source, float(output.thrust),
-                integrate=velocity_valid and velocity_weight >= 1. and not self.detach_vertical_output_degraded,
-                correction_weight=weight, height_only_kp=r.config.height_only_kp,
-                velocity_weight=velocity_weight, velocity_kp=r.config.control_velocity_kp)
+                now.to_sec(), float(output.thrust),
+                height_kp=r.config.height_only_kp, velocity_kp=r.config.control_velocity_kp)
         except ValueError as error:
             self.detach_vertical_fault = str(error)
             self.detach_range_failure_cause = self.detach_range_failure_cause or str(error)
@@ -830,8 +915,7 @@ class WallDetachVerticalMixin:
         self.recovery_thrust_limit = c.max_thrust
         self.vertical_target_speed, self.vertical_correction = c.target_speed, c.correction
         self.detach_vertical_reason = s.reason+('；受限输出' if c.saturated else '')
-        if fast_control:
-            self.detach_vertical_reason += '；'+self._range_control_velocity_reason('fast', s, now, velocity_weight)
+        self.detach_vertical_reason = c.reason+('；受限输出' if c.saturated else '')
         return thrust
 
     def _range_stability_ready(self, now):
@@ -844,9 +928,6 @@ class WallDetachVerticalMixin:
             reason = self.detach_vertical_reason
         elif not self._range_height_settled(now):
             reason = '测距高度/速度尚未稳定或新鲜有效'
-        elif self._range_fast_control_active() and (not self._range_fast_velocity_valid(s, now.to_sec())
-                                                   or abs(s.fast_velocity) > c.speed_tolerance_mps):
-            reason = '快速测距速度尚未稳定或新鲜有效'
         elif self._detach_progress() < 1. or not self._detach_rotation_pose_valid():
             reason = '等待姿态轨迹完成、实测倾角≤5°及角速度回稳'
         elif not self._published_recovery_target_ready(now):

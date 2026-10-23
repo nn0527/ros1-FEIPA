@@ -343,7 +343,7 @@ class RangeAdapterGainTests(unittest.TestCase):
         for state,revision in ((W.STATE_DETACH_ROTATE,0),(W.STATE_ABORT,0),(W.STATE_RECOVER,1),(W.STATE_EXIT,1)):
             n.state = state
             n.detach_range.target_revision = revision
-            with mock.patch.object(n.detach_vertical_controller,'update',wraps=n.detach_vertical_controller.update) as update:
+            with mock.patch.object(n.detach_vertical_controller,'update_range',wraps=n.detach_vertical_controller.update_range) as update:
                 n._range_vertical_thrust(range_fixtures.at(self.f.seconds))
             self.assertEqual(update.call_args.kwargs['velocity_kp'],.18)
             self.assertEqual(n.detach_vertical_controller.velocity_kp,.30)

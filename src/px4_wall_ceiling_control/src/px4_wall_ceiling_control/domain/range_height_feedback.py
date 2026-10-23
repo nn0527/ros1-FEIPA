@@ -14,7 +14,7 @@ from .geometry import quaternion_normalize, quaternion_slerp, rotate_vector
 @dataclass(frozen=True)
 class RangeHeightConfig:
     entry_tilt_deg: float = 10.
-    operating_tilt_deg: float = 15.
+    operating_tilt_deg: float = 60.
     timeout_s: float = .60
     pose_interp_max_span_s: float = .10
     pose_wait_s: float = .20
@@ -22,7 +22,7 @@ class RangeHeightConfig:
     height_only_kp: float = .15
     control_velocity_kp: float = .18
     control_blend_s: float = .30
-    loss_support_s: float = .30
+    loss_support_s: float = 2.
     control_timeout_s: float = 15.
     manual_target_m: float = 1.5
     handover_wait_s: float = 6.
@@ -221,7 +221,6 @@ class RangeHeightFeedback:
             return
         if not math.isfinite(distance) or distance <= 0 or not c.min_distance_m <= distance <= c.max_distance_m:
             self._reject('测距无效或超出设备量程')
-            self._invalidate_velocity(received, '测距帧无效，速度等待重建')
             return
         if len(self.pending) == self.pending.maxlen:
             # Never overwrite the first pending candidate with a later one.
@@ -230,7 +229,7 @@ class RangeHeightFeedback:
         self.pending.append((source, received, distance))
         self.process(received)
 
-    def _pose_at(self, source, now):
+    def _pose_at(self, source, now, allow_nearest=False):
         c = self.config
         poses = [p for p in self.poses if 0 <= now-p[1] <= c.timeout_s
                  and -c.future_tolerance_s <= now-p[0] <= c.timeout_s]
@@ -242,7 +241,13 @@ class RangeHeightFeedback:
                 left, right = source-before[0], after[0]-source
                 q = before[2] if span == 0 else quaternion_slerp(before[2], after[2], left/span)
                 return q, left, right, span
-        # Never extrapolate or use receipt-time/nearest attitude.
+        # A nearby source-timed pose is enough for a demo. Requiring two
+        # bracketing messages made ordinary asynchronous arrivals reject data.
+        if allow_nearest and poses:
+            nearest = min(poses, key=lambda p: abs(p[0]-source))
+            distance = abs(nearest[0]-source)
+            if distance <= c.pose_interp_max_span_s+1.e-9:
+                return nearest[2], max(0., source-nearest[0]), max(0., nearest[0]-source), distance
         return None
 
     def _invalidate_velocity(self, now, reason, reset_history=False, invalidate_fast=True):
@@ -282,15 +287,13 @@ class RangeHeightFeedback:
             if now-source > c.timeout_s or now-received > c.timeout_s:
                 self.pending.popleft()
                 self._reject('等待姿态期间测距过期')
-                self._invalidate_velocity(now, '等待姿态期间测距过期，速度等待重建')
                 continue
-            matched = self._pose_at(source, now)
+            matched = self._pose_at(source, now, allow_nearest=now-received >= c.pose_wait_s-1.e-9)
             if matched is None:
                 if now-received <= c.pose_wait_s:
                     break
                 self.pending.popleft()
                 self._reject('采样时刻姿态缺失或匹配超时')
-                self._invalidate_velocity(now, '采样时刻姿态缺失，速度等待重建')
                 continue
             self.pending.popleft()
             q, before_dt, after_dt, pose_span = matched
@@ -301,23 +304,18 @@ class RangeHeightFeedback:
             limit = c.operating_tilt_deg if self.locked else c.entry_tilt_deg
             if max(tilt, sensor_tilt) > limit+1.e-9 or projection <= 0:
                 self._reject('采样倾角超出测距工作门' if self.locked else '采样倾角尚未进入首帧门')
-                if self.locked:
-                    self._invalidate_velocity(now, '采样倾角不合格，速度等待重建')
                 continue
             height = distance*projection + rotate_vector(q, c.reference_offset_body_m)[2]
             if not math.isfinite(height) or height <= 0:
                 self._reject('测距几何高度无效')
-                self._invalidate_velocity(now, '测距几何高度无效，速度等待重建')
                 continue
             if self.locked and self.last_height is not None:
                 gap = source-self.source
                 if gap <= 0:
                     self._reject('测距时间重复或倒退')
-                    self._invalidate_velocity(now, '测距时间不连续，速度等待重建')
                     continue
                 if abs(height-self.last_height) > c.jump_m+c.max_vertical_speed_mps*gap:
                     self._reject('测距高度异常跳点')
-                    self._invalidate_velocity(now, '测距高度异常跳点，速度等待重建')
                     continue
             first = not self.locked
             if first:
@@ -342,10 +340,14 @@ class RangeHeightFeedback:
             self.pose_wait_s = max(0., now-received)
             self.count += 1
 
-            if self.fast_samples:
-                fast_source, fast_height = self.fast_samples[-1]
+            # Accumulate short frame intervals instead of repeatedly discarding
+            # velocity when the sensor publishes faster than velocity_min_dt_s.
+            fast_pair = next((p for p in reversed(self.fast_samples)
+                              if source-p[0] >= c.velocity_min_dt_s-1.e-9), None)
+            if fast_pair is not None:
+                fast_source, fast_height = fast_pair
                 fast_dt = source-fast_source
-                if c.velocity_min_dt_s <= fast_dt <= c.fast_velocity_max_gap_s:
+                if c.velocity_min_dt_s-1.e-9 <= fast_dt <= c.fast_velocity_max_gap_s:
                     raw_fast = (height-fast_height)/fast_dt
                     previous_fast = self.fast_velocity
                     filtered_fast = (raw_fast if not math.isfinite(previous_fast) else previous_fast+

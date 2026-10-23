@@ -124,7 +124,7 @@ class RangeHeightTests(unittest.TestCase):
         self.frame(r, 10.35, 1.3)
         self.frame(r, 10.6, 1.3, 16.)
         self.assertTrue(r.snapshot(10.6).valid)
-        self.assertFalse(r.snapshot(10.6).velocity_valid)
+        self.assertTrue(r.snapshot(10.6).velocity_valid)
         self.assertEqual(r.target, target)
         self.assertTrue(self.frame(r, 10.8, 1.25, 12.).velocity_valid)
         self.assertTrue(self.frame(r, 11.05, 1.25, 5.).velocity_valid)
@@ -210,13 +210,15 @@ class RangeHeightTests(unittest.TestCase):
         self.assertAlmostEqual(r.pose_after_dt_s, .07)
         self.assertAlmostEqual(r.target, 1.24*math.cos(math.radians(6.75)), places=7)
 
-    def test_nearest_pose_is_not_used_after_wait_budget(self):
+    def test_nearby_source_pose_is_used_after_wait_budget(self):
         r = self.tracker()
         r.observe_pose(10.09, 10.09, pitch(7.))
         r.observe_range(10.1, 10.11, 1.24)
-        r.snapshot(10.32)
         self.assertFalse(r.locked)
-        self.assertIn('采样时刻姿态缺失或匹配超时', r.rejected)
+        r.snapshot(10.32)
+        self.assertTrue(r.locked)
+        self.assertAlmostEqual(r.target, 1.24*math.cos(math.radians(7.)))
+        self.assertAlmostEqual(r.pose_match_dt_s, .01)
 
     def test_full_eighty_ms_pose_span_is_accepted(self):
         r = self.tracker()
@@ -255,16 +257,16 @@ class RangeHeightTests(unittest.TestCase):
 
     def test_nearest_pose_outside_tolerance_never_qualifies(self):
         r = self.tracker()
-        r.observe_pose(10.05, 10.05, pitch(0.))
+        r.observe_pose(9.98, 9.98, pitch(0.))
         r.observe_range(10.1, 10.11, 1.24)
-        r.snapshot(10.2)
+        r.snapshot(10.32)
         self.assertFalse(r.locked)
 
     def test_parameters_are_frozen_and_inconsistent_limits_rejected(self):
         r = self.tracker()
         with self.assertRaises(AttributeError):
             r.config.entry_tilt_deg = 12.
-        for kwargs in (dict(entry_tilt_deg=16.), dict(timeout_s=.01), dict(stable_min_samples=1),
+        for kwargs in (dict(entry_tilt_deg=61.), dict(timeout_s=.01), dict(stable_min_samples=1),
                        dict(sensor_axis_body=(0., 0., 0.)), dict(max_distance_m=-1.)):
             with self.assertRaises(ValueError):
                 replace(RangeHeightConfig(), **kwargs)

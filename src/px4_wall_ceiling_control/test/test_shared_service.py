@@ -22,6 +22,7 @@ def fake_service(path, marker):
             with open(marker, "a") as log: log.write("runtime\n")
             self.state = ConsoleState()
         def wall(self): return {"message": "simulated wall"}
+        def start(self, config): raise RuntimeError("simulated startup fault")
     serve(Runtime, path)
 
 
@@ -55,6 +56,11 @@ class ServiceTests(unittest.TestCase):
                         if message.get("id") == action: return message
                     self.fail("no reply")
                 self.assertTrue(reply(a, ar, "acquire")["ok"])
+                failure = reply(a, ar, "start", {})
+                self.assertFalse(failure["ok"])
+                self.assertIn("simulated startup fault", failure["error"])
+                # The next request must work on the same connection after a failure.
+                self.assertTrue(reply(a, ar, "wall")["ok"])
                 self.assertFalse(reply(b, br, "wall")["ok"])
                 self.assertTrue(reply(a, ar, "push", {"enabled": False})["ok"])
                 # Following the paused metadata there must be no more snapshots.

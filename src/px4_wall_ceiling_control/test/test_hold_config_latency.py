@@ -61,7 +61,7 @@ class HoldConfigLatencyTests(unittest.TestCase):
             'control path accessed the parameter server'))
 
     def test_hold_without_request_publishes_when_ready_or_blocked_without_parameter_io(self):
-        for installation_ready, rate, ready in ((True, 0., True), (True, 30., False),
+        for installation_ready, rate, ready in ((True, 0., True), (True, 30., True),
                                                 (False, 0., False)):
             with self.subTest(installation_ready=installation_ready, rate=rate):
                 self.n = self.new_node(**{'~detach_range_geometry_confirmed': installation_ready})
@@ -85,9 +85,9 @@ class HoldConfigLatencyTests(unittest.TestCase):
                 self.n, '_detach_start_ready', wraps=self.n._detach_start_ready) as ready:
             self.assertTrue(self.cycle(10.02).detach_ready)
             self.assertEqual(ready.call_count, 1)
-            self.assertFalse(self.cycle(10.04, rate=30.).detach_ready)
+            self.assertTrue(self.cycle(10.04, rate=30.).detach_ready)
             self.assertEqual(ready.call_count, 2)
-            self.assertFalse(self.cycle(10.06).detach_ready)
+            self.assertTrue(self.cycle(10.06).detach_ready)
             for i in range(1, 31):
                 status = self.cycle(10.06+i*.02)
                 self.assertEqual(ready.call_count, 3+i)

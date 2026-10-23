@@ -8,11 +8,13 @@ from pathlib import Path
 import secrets
 import signal
 import shlex
+import socket
 import subprocess
 import sys
 import threading
 import time
 import xmlrpc.client
+from urllib.parse import urlsplit
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PACKAGE = Path(__file__).resolve().parents[2]
@@ -20,6 +22,26 @@ PACKAGE = Path(__file__).resolve().parents[2]
 # modules. The source fallback is only needed on the Windows HTTP host.
 sys.path.append(str(PACKAGE / "src"))
 from px4_wall_ceiling_control.wall_console import ConsoleState, DEFAULT_CONFIG, STABLE_PORTS, finite_json, launch_arguments, validate_config, migrate_legacy_ports
+
+
+class MasterTransport(xmlrpc.client.Transport):
+    """Bound each master request without changing rospy's global socket timeout."""
+    def make_connection(self, host):
+        connection = super().make_connection(host)
+        connection.timeout = 1.0
+        return connection
+
+
+def master_system_state():
+    try:
+        with xmlrpc.client.ServerProxy(os.environ.get("ROS_MASTER_URI", "http://localhost:11311"),
+                                      transport=MasterTransport()) as master:
+            code, _, state = master.getSystemState("/wall_console_master_probe")
+        if code == 1 and isinstance(state, (list, tuple)) and len(state) == 3:
+            return state
+    except (OSError, ValueError, xmlrpc.client.Error):
+        pass
+    return None
 
 
 class RemoteRuntime:
@@ -45,9 +67,59 @@ class RemoteRuntime:
 
     @staticmethod
     def nodes():
-        result = subprocess.run(["rosnode", "list"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, timeout=3)
-        return set(result.stdout.split()) if result.returncode == 0 else set()
+        state = master_system_state()
+        return {node for group in state for _, nodes in group for node in nodes} if state is not None else set()
+
+    @staticmethod
+    def master_alive():
+        # An empty graph is still a live master, especially while rosout starts.
+        return master_system_state() is not None
+
+    @staticmethod
+    def master_listening():
+        target = urlsplit(os.environ.get("ROS_MASTER_URI", "http://localhost:11311"))
+        try:
+            with socket.create_connection((target.hostname, target.port or 11311), timeout=.4):
+                return True
+        except OSError:
+            return False
+
+    def ensure_ros_master(self, timeout=10):
+        """Reuse a live master; serialize console startup and tolerate a race winner."""
+        if self.master_alive():
+            return
+        import fcntl
+        deadline = time.monotonic() + timeout
+        with (self.log_dir / "master-start.lock").open("a") as lock:
+            while True:
+                if self.stop_requested:
+                    raise ValueError("启动已取消：已请求终止现有进程")
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise ValueError("等待其他控制台启动 ROS master 超时；未重复启动")
+                    time.sleep(.1)
+            spawned = False
+            while True:
+                if self.stop_requested:
+                    raise ValueError("启动已取消：已请求终止现有进程")
+                if self.master_alive():
+                    child = self.children.get("roscore")
+                    if child is not None and child.poll() is not None:
+                        self.children.pop("roscore", None)
+                        self.state.event("复用已运行的 ROS master；忽略重复启动实例的退出")
+                    if self.state.launch_error == "roscore 已退出，请查看启动日志":
+                        self.state.launch_error = ""
+                    return
+                if time.monotonic() >= deadline:
+                    raise ValueError("ROS master 启动超时或已有 master 无响应；未强杀其他实例，请查看启动日志")
+                child = self.children.get("roscore")
+                if not spawned and (child is None or child.poll() is not None) and not self.master_listening():
+                    self.spawn("roscore", ["roscore"])
+                    spawned = True
+                time.sleep(.2)
 
     def spawn(self, name, args):
         if getattr(self, "stop_requested", False):
@@ -325,7 +397,8 @@ class RemoteRuntime:
                 if child.poll() is None or self.state.starting:
                     continue
                 error = name + " 已退出，请查看启动日志"
-                replaced = ((name == "wall_flight" and runtime.get("enabled")) or
+                replaced = ((name == "roscore" and self.master_alive()) or
+                            (name == "wall_flight" and runtime.get("enabled")) or
                             (name == "mavros" and mavros_live))
                 if replaced:
                     self.children.pop(name, None)
@@ -414,13 +487,7 @@ class RemoteRuntime:
                     continue
                 if not Path(self.state.config[key]).is_char_device():
                     raise ValueError("找不到串口设备: " + self.state.config[key])
-            if not nodes:
-                self.spawn("roscore", ["roscore"])
-                deadline = time.monotonic() + 10
-                while not self.nodes():
-                    if time.monotonic() > deadline:
-                        raise ValueError("ROS master 启动超时")
-                    time.sleep(0.4)
+            self.ensure_ros_master()
             self.init_ros()
             nodes = self.nodes()
             url = self.state.config["fcu_port"] + ":" + str(self.state.config["baud"])
@@ -547,13 +614,7 @@ class RemoteRuntime:
             owners = self.port_owners(port)
             if owners:
                 raise ValueError("飞控串口仍被进程占用 PID " + str(owners) + "，不能重复连接")
-            if not nodes:
-                self.spawn("roscore", ["roscore"])
-                deadline = time.monotonic() + 10
-                while not self.nodes():
-                    if time.monotonic() > deadline:
-                        raise ValueError("ROS master 启动超时")
-                    time.sleep(.2)
+            self.ensure_ros_master()
             self.init_ros()
             if "/mavros" in self.nodes():
                 # Check again immediately before removing only this registration.

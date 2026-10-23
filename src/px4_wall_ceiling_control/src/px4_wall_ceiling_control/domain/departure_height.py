@@ -53,6 +53,7 @@ class DepartureHeightController:
         self.clear_integral()
         self.target_speed = self.correction = 0.
         self.support_weight = 0.
+        self.reference_tracking = False
         self.saturated = False
         self.slew_limited = False
         self.requested = actual_thrust
@@ -64,6 +65,68 @@ class DepartureHeightController:
             raise ValueError('invalid departure height reanchor')
         self.reference = height
         self.clear_integral()
+
+    def begin_support(self, base, actual_thrust, now):
+        """Initialize thrust support without a height measurement or target."""
+        self.begin(0., base, actual_thrust, now)
+        self.reference = self.target_speed = math.nan
+
+    def update_support(self, vertical_fraction, now, actual_thrust):
+        """Attitude feedforward only; no local position or linear velocity."""
+        if not self.active or not all(math.isfinite(x) for x in (vertical_fraction, now, actual_thrust)):
+            raise ValueError('invalid departure support feedback')
+        if now < self.at or not .1-1e-6 <= actual_thrust <= self.max_thrust+1e-6:
+            raise ValueError('invalid departure support time/output')
+        self.clear_integral()
+        self.reference = self.target_speed = math.nan
+        self.reference_tracking = False
+        self.correction = 0.
+        if now == self.at:
+            return self.value
+        dt = min(.05, now-self.at)
+        self.at = now
+        fraction = bounded(vertical_fraction, 0., 1.)
+        requested, _, weight, unlimited = self._requested(fraction, None, 0.)
+        step = self.thrust_slew*dt
+        actual = bounded(actual_thrust, .1, self.max_thrust)
+        self.value = bounded(requested, max(.1, actual-step), min(self.max_thrust, actual+step))
+        self.requested, self.support_weight = requested, weight
+        self.slew_limited = abs(requested-self.value) > 1e-9
+        self.saturated = unlimited > self.max_thrust or self.slew_limited
+        self.reason = 'attitude-only departure support; waiting for range'
+        return self.value
+
+    def update_range(self, height, velocity, vertical_fraction, now, actual_thrust,
+                     height_kp, velocity_kp):
+        """Range PD: no cascade, integral, velocity admission or reanchoring."""
+        values = (height, vertical_fraction, now, actual_thrust, height_kp, velocity_kp)
+        if velocity is not None:
+            values += (velocity,)
+        if (not self.active or not all(math.isfinite(x) for x in values)
+                or now < self.at or not .1-1e-6 <= actual_thrust <= self.max_thrust+1e-6):
+            raise ValueError('invalid range PD feedback/time/output')
+        self.clear_integral()
+        self.reference_tracking = False
+        self.target_speed = 0. if velocity is not None else math.nan
+        if now == self.at:
+            return self.value
+        dt = min(.05, now-self.at)
+        self.at = now
+        correction = height_kp*(self.reference-height)
+        if velocity is not None:
+            correction -= velocity_kp*velocity
+        correction = bounded(correction, -self.correction_limit, self.correction_limit)
+        fraction = bounded(vertical_fraction, 0., 1.)
+        requested, _, weight, unlimited = self._requested(
+            fraction, None, 0., height_correction=correction, velocity_weight=0.)
+        step = self.thrust_slew*dt
+        actual = bounded(actual_thrust, .1, self.max_thrust)
+        self.value = bounded(requested, max(.1, actual-step), min(self.max_thrust, actual+step))
+        self.requested, self.correction, self.support_weight = requested, correction, weight
+        self.slew_limited = abs(requested-self.value) > 1e-9
+        self.saturated = unlimited > self.max_thrust or abs(correction) >= self.correction_limit or self.slew_limited
+        self.reason = 'range PD' if velocity is not None else 'range P; waiting for measured range velocity'
+        return self.value
 
     def _requested(self, vertical_fraction, velocity_error, integral, correction_weight=1.,
                    height_correction=None, velocity_weight=1., velocity_kp=None):
@@ -82,7 +145,8 @@ class DepartureHeightController:
 
     def update(self, height, velocity, vertical_fraction, now, source_stamp,
                actual_thrust, integrate=True, correction_weight=1.,
-               height_only_kp=None, velocity_weight=1., velocity_kp=None):
+               height_only_kp=None, velocity_weight=1., velocity_kp=None,
+               allow_reference_tracking=True):
         if not self.active:
             raise ValueError('departure controller has no seed')
         values = (height, vertical_fraction, now, source_stamp, actual_thrust, correction_weight, velocity_weight)
@@ -122,6 +186,25 @@ class DepartureHeightController:
             self.target_speed = 0.
         error = self.target_speed-velocity if velocity is not None else None
         height_correction = (height_only_kp*(self.reference-height) if height_only_kp is not None else None)
+        # Decide authority before a negative correction can lower the full-lift
+        # threshold. While the wall carries weight, neither accumulated height
+        # error nor the velocity P term may demand a later thrust reduction.
+        neutral_weight = self._requested(vertical_fraction, None, 0.)[2]
+        feedback_weight = self._requested(
+            vertical_fraction, error, self.integral, correction_weight,
+            height_correction, velocity_weight, velocity_kp)[2]
+        was_supported = self.reference_tracking and self.support_weight < 1.-1e-9
+        self.reference_tracking = allow_reference_tracking and (
+            neutral_weight < 1.-1e-9 or feedback_weight < 1.-1e-9 or was_supported)
+        if self.reference_tracking:
+            # Include the first full-authority sample in the reanchor so the
+            # handoff starts at the hover feedforward without stored error.
+            self.reanchor(height)
+            self.target_speed = 0.
+            error = -velocity if velocity is not None else None
+            height_correction = 0. if height_only_kp is not None else None
+            correction_weight = 0.
+            integrate = False
         if velocity is None or velocity_weight < 1.:
             self.clear_integral()
             integrate = False

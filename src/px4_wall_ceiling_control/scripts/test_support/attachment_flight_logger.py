@@ -19,7 +19,7 @@ import zipfile
 
 TOPICS = [
     "/wall_perch/sensor_fusion_status", "/wall_perch/handover_readiness",
-    "/wall_perch/status", "/wall_perch/control_candidate", "/wall_perch/detach", "/wall_perch/cancel",
+    "/wall_perch/status", "/wall_perch/departure_trace", "/wall_perch/control_candidate", "/wall_perch/detach", "/wall_perch/cancel",
     "/ceiling_attachment/status", "/ceiling_attachment/control_candidate", "/ceiling_attachment/detach",
     "/mavros/setpoint_raw/attitude", "/mavros/setpoint_raw/target_attitude",
     "/mavros/state", "/mavros/local_position/odom", "/mavros/local_position/velocity_local",
@@ -221,6 +221,8 @@ class SignalSummary:
             return message
         health = sample("/attachment/output_health", "output_health")
         row["output_health_json"] = health.data if health is not None else None
+        trace = sample("/wall_perch/departure_trace", "departure_trace")
+        row["departure_trace_json"] = trace.data if trace is not None else None
         wall = sample("/wall_perch/status", "wall")
         for key in ("state_name", "reason", "progress", "candidate_valid", "fault_count", "thrust_normalized",
                     "front_distance_raw_m", "front_distance_filtered_m", "top_distance_raw_m",

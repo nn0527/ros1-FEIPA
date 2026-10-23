@@ -600,6 +600,13 @@ class WallHorizontalVelocityMixin:
                           W.STATE_SLOW_APPROACH,W.STATE_RECOVER,W.STATE_EXIT,W.STATE_ABORT):
             return True
         if self.state == W.STATE_DETACH_ROTATE:
+            if getattr(self, 'detach_range_enabled', False) and not getattr(self, 'bench_wait_for_ranges', False):
+                return False  # One attitude source until measured level stability.
+            if getattr(self, 'detach_brake_planner', None) is not None:
+                # A near-level fast rotation may deliberately retract its target.
+                # Horizontal correction must not replace this braking command.
+                return bool(self.detach_brake_planner.done
+                    and not self.detach_brake_paused and self._detach_rotation_pose_valid())
             progress = (self._detach_progress() if hasattr(self, '_detach_progress')
                 and not getattr(self, 'bench_wait_for_ranges', False)
                 else min(1.,max(0.,self._state_age(now)/self.detach_time_s)))
@@ -661,7 +668,7 @@ class WallHorizontalVelocityMixin:
         snapshot=self.horizontal_flow_snapshot
         flow,flow_at,frame_error=snapshot if snapshot is not None else (None,None,'')
         reason = ''
-        required_velocity = velocity[:2] if getattr(self, '_range_locked', lambda: False)() else velocity
+        required_velocity = velocity[:2] if getattr(self, '_range_task_active', lambda: False)() else velocity
         if not all(math.isfinite(v) for v in required_velocity):reason = '水平速度数值无效'
         elif not is_fresh_receipt(self.horizontal_estimator_at,1.,now) or estimate is None:reason = '估计器反馈过期'
         elif not (estimate.attitude_status_flag and estimate.velocity_horiz_status_flag) or estimate.const_pos_mode_status_flag:reason = 'PX4水平速度估计未有效（或处于恒位置推算）'
@@ -726,6 +733,10 @@ class WallHorizontalVelocityMixin:
             or self._departure_clearance_ready(now)))
 
     def _horizontal_attitude(self, now, quaternion):
+        if (self.state == W.STATE_DETACH_ROTATE and getattr(self, 'detach_range_enabled', False)
+                and not getattr(self, 'bench_wait_for_ranges', False)):
+            self.horizontal_velocity_active = False
+            return quaternion
         if not getattr(self,'horizontal_velocity_enabled',False):return quaternion
         quaternion = self._recovery_heading_attitude(quaternion)
         self._prepare_horizontal_velocity(now)

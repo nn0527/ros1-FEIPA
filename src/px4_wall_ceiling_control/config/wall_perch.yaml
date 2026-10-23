@@ -58,7 +58,8 @@ wall_perch_decision_node:
   # 仅在轨迹完成且实测俯仰角达到准入条件后启用。
   manual_wall_recovery_enabled: true
   hold_entry_blend_s: 0.50
-  # 脱离准入要求实测姿态稳定，且垂直速度在允许范围内。
+  # 测距离墙 demo：新鲜姿态、权限和最终输出满足就开始，不等待稳定窗口。
+  # 以下轴误差、速率及稳定等待参数仅供非测距兼容路径。
   # 轨迹从最后一次实际发布的姿态／推力开始。
   detach_axis_error_deg: 15.0
   detach_max_rate_rps: 0.436332313  # 25 度／秒
@@ -71,12 +72,26 @@ wall_perch_decision_node:
   detach_time_s: 3.00
   detach_duration_timeout_s: 10.00
   detach_max_tracking_error_deg: 30.0
+  # 以下动态制动参数仅供非测距兼容路径；测距离墙固定五次曲线回平。
+  # 已发布目标倾角进入30度后，继承目标角度/速度/加速度重新插值。
+  # 制动能力是规划假设，需台架/试飞验证；此处不修改PX4角速度积分。
+  detach_brake_enabled: true
+  detach_brake_target_deg: 30.0
+  detach_brake_decel_deg_s2: 30.0
+  detach_brake_delay_s: 0.15
+  detach_brake_margin_deg: 5.0
+  detach_brake_max_lead_deg: 10.0
+  detach_brake_target_rate_deg_s: 56.25
+  detach_brake_target_accel_deg_s2: 180.0
+  detach_brake_attitude_gain: 4.0
+  detach_brake_rate_damping: 1.0
   detach_recovered_tilt_deg: 5.0
   detach_recovered_rate_deg_s: 10.0
   detach_recovered_hold_s: 0.30
   recover_time_s: 1.00
   recover_timeout_s: 15.00
-  # 脱离、恢复和控制权交接全过程共用同一个离墙高度基准及支撑推力基准。
+  # 测距脱离：锁定前仅姿态推力支撑；锁定后才建立测距高度目标。
+  # 以下旧竖直环参数仅供非测距兼容路径；测距速度环另有独立增益。
   detach_height_kp: 0.30
   detach_velocity_kp: 0.30
   detach_velocity_ki: 0.06
@@ -87,10 +102,10 @@ wall_perch_decision_node:
   # 原有垂直控制环。必须核实硬件安装。
   detach_range_height_enabled: false
   detach_range_entry_tilt_deg: 10.0
-  detach_range_operating_tilt_deg: 15.0
+  # 首次锁定仍需10度；锁定后允许摆动，仅保留接近水平光轴的几何保护。
+  detach_range_operating_tilt_deg: 60.0
   detach_range_timeout_s: 0.60
-  # 按数据源时间，使用前后两帧姿态插值。0.20 秒等待时间是回放／台架测试的
-  # 初始值，尚未验证为飞行通信延迟的允许上限。
+  # 优先按源时间插值；没有前后帧时允许时间差≤0.10秒的最近姿态。
   detach_range_pose_interp_max_span_s: 0.10
   detach_range_pose_wait_s: 0.20
   detach_range_velocity_window_s: 0.8
@@ -99,8 +114,11 @@ wall_perch_decision_node:
   # 仅用于雷达测距的速度环候选增益；旧路径及非雷达路径的增益保持不变。
   # 快速反馈暴露出修正量频繁饱和后，由原来的 0.30 下调。
   detach_range_control_velocity_kp: 0.10
+  # 兼容诊断字段：demo直接使用限幅及推力变化率，不再叠加反馈接入权重。
   detach_range_control_blend_s: 0.30
-  detach_range_loss_support_s: 0.30
+  # 真正失去新鲜高度后最多支撑2秒；缺少测距速度不会触发故障。
+  detach_range_loss_support_s: 2.00
+  # 以下总时间预算和交接预算保留配置兼容，demo不据此中断回平或定高。
   detach_range_control_timeout_s: 15.0
   # 一键操作的显式目标高度，单位为垂直方向的米；不替代实测高度。
   detach_range_manual_target_m: 1.5
@@ -124,11 +142,12 @@ wall_perch_decision_node:
   detach_range_height_filter_tau_s: 0.10
   detach_range_velocity_filter_tau_s: 0.25
   # 使用相邻测距样本计算的快速速度，为所有由雷达测距控制的脱离／恢复路径提供阻尼。
-  # 慢速窗口仍独立用于稳定性／控制权交接检查。
+  # 慢速窗口仍独立用于定高稳定性／控制权交接检查，不限制姿态回平完成。
   detach_range_fast_velocity_filter_tau_s: 0.10
   detach_range_fast_velocity_max_gap_s: 0.60
   detach_range_jump_m: 0.25
   detach_range_max_vertical_speed_mps: 2.0
+  # 兼容字段：输出必须新鲜且归本节点所有，不再另外启动0.3秒同步倒计时。
   detach_range_output_sync_timeout_s: 0.30
   return_thrust_slew_per_s: 0.50
   recovery_horizontal_velocity_ki: 0.30

@@ -29,11 +29,11 @@ class RangeRecoveryDampingTests(unittest.TestCase):
         self.n._enter_state(W.STATE_ABORT, at(self.fixture.seconds), reason)
 
     def test_rotation_timeout_keeps_fast_damping_when_slow_sign_is_wrong(self):
-        n = self.seed(height=1.966, velocity=.478, fast_velocity=-.389)
+        n = self.seed(height=1.26, velocity=.478, fast_velocity=-.389)
         reference, base = n.detach_vertical_controller.reference, n.detach_vertical_controller.base
         self.enter_abort()
         self.assertTrue(n.detach_range_faulted)
-        with mock.patch.object(n.detach_vertical_controller, 'update', wraps=n.detach_vertical_controller.update) as update:
+        with mock.patch.object(n.detach_vertical_controller, 'update_range', wraps=n.detach_vertical_controller.update_range) as update:
             value = n._range_vertical_thrust(at(self.fixture.seconds))
         self.assertEqual(update.call_args.args[1], -.389)
         self.assertGreater(n.detach_vertical_controller.requested, base)
@@ -42,7 +42,7 @@ class RangeRecoveryDampingTests(unittest.TestCase):
         self.assertTrue(n.detach_range_faulted)
         self.assertEqual(n.detach_task_phase, 'FAULT')
         self.assertIn('rotation timeout', n.detach_range_failure_cause)
-        self.assertIn('control_velocity=fast', n.detach_vertical_reason)
+        self.assertIn('range PD', n.detach_vertical_reason)
 
     def test_rising_reversal_brakes_in_abort_instead_of_continuing_old_climb_command(self):
         n = self.seed(height=1.133, velocity=-.082, fast_velocity=.956)
@@ -52,12 +52,12 @@ class RangeRecoveryDampingTests(unittest.TestCase):
         self.assertLess(n.detach_vertical_controller.requested, n.detach_vertical_controller.base)
 
     def test_manual_target_uses_fast_damping_and_preserves_the_explicit_target(self):
-        n = self.seed(height=1.966, velocity=.478, fast_velocity=-.389)
+        n = self.seed(height=1.26, velocity=.478, fast_velocity=-.389)
         n.state = W.STATE_RECOVER
         n.detach_range.target_revision = 1
         n.detach_range.target = 1.5
         n.detach_vertical_controller.reanchor(1.5)
-        with mock.patch.object(n.detach_vertical_controller, 'update', wraps=n.detach_vertical_controller.update) as update:
+        with mock.patch.object(n.detach_vertical_controller, 'update_range', wraps=n.detach_vertical_controller.update_range) as update:
             n._range_vertical_thrust(at(self.fixture.seconds))
         self.assertEqual(update.call_args.args[1], -.389)
         self.assertEqual(n.detach_vertical_controller.reference, 1.5)
@@ -68,26 +68,24 @@ class RangeRecoveryDampingTests(unittest.TestCase):
         n = self.seed(velocity=-.4, fast_velocity_valid=False)
         self.enter_abort()
         n.detach_vertical_controller.integral = .03
-        with mock.patch.object(n.detach_vertical_controller, 'update', wraps=n.detach_vertical_controller.update) as update:
+        with mock.patch.object(n.detach_vertical_controller, 'update_range', wraps=n.detach_vertical_controller.update_range) as update:
             value = n._range_vertical_thrust(at(self.fixture.seconds))
-        update.assert_not_called()
-        self.assertAlmostEqual(value, .50)
+        self.assertIsNone(update.call_args.args[1])
+        self.assertTrue(math.isfinite(value))
+        self.assertAlmostEqual(n.detach_vertical_controller.requested, n.detach_vertical_controller.base)
         self.assertEqual(n.detach_vertical_controller.integral, 0.)
-        self.assertIn('control_velocity=hold', n.detach_vertical_reason)
+        self.assertIn('range P', n.detach_vertical_reason)
 
-    def test_fast_loss_after_abort_stops_after_existing_bounded_support(self):
+    def test_missing_velocity_after_abort_keeps_p_and_original_fault(self):
         n = self.seed(velocity=0., fast_velocity_valid=False)
         self.enter_abort()
-        n._range_vertical_thrust(at(self.fixture.seconds))
-        self.fixture.seconds += .30
-        self.fixture.fx.feedback(n, self.fixture.seconds, tilt=0.)
-        self.fixture.fx.output(n, self.fixture.seconds, tilt=0., thrust=.50)
-        self.assertTrue(math.isnan(n._range_vertical_thrust(at(self.fixture.seconds))))
-        self.assertTrue(n.detach_fast_velocity_fault)
+        for delta in (0., .3, .4):
+            seconds = self.fixture.seconds+delta
+            self.fixture.fx.feedback(n, seconds, tilt=0.)
+            self.fixture.fx.output(n, seconds, tilt=0., thrust=.50)
+            self.assertTrue(math.isfinite(n._range_vertical_thrust(at(seconds))))
+        self.assertFalse(n.detach_fast_velocity_fault)
         self.assertEqual(n.detach_range_failure_cause, 'detach rotation timeout')
-        # Later sensor recovery cannot silently clear the latched fault.
-        n.detach_range.read_snapshot.return_value = replace(self.snapshot, fast_velocity_valid=True)
-        self.assertTrue(math.isnan(n._range_vertical_thrust(at(self.fixture.seconds))))
         self.assertEqual(n.detach_task_phase, 'FAULT')
 
     def test_fault_exit_and_manual_recovery_do_not_switch_back_to_slow_velocity(self):
@@ -95,7 +93,7 @@ class RangeRecoveryDampingTests(unittest.TestCase):
         n.detach_range_faulted = True
         n.detach_range_manual_recovery = True
         n.state = W.STATE_EXIT
-        with mock.patch.object(n.detach_vertical_controller, 'update', wraps=n.detach_vertical_controller.update) as update:
+        with mock.patch.object(n.detach_vertical_controller, 'update_range', wraps=n.detach_vertical_controller.update_range) as update:
             n._range_vertical_thrust(at(self.fixture.seconds))
         self.assertEqual(update.call_args.args[1], -.4)
         self.assertTrue(n.detach_range_faulted)
@@ -127,9 +125,9 @@ class RangeRecoveryDampingTests(unittest.TestCase):
         self.assertEqual(self.n.detach_task_phase, 'FAULT')
         first_target = self.n.detach_range.target
         self.n._range_vertical_thrust(at(10.25))
-        self.assertIn('control_velocity=hold', self.n.detach_vertical_reason)
+        self.assertFalse(self.n.detach_range.read_snapshot(10.25).fast_velocity_valid)
         self.fixture.frame(10.5,distance=1.15)
-        with mock.patch.object(self.n.detach_vertical_controller, 'update', wraps=self.n.detach_vertical_controller.update) as update:
+        with mock.patch.object(self.n.detach_vertical_controller, 'update_range', wraps=self.n.detach_vertical_controller.update_range) as update:
             self.n._range_vertical_thrust(at(10.5))
         self.assertAlmostEqual(update.call_args.args[1], -.36, places=6)
         self.assertEqual(self.n.detach_range.target, first_target)
@@ -159,8 +157,8 @@ class RangeRecoveryDampingTests(unittest.TestCase):
                     n.detach_range.read_snapshot.return_value = replace(
                         self.snapshot, velocity=slow, fast_velocity=fast)
                     self.assertEqual(n._vertical_speed_safe(), safe)
-                    with mock.patch.object(n.detach_vertical_controller, 'update',
-                                           wraps=n.detach_vertical_controller.update) as update:
+                    with mock.patch.object(n.detach_vertical_controller, 'update_range',
+                                           wraps=n.detach_vertical_controller.update_range) as update:
                         n._range_vertical_thrust(at(self.fixture.seconds))
                     self.assertEqual(update.call_args.args[1], fast)
 
@@ -173,16 +171,12 @@ class RangeRecoveryDampingTests(unittest.TestCase):
 
     def test_invalid_fast_speed_never_substitutes_slow_speed_in_safety_or_thrust(self):
         n = self.seed(velocity=-2., fast_velocity_valid=False)
-        self.assertTrue(n._vertical_speed_safe())  # Bounded hold, not measured zero speed.
-        with mock.patch.object(n.detach_vertical_controller, 'update',
-                               wraps=n.detach_vertical_controller.update) as update:
-            self.assertAlmostEqual(n._range_vertical_thrust(at(self.fixture.seconds)), .50)
-        update.assert_not_called()
-        self.fixture.seconds += .30
-        self.fixture.fx.feedback(n, self.fixture.seconds, tilt=0.)
-        self.fixture.fx.output(n, self.fixture.seconds, tilt=0., thrust=.50)
-        self.assertTrue(math.isnan(n._range_vertical_thrust(at(self.fixture.seconds))))
-        self.assertTrue(n.detach_fast_velocity_fault)
+        self.assertTrue(n._vertical_speed_safe())
+        with mock.patch.object(n.detach_vertical_controller, 'update_range', wraps=n.detach_vertical_controller.update_range) as update:
+            self.assertTrue(math.isfinite(n._range_vertical_thrust(at(self.fixture.seconds))))
+        self.assertIsNone(update.call_args.args[1])
+        self.assertEqual(n.detach_vertical_controller.correction, 0.)
+        self.assertFalse(n.detach_fast_velocity_fault)
 
 
 if __name__ == '__main__':

@@ -149,6 +149,7 @@ class ConsoleTests(unittest.TestCase):
         runtime.state.update('runtime', {'enabled':True})
         runtime.state.update('phase', 'CANCELING_ENTRY')
         runtime.nodes = mock.Mock(return_value={'/rosout'})
+        runtime.ensure_ros_master = mock.Mock()
         runtime.init_ros = mock.Mock()
         runtime.port_owners = mock.Mock(return_value=[])
         runtime.mavros_process_conflicts = mock.Mock(return_value=[])

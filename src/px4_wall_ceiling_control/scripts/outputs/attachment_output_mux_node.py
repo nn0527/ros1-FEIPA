@@ -417,6 +417,14 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
                 or message.control_phase not in (WallPerchStatus.STATE_DETACH_ROTATE,
                     WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT, WallPerchStatus.STATE_ABORT)):
             return 'range_phase_payload_mismatch'
+        if getattr(message, 'departure_support_only', False) and (
+                message.kind != AttachmentControlCandidate.KIND_ATTITUDE_THRUST
+                or message.detach_range_episode <= 0
+                or message.detach_task_phase not in (1, 4)
+                or getattr(message, 'range_height_control', False)
+                or message.control_phase not in (WallPerchStatus.STATE_DETACH_ROTATE,
+                    WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT, WallPerchStatus.STATE_ABORT)):
+            return 'departure_support_payload_mismatch'
         return ""
 
     def _retire_wall_maneuver(self):
@@ -837,7 +845,8 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
         snapshot = getattr(self, 'wall_candidate_snapshot', None)
         candidate = snapshot[0] if snapshot is not None else None
         if (getattr(self, 'owner', self.OWNER_NONE) == self.OWNER_WALL
-                and candidate is not None and getattr(candidate, 'range_height_control', False)
+                and candidate is not None and (getattr(candidate, 'range_height_control', False)
+                                               or getattr(candidate, 'departure_support_only', False))
                 and self._wall_fresh(now)):
             return odometry_attitude_horizontal_is_finite(self.odom, self.odom_twist_in_child_frame)
         return odometry_is_finite(self.odom)
@@ -1472,6 +1481,7 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
                 "detach_task_phase": candidate.detach_task_phase,
                 "detach_range_episode": candidate.detach_range_episode,
                 "range_height_control": candidate.range_height_control,
+                "departure_support_only": getattr(candidate, 'departure_support_only', False),
                 "range_feedback_valid": candidate.range_feedback_valid,
                 "generated_at_s": candidate.header.stamp.to_sec(),
                 "received_at_s": snapshot[1].to_sec(),

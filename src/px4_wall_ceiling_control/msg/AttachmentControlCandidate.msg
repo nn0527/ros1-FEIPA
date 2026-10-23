@@ -45,3 +45,6 @@ uint8 detach_task_phase
 uint32 detach_range_episode
 bool range_height_control
 bool range_feedback_valid
+
+# Range departure before first lock: attitude/feedforward support, no Z/vz loop.
+bool departure_support_only
