@@ -1,5 +1,5 @@
-# ROS port of the external PX4 wall_perch reference module. These are
-# bench-test initial values, not flight-qualified gains or limits.
+# 外部 PX4 贴墙参考模块 wall_perch 的 ROS 移植配置。以下参数为
+# 台架测试初始值，增益和限幅尚未通过飞行验证。
 wall_perch_decision_node:
   decision_enabled: false
 
@@ -15,14 +15,14 @@ wall_perch_decision_node:
   control_candidate_topic: /wall_perch/control_candidate
   publish_rate_hz: 50.0
 
-  # WP_FRN_RD_DIST / WP_FRN_RD_HLD
+  # 对应 PX4 前向距离就绪阈值／保持时间：WP_FRN_RD_DIST / WP_FRN_RD_HLD
   front_ready_distance_m: 0.50
   # 前距连续满足0.4 s后直接进入SLOW_APPROACH。
   front_ready_hold_s: 0.40
-  # WP_FLP_TRD_DIST / WP_FLP_TRD_HLD
+  # 对应 PX4 翻转触发距离／保持时间：WP_FLP_TRD_DIST / WP_FLP_TRD_HLD
   flip_trigger_distance_m: 0.20
   flip_trigger_hold_s: 0.30
-  # WP_TOP_CT_DIST / WP_TOP_CT_HLD
+  # 对应 PX4 顶部接触距离／保持时间：WP_TOP_CT_DIST / WP_TOP_CT_HLD
   top_contact_distance_m: 0.056
   # 旧顶部准入判断仅保留作诊断；顶部距离、有效帧和新鲜度均不参与HOLD准入。
   hold_entry_top_distance_check_enabled: false
@@ -38,36 +38,36 @@ wall_perch_decision_node:
 
   # 正常流程跳过STABILIZE_HOVER；保留参数仅用于旧状态兼容。
   stabilize_time_s: 0.00
-  # Valid raw front distance above this limit aborts pre-flip approach.
+  # 有效的前向原始距离超过此阈值时，中止翻转前的接近过程。
   approach_abort_front_distance_m: 1.3
   approach_timeout_s: 20.00
   flip_time_s: 2.00
-  # Independent wall-clock limit: bounded control steps never catch up after stalls.
+  # 独立的实际经过时间上限：控制步长受限，停顿后不会通过补步追赶轨迹。
   flip_duration_timeout_s: 6.00
-  # Bound target lead over fresh measured attitude; height braking remains active.
+  # 限制目标姿态领先于新鲜实测姿态的角度；高度制动仍保持启用。
   flip_max_tracking_error_deg: 15.0
   # 最后10%才接入顶部雷达用于诊断和压墙反馈，不参与HOLD准入。
   flip_top_start_fraction: 0.90
   capture_time_s: 0.50
   # 翻转完成但实测俯仰角不足80°时，最多等待8秒；安全输入失效仍立即中止。
   capture_timeout_s: 8.00
-  # Remain against the wall until the operator stops the wheels and requests detach.
+  # 持续贴墙，直到操作员停止车轮并请求脱离。
   hold_time_s: 0.00
-  # Keep bounded wall pressure during slip/wheel correction; only a manual
-  # detach request advances after the normal pose/rate stability gates pass.
-  # Enabled after trajectory completion + measured pitch gate; not before it.
+  # 滑移或车轮修正期间维持受限的压墙推力；只有收到人工脱离请求，
+  # 且通过正常的姿态／角速度稳定性检查后，才继续脱离流程。
+  # 仅在轨迹完成且实测俯仰角达到准入条件后启用。
   manual_wall_recovery_enabled: true
   hold_entry_blend_s: 0.50
-  # Detach admission requires stable measured pose and bounded vertical speed.
-  # The trajectory starts from the last actual published attitude/thrust.
+  # 脱离准入要求实测姿态稳定，且垂直速度在允许范围内。
+  # 轨迹从最后一次实际发布的姿态／推力开始。
   detach_axis_error_deg: 15.0
-  detach_max_rate_rps: 0.436332313  # 25 deg/s
-  detach_vertical_speed_check_enabled: false  # Ignore speed magnitude for detach admission.
+  detach_max_rate_rps: 0.436332313  # 25 度／秒
+  detach_vertical_speed_check_enabled: false  # 脱离准入时不检查速度大小。
   detach_max_abs_vertical_speed_mps: 0.20
   detach_stable_hold_s: 0.50
   detach_request_timeout_s: 8.00
-  # Detach attitude trajectory duration.
-  # 90 deg over 3 s (quintic setpoint).
+  # 脱离姿态轨迹的规划时长。
+  # 在 3 秒内转动 90 度，设定值采用五次曲线。
   detach_time_s: 3.00
   detach_duration_timeout_s: 10.00
   detach_max_tracking_error_deg: 30.0
@@ -76,55 +76,55 @@ wall_perch_decision_node:
   detach_recovered_hold_s: 0.30
   recover_time_s: 1.00
   recover_timeout_s: 15.00
-  # Keep one departure height/base through DETACH, RECOVER and handover.
+  # 脱离、恢复和控制权交接全过程共用同一个离墙高度基准及支撑推力基准。
   detach_height_kp: 0.30
   detach_velocity_kp: 0.30
   detach_velocity_ki: 0.12
   detach_vertical_integral_limit: 0.06
   detach_vertical_correction_limit: 0.12
   detach_support_max_thrust: 0.85
-  # Only the flight console opts into range height control. Other entries keep
-  # their existing vertical loop. Hardware installation MUST be verified.
+  # 仅飞行控制台选择启用雷达测距高度控制；其他入口保留
+  # 原有垂直控制环。必须核实硬件安装。
   detach_range_height_enabled: false
   detach_range_entry_tilt_deg: 10.0
   detach_range_operating_tilt_deg: 15.0
   detach_range_timeout_s: 0.60
-  # Source-time bracket interpolation. 0.20 s wait is an initial replay/bench
-  # value, not a validated flight transport limit.
+  # 按数据源时间，使用前后两帧姿态插值。0.20 秒等待时间是回放／台架测试的
+  # 初始值，尚未验证为飞行通信延迟的允许上限。
   detach_range_pose_interp_max_span_s: 0.10
   detach_range_pose_wait_s: 0.20
   detach_range_velocity_window_s: 0.8
   detach_range_velocity_min_dt_s: 0.05
   detach_range_height_only_kp: 0.15
-  # Range-only speed-loop candidate; legacy/non-range gains stay unchanged.
-  # Reduced from 0.30 after fast feedback exposed frequent correction saturation.
-  detach_range_control_velocity_kp: 0.18
+  # 仅用于雷达测距的速度环候选增益；旧路径及非雷达路径的增益保持不变。
+  # 快速反馈暴露出修正量频繁饱和后，由原来的 0.30 下调。
+  detach_range_control_velocity_kp: 0.15
   detach_range_control_blend_s: 0.30
   detach_range_loss_support_s: 0.30
   detach_range_control_timeout_s: 15.0
-  # Explicit one-click target in vertical metres; does not replace measured height.
+  # 一键操作的显式目标高度，单位为垂直方向的米；不替代实测高度。
   detach_range_manual_target_m: 1.5
   detach_range_handover_wait_s: 6.0
   detach_range_height_tolerance_m: 0.10
   detach_range_speed_tolerance_mps: 0.20
   detach_range_stable_time_s: 1.0
   detach_range_stable_min_samples: 4
-  # Installed MicoAir MTF-02P, confirmed by operator 2026-10-21.
-  # Manufacturer: 0.02-6 m @90% reflectivity/70 klux; not a quality guarantee.
-  # https://micoair.cn/zh/docs/sensors/sensors/mtf-02-02p-sensors
+  # 已安装 MicoAir MTF-02P，操作员于 2026-10-21 确认。
+  # 厂家标称量程：反射率 90%、照度 7 万勒克斯时为 0.02～6 米；不保证实际测量质量。
+  # 厂家说明：https://micoair.cn/zh/docs/sensors/sensors/mtf-02-02p-sensors
   detach_range_min_distance_m: 0.02
   detach_range_max_distance_m: 6.0
   detach_range_sensor_axis_body: [0.0, 0.0, -1.0]
-  # FLU vector from sensor to controlled reference; projected once into world Z.
+  # 从传感器指向受控参考点的机体前左上坐标系向量；仅投影一次到世界坐标系的竖直轴。
   detach_range_reference_offset_body_m: [0.0, 0.0, 0.0]
-  # Operator confirmed downward installation; distance is RAW AXIAL range.
-  # Zero offset selects the sensor origin as the reference point.
+  # 操作员已确认传感器朝下安装；距离值为沿传感器轴线的原始测距。
+  # 偏移量为零时，以传感器原点作为参考点。
   detach_range_geometry_confirmed: true
   detach_range_future_tolerance_s: 0.10
   detach_range_height_filter_tau_s: 0.10
   detach_range_velocity_filter_tau_s: 0.25
-  # Fast adjacent-range velocity damps all range-owned departure/recovery paths.
-  # The slow window remains an independent stability/handover check.
+  # 使用相邻测距样本计算的快速速度，为所有由雷达测距控制的脱离／恢复路径提供阻尼。
+  # 慢速窗口仍独立用于稳定性／控制权交接检查。
   detach_range_fast_velocity_filter_tau_s: 0.10
   detach_range_fast_velocity_max_gap_s: 0.60
   detach_range_jump_m: 0.25
@@ -133,63 +133,63 @@ wall_perch_decision_node:
   return_thrust_slew_per_s: 0.50
   recovery_horizontal_velocity_ki: 0.30
   recovery_horizontal_integral_limit_mps2: 0.20
-  # Smooth ordinary recovery reentry; never delays emergency leveling or kill.
+  # 普通恢复重新接入时平滑过渡；不延迟紧急回平或急停。
   recovery_horizontal_reentry_blend_s: 0.30
-  # Already-qualified, continuously valid feedback: taper correction to zero
-  # from 30 to the existing 45 deg/s limit; do not reacquire at high rates.
+  # 对于已经通过准入且持续有效的反馈，角速度从 30 度／秒增加到现有的
+  # 45 度／秒上限时，将修正量逐渐降至零；高角速度时不重新准入。
   recovery_horizontal_rate_soft_deg_s: 30.0
-  # Measured tilt: taper velocity correction before the unchanged >10 deg gate.
+  # 按实测倾角提前减弱速度修正；原有大于 10 度的检查阈值保持不变。
   recovery_horizontal_tilt_soft_deg: 5.0
   recovery_horizontal_tilt_stop_deg: 8.0
-  # After >=8 deg, require fresh level/low-rate samples before smooth reentry.
+  # 倾角达到或超过 8 度后，须取得新鲜、接近水平且低角速度的样本，才平滑重新接入。
   recovery_horizontal_level_hold_s: 0.30
   departure_retreat_speed_mps: 0.05
   departure_clearance_distance_m: 0.30
   departure_clearance_hold_s: 0.30
   departure_heading_tolerance_deg: 10.0
-  # Vertical target-speed limits; ENU up is positive. Normal departure uses
-  # its captured support base and independent PI through handover.
+  # 垂直目标速度限幅，世界东-北-天坐标系中向上为正。正常脱离使用
+  # 捕获的支撑推力基准及独立比例积分控制器，并持续到控制权交接。
   recovery_max_up_speed_mps: 0.10
   recovery_max_down_speed_mps: 0.15
   recovery_height_to_speed_kp: 0.50
   recovery_velocity_kp: 0.30
   recovery_positive_compensation_max: 0.08
   recovery_max_thrust: 0.60
-  # Bench departure/recovery support only; retain through EXIT until ALTCTL.
+  # 仅用于台架脱离／恢复支撑；退出阶段仍保留，直到飞控进入定高模式。
   bench_detach_hover_thrust: 0.48
-  # Capture odometry Z when detach starts. As the body levels, use Z/vertical
-  # speed feedback and measured tilt to request the vertical hover component.
-  # Keep the wall-pressure thrust while the wheels roll on the wall. Near 90 deg,
-  # wheel friction must support weight; thrust is capped at max_thrust.
+  # 脱离开始时记录里程计高度。机体回平过程中，使用高度／垂直速度反馈
+  # 及实测倾角，计算所需的垂直悬停推力分量。
+  # 车轮沿墙滚动时保持压墙推力。倾角接近 90 度时，
+  # 必须由车轮摩擦力承重；推力受 max_thrust 参数限制。
   detach_altitude_kp: 0.50
   detach_vertical_speed_kd: 0.30
   detach_compensation_start_deg: 80.0
-  # Remain in RECOVER until both height and vertical speed settle.
+  # 保持在恢复阶段，直到高度和垂直速度均稳定。
   detach_altitude_tolerance_m: 0.10
   detach_vertical_speed_tolerance_mps: 0.20
 
-  # Positive pitch matches the direction verified by pitch_45_test.py.
-  # Only +45 deg has been bench tested; the +90 deg target still needs validation.
+  # 正俯仰方向与 pitch_45_test.py 已验证的方向一致。
+  # 仅正 45 度经过台架测试；正 90 度目标仍待验证。
   wall_angle_deg: 90.0
   # 慢速接近一开始就向墙倾斜3°，不再先做翻转前悬停稳定阶段。
   approach_pitch_deg: 3.0
-  # Console launch enables fused velocity. Normal departure requires its frozen
-  # equilibrium/heading; legacy bench departure retains its separate path.
+  # 控制台启动时启用融合速度。正常脱离要求已冻结的
+  # 平衡姿态／航向；旧版台架脱离保留独立路径。
   horizontal_velocity_enabled: false
   horizontal_approach_speed_mps: 0.10
-  # Approach retains the actual POSCTL collective at takeover; recovery keeps its own base.
+  # 接近阶段继承从位置控制模式接管时的实际总推力；恢复阶段保留独立基准。
   approach_use_takeover_thrust: true
   horizontal_velocity_kp: 1.5
-  # Approach ENU integral. Recovery uses its own separately reset PI instance.
+  # 接近阶段在世界东-北-天坐标系中积分；恢复阶段使用独立重置的比例积分控制器实例。
   horizontal_velocity_ki: 0.30
   horizontal_integral_limit_mps2: 0.20
   horizontal_equilibrium_window_s: 0.5
   horizontal_equilibrium_speed_mps: 0.20
-  # Feedback increment around the frozen POSCTL equilibrium; final total cone remains 5deg.
+  # 围绕已冻结的位置控制模式平衡姿态叠加反馈增量；最终总倾角锥仍限制为 5 度。
   horizontal_max_acceleration_mps2: 0.30
   horizontal_target_acceleration_mps2: 0.10
   horizontal_flow_timeout_s: 0.60
-  # MAVROS clock mapping may lead ROS slightly; cap is enforced at 0.10 s.
+  # MAVROS 时钟映射可能略领先于 ROS；未来时间容差的硬上限为 0.10 秒。
   horizontal_flow_future_tolerance_s: 0.10
   horizontal_flow_quality_min: 1
   horizontal_reacquire_time_s: 0.30
@@ -211,7 +211,7 @@ wall_perch_decision_node:
   # 真正的单电机硬上限仍须在PX4控制分配器或ESC内实现。
   max_thrust: 0.85
 
-  # Bounded departure support; verification and blending both consume budget.
+  # 有时间预算限制的脱离支撑；确认和混合过渡均消耗该预算。
   detach_height_continuation_jump_m: 0.25
   detach_height_continuation_entry_tilt_deg: 30.0
   detach_height_continuation_episode_s: 1.2
@@ -230,26 +230,26 @@ wall_perch_decision_node:
   capture_max_rate_rps: 4.5
   recover_max_rate_rps: 3.0
   max_down_velocity_mps: 0.80
-  # Ignore estimated descent limit only after wall contact is confirmed.
+  # 仅在确认贴墙接触后，才忽略估计下降速度限制。
   ignore_down_velocity_during_hold: true
   min_altitude_m: 0.30
-  # Local ENU z can drift below zero on the ground; freeze ground z on arming.
+  # 地面上的本地东-北-天坐标系高度可能漂移到零以下；解锁时冻结地面高度。
   altitude_reference: arming_ground
   recover_angle_deg: 15.0
   sensor_timeout_s: 0.60
-  # Operator-requested hold-only bypass. No synthetic range/validity is sent.
-  # Acquisition, flip, capture, detach and recovery retain their range checks.
+  # 按操作员要求，仅在贴墙保持阶段绕过距离失效检查；不发送伪造的距离或有效标志。
+  # 取得控制权、翻转、接触确认、脱离和恢复阶段仍保留距离检查。
   ignore_range_loss_during_hold: true
-  # Tolerate error 258 only while the last valid range is still fresh.
+  # 仅在最后一帧有效测距仍新鲜时，容忍错误码 258。
   ignore_range_error_258: true
-  # Ignore range invalid/loss during approach, takeover, flip, capture and hold.
-  # Approach/takeover still wait for fresh valid front/top ranges before advancing.
+  # 接近、接管、翻转、接触确认和贴墙保持期间，忽略测距无效／丢失。
+  # 接近／接管阶段推进前，仍须等待新鲜有效的前向／顶部测距。
   ignore_range_loss_during_attachment: true
   sensor_health_timeout_s: 0.30
   # 侧吸取得 owner 前要求顶部传感器已有新鲜有效量测。
   require_top_sensor_on_acquire: true
   odom_timeout_s: 0.50
-  # nav_msgs/Odometry.twist is expressed in child_frame_id by convention.
+  # 按消息约定，nav_msgs/Odometry.twist 的速度量使用 child_frame_id 指定的子坐标系。
   odom_twist_in_child_frame: true
   state_timeout_s: 1.50
   operator_timeout_s: 0.50
@@ -257,8 +257,8 @@ wall_perch_decision_node:
   require_armed: true
   require_offboard: true
 
-  # PX4 reference bypasses the mixer and writes raw motors in WALL_PIN.
-  # This MAVROS port deliberately defaults to a bounded attitude/thrust target.
+  # PX4 参考实现在墙面锁定阶段绕过混控器，直接写入原始电机输出。
+  # 此 MAVROS 移植版本默认使用受限的姿态／推力目标。
   pin_enabled: false
   pin_pitch_deg: 85.0
   pin_thrust: 0.85
