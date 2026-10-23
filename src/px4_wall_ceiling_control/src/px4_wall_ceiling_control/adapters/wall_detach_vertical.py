@@ -43,7 +43,7 @@ class WallDetachVerticalMixin:
 
     def _init_detach_vertical(self):
         self.detach_vertical_controller = DepartureHeightController(
-            height_kp=float(rospy.get_param('~detach_height_kp', .50)),
+            height_kp=float(rospy.get_param('~detach_height_kp', .30)),
             velocity_kp=float(rospy.get_param('~detach_velocity_kp', .30)),
             velocity_ki=float(rospy.get_param('~detach_velocity_ki', .12)),
             integral_limit=float(rospy.get_param('~detach_vertical_integral_limit', .06)),
@@ -65,6 +65,11 @@ class WallDetachVerticalMixin:
         # Parameter RPCs belong to startup, never to the timed control path.
         # The immutable configuration is shared by every departure until restart.
         self.detach_range_config = self._load_range_config()
+        c = self.detach_vertical_controller
+        rospy.loginfo('wall range gains: velocity_kp=%.3f legacy_velocity_kp=%.3f height_kp=%.3f '
+                      'velocity_ki=%.3f correction_limit=%.3f thrust_slew=%.3f up=%.3f down=%.3f',
+                      self.detach_range_config.control_velocity_kp, c.velocity_kp, c.height_kp,
+                      c.velocity_ki, c.correction_limit, c.thrust_slew, c.up_speed, c.down_speed)
         self.detach_range = RangeHeightFeedback(self.detach_range_config)
         self.detach_range_episode = 0
         self._reset_range_task()
@@ -429,7 +434,89 @@ class WallDetachVerticalMixin:
             values[key] = tuple(values[key])
         return RangeHeightConfig(**values)
 
+    def _reset_range_control_velocity(self):
+        # Private to post-sync range support; never reinitialize the shared
+        # observer, captured height reference, or collective controller.
+        self.detach_fast_ready_since = None
+        self.detach_fast_invalid_since = None
+        self.detach_fast_velocity_fault = False
+        self.detach_fast_log_key = None
+
+    def _range_fast_control_active(self):
+        # A task fault changes completion eligibility, not the velocity needed
+        # to damp its existing height support. In particular a rotation timeout
+        # may reach ABORT before the first range locks. Manual targets and fault
+        # EXIT must not silently select the delayed regression velocity either.
+        # Authority, feedback loss and the latched fast fault are checked by
+        # the existing output path; this predicate grants no output permission.
+        return bool(self._range_locked() and self.detach_range_synced
+                    and self.state in (W.STATE_DETACH_ROTATE, W.STATE_RECOVER,
+                                       W.STATE_ABORT, W.STATE_EXIT))
+
+    def _range_fast_velocity_valid(self, snapshot, now):
+        c = self.detach_range.config
+        return bool(snapshot.valid and snapshot.fast_velocity_valid
+                    and math.isfinite(snapshot.fast_velocity)
+                    and -c.future_tolerance_s <= snapshot.fast_velocity_age <= c.timeout_s)
+
+    def _range_control_velocity(self, snapshot, now):
+        """One velocity selection for both thrust feedback and descent safety.
+
+        Missing fast feedback is a bounded-hold/fault condition, never authority
+        to substitute the slower regression velocity for either consumer.
+        """
+        if self._range_fast_control_active():
+            valid = self._range_fast_velocity_valid(snapshot, now)
+            return (snapshot.fast_velocity if valid else math.nan), valid
+        valid = bool(snapshot.valid and snapshot.velocity_valid
+                     and math.isfinite(snapshot.velocity))
+        return (snapshot.velocity if valid else math.nan), valid
+
+    def _range_control_velocity_reason(self, mode, snapshot, now, weight=0.):
+        elapsed = (0. if self.detach_fast_invalid_since is None else
+                   max(0., now.to_sec()-self.detach_fast_invalid_since))
+        value = snapshot.fast_velocity if self._range_fast_velocity_valid(snapshot, now.to_sec()) else math.nan
+        detail = ('control_velocity=%s v=%.3f m/s age=%.3f s blend=%.2f invalid=%.3f s; %s' %
+                  (mode, value, snapshot.fast_velocity_age, weight, elapsed,
+                   snapshot.fast_velocity_reason))
+        # New source frames, not 50 Hz timer ticks, add diagnostic records.
+        key = (mode, snapshot.fast_velocity_source)
+        if key != self.detach_fast_log_key:
+            rospy.loginfo('wall range control: %s', detail)
+            self.detach_fast_log_key = key
+        return detail
+
+    def _prepare_range_control_velocity(self, now, snapshot):
+        if not self._range_fast_control_active():
+            return
+        if self._range_fast_velocity_valid(snapshot, now.to_sec()):
+            self.detach_fast_invalid_since = None
+            if self.detach_fast_ready_since is None:
+                self.detach_fast_ready_since = now.to_sec()
+            return
+        self.detach_fast_ready_since = None
+        self.detach_vertical_controller.clear_integral()
+        if self.detach_fast_invalid_since is None:
+            self.detach_fast_invalid_since = now.to_sec()
+        if now.to_sec()-self.detach_fast_invalid_since < self.detach_range.config.loss_support_s-2.e-9:
+            return
+        # Existing safety/authority/output failures retain priority. This new
+        # fault only describes a live, owned, otherwise safe control channel.
+        if (not snapshot.valid or not self._safety_ok(now)
+                or not self._detach_vertical_feedback_ok(now)
+                or self._detach_vertical_output(now, allow_recovery=True) is None):
+            return
+        reason = '快速测距速度失效超过短时支撑上限'
+        self.detach_fast_velocity_fault = True
+        self.detach_vertical_fault = reason
+        self.detach_range_failure_cause = self.detach_range_failure_cause or reason
+        self.detach_range_faulted = True
+        self.detach_task_phase = 'FAULT'
+        self.detach_range_block_reason = reason
+        self._range_control_velocity_reason('fault', snapshot, now)
+
     def _reset_range_task(self):
+        self._reset_range_control_velocity()
         if hasattr(self, 'detach_range'):
             self.detach_range.reset()
         self.detach_task_phase = 'NONE'
@@ -456,6 +543,8 @@ class WallDetachVerticalMixin:
             return '本轮已提交一键定高，重复点击不会重置预算'
         if self.detach_range_posctl_request_at is not None:
             return 'POSCTL交回请求已发出，不能再改变高度目标'
+        if self.detach_fast_velocity_fault:
+            return '快速测距速度失效已锁存，本轮不能重新准入'
         fault = self.detach_range_failure_cause or self.detach_vertical_fault or self.last_reason
         if self.detach_range_faulted and fault not in ('测距闭环总时间预算超时', '测距交回等待超时'):
             return '仅测距控制或交回超时可重新准入；'+fault
@@ -469,6 +558,8 @@ class WallDetachVerticalMixin:
         s = r.read_snapshot(now.to_sec())
         if not s.valid or not s.velocity_valid:
             return '等待新鲜测距高度和有效测距速度窗口'
+        if not self._range_fast_velocity_valid(s, now.to_sec()):
+            return '等待新鲜有效的快速测距速度，禁止无阻尼切换定高目标'
         output = self._valid_wall_output(now)
         if not self._detach_vertical_feedback_ok(now) or output is None:
             return '姿态反馈或实际侧吸输出无效'
@@ -523,6 +614,7 @@ class WallDetachVerticalMixin:
             self.detach_range_faulted = False  # This new admitted action has its own budget.
             self.detach_range_failure_cause = ''
             self.detach_vertical_fault = ''
+            self._reset_range_control_velocity()
             self.detach_vertical_controller.begin(r.target, self.detach_vertical_controller.base,
                                                   float(self.horizontal_output.thrust), now.to_sec())
             self.detach_altitude_m = self.recovery_altitude_m = r.target
@@ -600,6 +692,8 @@ class WallDetachVerticalMixin:
         self.detach_altitude_m = self.recovery_altitude_m = r.target
         self.vertical_reference_source = 'range_first_qualified_message'
         self.detach_range_synced = True
+        self._reset_range_control_velocity()
+        self.detach_fast_invalid_since = now.to_sec()
         self.detach_task_phase = 'FAULT' if self.detach_range_faulted else 'RANGE_HEIGHT_CONTROL'
         # Old Z continuity/reanchors have no authority after this atomic switch.
         self.detach_height_continuation.reset()
@@ -644,6 +738,7 @@ class WallDetachVerticalMixin:
             self.detach_task_phase = 'FAULT'
             self.detach_vertical_fault = failure
             self.detach_range_block_reason = failure
+        self._prepare_range_control_velocity(now, s)
 
     def _range_height_feedback(self):
         s = self.detach_range.read_snapshot(self._range_feedback_now().to_sec())
@@ -652,7 +747,10 @@ class WallDetachVerticalMixin:
     def _range_height_settled(self, now):
         s, c = self.detach_range.read_snapshot(now.to_sec()), self.detach_range.config
         return bool(s.valid and s.velocity_valid and abs(s.target-s.height) <= c.height_tolerance_m
-                    and abs(s.velocity) <= c.speed_tolerance_mps)
+                    and abs(s.velocity) <= c.speed_tolerance_mps
+                    and (not self._range_fast_control_active()
+                         or (self._range_fast_velocity_valid(s, now.to_sec())
+                             and abs(s.fast_velocity) <= c.speed_tolerance_mps)))
 
     def _range_vertical_thrust(self, now):
         self.recovery_support_valid = False
@@ -668,6 +766,33 @@ class WallDetachVerticalMixin:
         if output is None or not self.detach_range_synced:
             c.clear_integral()
             return math.nan
+        # A fast-velocity timeout is latched through ABORT. In particular, it
+        # cannot quietly re-enter the old slow-velocity/old-Z control path.
+        if self.detach_fast_velocity_fault:
+            c.clear_integral()
+            self.detach_vertical_reason = self.detach_vertical_fault
+            return math.nan
+        fast_control = self._range_fast_control_active()
+        if fast_control:
+            self._prepare_range_control_velocity(now, s)
+            if self.detach_fast_velocity_fault:
+                self.detach_vertical_reason = self.detach_vertical_fault
+                return math.nan
+            if not self._range_fast_velocity_valid(s, now.to_sec()) and s.valid:
+                c.clear_integral()
+                if now.to_sec()-self.detach_fast_invalid_since >= r.config.loss_support_s-2.e-9:
+                    return math.nan
+                # Hold only a newly validated actual collective; do not drive
+                # on height error without measured velocity damping.
+                self.detach_vertical_value = float(output.thrust)
+                c.value = c.requested = self.detach_vertical_value
+                c.at = now.to_sec()
+                c.correction, c.target_speed = 0., math.nan
+                c.slew_limited = c.saturated = False
+                self.recovery_support_valid = True
+                self.recovery_thrust_limit = c.max_thrust
+                self.detach_vertical_reason = self._range_control_velocity_reason('hold', s, now)
+                return self.detach_vertical_value
         if not s.valid:
             c.clear_integral()
             self.detach_vertical_reason = s.reason+'；目标保留，禁止旧Z回退'
@@ -684,13 +809,16 @@ class WallDetachVerticalMixin:
         weight = min(1., max(0., (now.to_sec()-r.action_started)/r.config.control_blend_s))
         velocity_weight = (min(1., max(0., (now.to_sec()-r.velocity_ready_at)/r.config.control_blend_s))
                            if s.velocity_valid and r.velocity_ready_at is not None else 0.)
+        velocity, velocity_valid = self._range_control_velocity(s, now.to_sec())
+        if fast_control:
+            velocity_weight = min(1., max(0., (now.to_sec()-self.detach_fast_ready_since)/r.config.control_blend_s))
         try:
-            thrust = c.update(s.height, s.velocity if s.velocity_valid else None,
+            thrust = c.update(s.height, velocity if velocity_valid else None,
                 rotate_vector(self._current_quaternion(), (0., 0., 1.))[2],
                 now.to_sec(), s.source, float(output.thrust),
-                integrate=s.velocity_valid and velocity_weight >= 1. and not self.detach_vertical_output_degraded,
+                integrate=velocity_valid and velocity_weight >= 1. and not self.detach_vertical_output_degraded,
                 correction_weight=weight, height_only_kp=r.config.height_only_kp,
-                velocity_weight=velocity_weight)
+                velocity_weight=velocity_weight, velocity_kp=r.config.control_velocity_kp)
         except ValueError as error:
             self.detach_vertical_fault = str(error)
             self.detach_range_failure_cause = self.detach_range_failure_cause or str(error)
@@ -702,6 +830,8 @@ class WallDetachVerticalMixin:
         self.recovery_thrust_limit = c.max_thrust
         self.vertical_target_speed, self.vertical_correction = c.target_speed, c.correction
         self.detach_vertical_reason = s.reason+('；受限输出' if c.saturated else '')
+        if fast_control:
+            self.detach_vertical_reason += '；'+self._range_control_velocity_reason('fast', s, now, velocity_weight)
         return thrust
 
     def _range_stability_ready(self, now):
@@ -714,6 +844,9 @@ class WallDetachVerticalMixin:
             reason = self.detach_vertical_reason
         elif not self._range_height_settled(now):
             reason = '测距高度/速度尚未稳定或新鲜有效'
+        elif self._range_fast_control_active() and (not self._range_fast_velocity_valid(s, now.to_sec())
+                                                   or abs(s.fast_velocity) > c.speed_tolerance_mps):
+            reason = '快速测距速度尚未稳定或新鲜有效'
         elif self._detach_progress() < 1. or not self._detach_rotation_pose_valid():
             reason = '等待姿态轨迹完成、实测倾角≤5°及角速度回稳'
         elif not self._published_recovery_target_ready(now):

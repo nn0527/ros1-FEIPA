@@ -66,8 +66,9 @@ class DepartureHeightController:
         self.clear_integral()
 
     def _requested(self, vertical_fraction, velocity_error, integral, correction_weight=1.,
-                   height_correction=None, velocity_weight=1.):
-        correction = (self.velocity_kp*velocity_error+integral if velocity_error is not None else 0.)
+                   height_correction=None, velocity_weight=1., velocity_kp=None):
+        gain = self.velocity_kp if velocity_kp is None else velocity_kp
+        correction = (gain*velocity_error+integral if velocity_error is not None else 0.)
         if height_correction is not None:
             correction = height_correction+velocity_weight*(correction-height_correction)
         correction = bounded(correction,
@@ -81,7 +82,7 @@ class DepartureHeightController:
 
     def update(self, height, velocity, vertical_fraction, now, source_stamp,
                actual_thrust, integrate=True, correction_weight=1.,
-               height_only_kp=None, velocity_weight=1.):
+               height_only_kp=None, velocity_weight=1., velocity_kp=None):
         if not self.active:
             raise ValueError('departure controller has no seed')
         values = (height, vertical_fraction, now, source_stamp, actual_thrust, correction_weight, velocity_weight)
@@ -91,6 +92,8 @@ class DepartureHeightController:
             raise ValueError('missing velocity requires explicit height-only control')
         if height_only_kp is not None and (not math.isfinite(height_only_kp) or height_only_kp <= 0):
             raise ValueError('invalid height-to-thrust gain')
+        if velocity_kp is not None and (not math.isfinite(velocity_kp) or velocity_kp <= 0):
+            raise ValueError('invalid velocity-to-thrust gain')
         if not all(math.isfinite(v) for v in values) or source_stamp <= 0:
             raise ValueError('invalid departure feedback')
         if not .1-1e-6 <= actual_thrust <= self.max_thrust+1e-6:
@@ -136,13 +139,14 @@ class DepartureHeightController:
             self.last_source_stamp = source_stamp
             self.integral_budget = 0. if previous_source is None or source_gap > .5 else max(0., self.integral_budget-source_dt)
         requested, correction, weight, unlimited = self._requested(
-            vertical_fraction, error, self.integral, correction_weight, height_correction, velocity_weight)
+            vertical_fraction, error, self.integral, correction_weight, height_correction, velocity_weight, velocity_kp)
         self.integral_active = False
         self.saturated = unlimited > self.max_thrust or abs(correction) >= self.correction_limit-1e-9
         if integrate and fresh_sample and source_dt > 0 and vertical_fraction >= math.cos(math.radians(30.)):
             trial = bounded(self.integral+self.velocity_ki*error*source_dt,
                             -self.integral_limit, self.integral_limit)
-            proposed, trial_correction, _, trial_unlimited = self._requested(vertical_fraction, error, trial, correction_weight)
+            proposed, trial_correction, _, trial_unlimited = self._requested(
+                vertical_fraction, error, trial, correction_weight, velocity_kp=velocity_kp)
             direction = trial-self.integral
             outward = ((trial_unlimited > self.max_thrust or trial_correction >= self.correction_limit
                         or requested > actual_thrust+self.thrust_slew*dt+.005) and direction > 0)
@@ -154,7 +158,8 @@ class DepartureHeightController:
             if not outward:
                 self.integral_active = abs(direction) > 1e-12
                 self.integral = trial
-                requested, correction, weight, unlimited = self._requested(vertical_fraction, error, trial, correction_weight)
+                requested, correction, weight, unlimited = self._requested(
+                    vertical_fraction, error, trial, correction_weight, velocity_kp=velocity_kp)
         step = self.thrust_slew*dt
         self.value = bounded(requested, max(.1, actual_thrust-step),
                              min(self.max_thrust, actual_thrust+step))

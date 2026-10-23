@@ -211,7 +211,10 @@ class FusionTransactionTests(unittest.TestCase):
     def test_next_cycle_takes_new_snapshot_in_idle(self):
         h = Harness(); h.suspend(); h.restore(); h.settle()
         h.values = {FLOW: 3, RANGE: 1}
-        h.feed(state="IDLE"); op = h.tick()
+        h.feed(state="IDLE"); self.assertIsNone(h.tick())
+        self.assertTrue(h.status()["control_ready"])
+        h.feed(armed=False); h.tick()
+        h.feed(armed=True); op = h.tick()
         self.assertEqual(op.kind, "snapshot"); h.complete(op)
         h.feed(state="WALL_HOLD", tilt=90.); op = h.tick()
         self.assertEqual(h.journal.data["originals"], {FLOW: 3, RANGE: 1})
@@ -450,9 +453,10 @@ def load_node_without_ros():
     """Test service semantics with mocks, without touching a ROS master/FCU."""
     modules = {name: types.ModuleType(name) for name in (
         "rospy", "mavros_msgs", "mavros_msgs.msg", "mavros_msgs.srv",
-        "nav_msgs", "nav_msgs.msg", "px4_wall_ceiling_control.msg")}
+        "nav_msgs", "nav_msgs.msg", "std_msgs", "std_msgs.msg", "px4_wall_ceiling_control.msg")}
     modules["mavros_msgs.msg"].ParamValue = lambda **kw: types.SimpleNamespace(**kw)
     modules["mavros_msgs.msg"].State = object
+    modules["std_msgs.msg"].String = object
     for name in ("ParamGet", "ParamPull", "ParamSet"):
         setattr(modules["mavros_msgs.srv"], name, object)
     modules["nav_msgs.msg"].Odometry = object
@@ -471,35 +475,23 @@ class WorkerAndTransportTests(unittest.TestCase):
     def setUp(self):
         self.node = load_node_without_ros()
         self.transport = self.node.MavrosParameterTransport.__new__(self.node.MavrosParameterTransport)
-        self.transport.namespace = "/mock_mavros"
-        self.transport.pull = mock.Mock(return_value=types.SimpleNamespace(success=True, param_received=2))
-        self.transport.get = mock.Mock(side_effect=lambda param_id: types.SimpleNamespace(
-            success=True, value=types.SimpleNamespace(integer={FLOW: 1, RANGE: 2}[param_id], real=0.)))
-        self.transport.set = mock.Mock(return_value=types.SimpleNamespace(
-            success=True, value=types.SimpleNamespace(integer=0, real=0.)))
+        self.transport._exchange = mock.Mock(side_effect=lambda parameter, expected=None:
+            expected if expected is not None else {FLOW: 1, RANGE: 2}[parameter])
 
-    def test_snapshot_and_verify_force_pull_before_reading_cache(self):
-        sequence = []
-        self.transport.pull.side_effect = lambda **kw: (sequence.append(("pull", kw)) or
-                                                        types.SimpleNamespace(success=True, param_received=2))
-        self.transport.get.side_effect = lambda param_id: (sequence.append(("get", param_id)) or
-            types.SimpleNamespace(success=True, value=types.SimpleNamespace(integer=1, real=0.)))
+    def test_snapshot_and_verify_use_two_fresh_named_reads(self):
         for kind in ("snapshot", "verify", "reconcile"):
-            sequence.clear()
-            self.transport.execute(Operation(1, kind, 0, 10., 10.))
-            self.assertEqual(sequence, [("pull", {"force_pull": True}), ("get", FLOW), ("get", RANGE)])
+            self.transport._exchange.reset_mock()
+            self.assertEqual(self.transport.execute(Operation(1, kind, 0, 10., 10.)), {FLOW: 1, RANGE: 2})
+            self.assertEqual(self.transport._exchange.call_args_list, [mock.call(FLOW), mock.call(RANGE)])
 
-    def test_failed_pull_and_wrong_set_ack_are_not_success(self):
-        self.transport.pull.return_value.success = False
+    def test_named_read_timeout_and_wrong_set_ack_are_not_success(self):
+        self.transport._exchange.side_effect = RuntimeError('timeout')
         with self.assertRaises(RuntimeError):
-            self.transport.execute(Operation(1, "snapshot", 0, 10., 10.))
-        self.transport.get.assert_not_called()
-        for response in (types.SimpleNamespace(success=False, value=None),
-                         types.SimpleNamespace(success=True, value=types.SimpleNamespace(integer=1, real=0.)),
-                         types.SimpleNamespace(success=True, value=types.SimpleNamespace(integer=0, real=1.))):
-            self.transport.set.return_value = response
-            with self.assertRaises((RuntimeError, ValueError)):
-                self.transport.execute(Operation(2, "set", 1, 10., 10., FLOW, 0))
+            self.transport.execute(Operation(1, 'snapshot', 0, 10., 10.))
+        self.transport._exchange.side_effect = None
+        self.transport._exchange.return_value = 1
+        with self.assertRaises(ValueError):
+            self.transport.execute(Operation(2, 'set', 1, 10., 10., FLOW, 0))
 
     def test_blocked_service_keeps_status_thread_free_and_has_only_one_worker(self):
         entered, release = threading.Event(), threading.Event()

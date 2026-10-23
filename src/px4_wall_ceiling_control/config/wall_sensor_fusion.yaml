@@ -9,6 +9,9 @@ wall_sensor_fusion_manager_node:
   state_timeout_s: 1.50
   future_tolerance_s: 0.10
   request_timeout_s: 5.0
+  # Fresh named PARAM_VALUE exchanges; never force-pull the full parameter table.
+  parameter_reply_timeout_s: 0.60
+  parameter_reply_retries: 2
   # MAVROS 1.20.1 waits up to 5 s for PARAM_SET ACK. On a pending-write
   # restart, isolate the old service for 10 s before issuing any new calls.
   restart_quarantine_s: 10.0

@@ -20,6 +20,7 @@ class RangeHeightConfig:
     pose_wait_s: float = .20
     velocity_window_s: float = .8
     height_only_kp: float = .15
+    control_velocity_kp: float = .18
     control_blend_s: float = .30
     loss_support_s: float = .30
     control_timeout_s: float = 15.
@@ -49,7 +50,7 @@ class RangeHeightConfig:
     def __post_init__(self):
         positive = (self.entry_tilt_deg, self.operating_tilt_deg, self.timeout_s,
                     self.pose_interp_max_span_s, self.pose_wait_s,
-                    self.velocity_window_s, self.height_only_kp,
+                    self.velocity_window_s, self.height_only_kp, self.control_velocity_kp,
                     self.control_blend_s, self.loss_support_s, self.control_timeout_s,
                     self.handover_wait_s, self.height_tolerance_m, self.speed_tolerance_mps,
                     self.stable_time_s, self.velocity_min_dt_s, self.height_filter_tau_s,

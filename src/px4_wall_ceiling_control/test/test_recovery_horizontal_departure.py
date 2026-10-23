@@ -22,6 +22,9 @@ class RecoveryHorizontalDepartureTests(unittest.TestCase):
         self.f.setUp()
         self.addCleanup(self.f.doCleanups)
         self.n = self.f.n
+        # These cases isolate PI/evidence behavior after the transition. The
+        # production 0.30 s blend is covered by test_recovery_continuous_control.
+        self.n.recovery_horizontal_reentry_blend_s = .02
         self.f.ready()
         self.n.state = W.STATE_RECOVER
         self.n.horizontal_takeover_yaw = 0.

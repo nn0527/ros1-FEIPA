@@ -35,7 +35,8 @@ from px4_wall_ceiling_control.domain.rc_attitude_assist import (
     stick_fraction,
     trim_attitude,
 )
-from px4_wall_ceiling_control.domain.recovery_attitude_limits import limit_recovery_attitude, axis_yaw
+from px4_wall_ceiling_control.domain.recovery_attitude_limits import (
+    limit_recovery_attitude, axis_yaw, attitude_from_axis_yaw)
 from px4_wall_ceiling_control.domain.safety import flight_state_ready
 from px4_wall_ceiling_control.freshness import is_fresh_receipt as is_fresh, is_fresh_source
 from px4_wall_ceiling_control.msg import (
@@ -1361,6 +1362,7 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
         desired_q = q
         requested_angle = quaternion_angle(q_previous, q)
         requested_thrust = target.thrust
+        abort_level_immediate = False
         if phase in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT):
             prev_axis, _ = axis_yaw(q_previous)
             if math.acos(max(-1., min(1., prev_axis[2]))) > math.radians(self.recovery_max_tilt_deg) + 1e-6:
@@ -1372,13 +1374,33 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
             q, _ = limit_recovery_attitude(q, q_previous, dt,
                 math.radians(self.recovery_max_tilt_deg), math.radians(self.recovery_tilt_slew_deg_s),
                 math.radians(self.recovery_yaw_slew_deg_s))
+        elif abort:
+            # ABORT is also a long-lived near-level recovery state. Ordinary
+            # velocity feedback must not inherit the emergency leveling bypass.
+            max_tilt = math.radians(self.recovery_max_tilt_deg)
+            prev_axis, _ = axis_yaw(q_previous)
+            measured = self.odom.pose.pose.orientation if self._odom_fresh(now) else None
+            measured_q = tuple(getattr(measured, k) for k in 'xyzw') if measured is not None else ()
+            measured_valid = (len(measured_q) == 4 and all(math.isfinite(v) for v in measured_q)
+                              and abs(sum(v*v for v in measured_q)-1.) <= .01)
+            near_level = bool(measured_valid and prev_axis[2] >= math.cos(max_tilt)-1.e-9
+                              and axis_yaw(measured_q)[0][2] >= math.cos(max_tilt)-1.e-9)
+            bounded_q, _ = limit_recovery_attitude(q, q_previous, dt, max_tilt,
+                math.radians(self.recovery_tilt_slew_deg_s), math.radians(self.recovery_yaw_slew_deg_s))
+            if near_level:
+                q = bounded_q
+            else:
+                # Large/unknown measured attitude or a large actual output axis:
+                # preserve immediate safe-axis recovery; yaw is never leveling.
+                q = attitude_from_axis_yaw(axis_yaw(q)[0], axis_yaw(bounded_q)[1])
+                abort_level_immediate = True
         elif not abort:
             rate = (getattr(self, "wall_detach_rate_rad_s", math.radians(56.25)) if returning
                     else getattr(self, "wall_maneuver_rate_rad_s", math.radians(84.375)))
             angle_step = rate * dt
             if requested_angle > angle_step and requested_angle > 1e-9:
                 q = quaternion_slerp(q_previous, q, angle_step/requested_angle)
-        # ABORT deliberately keeps immediate safe leveling. Its thrust still
+        # Emergency ABORT keeps immediate safe leveling. Its thrust still
         # follows actual support; loss of a soft allowance cannot cause a step.
         slew_rate = (getattr(self, "wall_return_thrust_slew_per_s", .50) if returning
                      else getattr(self, "wall_maneuver_thrust_slew_per_s", .50))
@@ -1390,7 +1412,8 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
             "seed_available": True, "dt_s": dt,
             "attitude_step_deg": math.degrees(quaternion_angle(q_previous, q)),
             "thrust_step": target.thrust-thrust_previous,
-            "abort_level_immediate": abort,
+            "abort_level_immediate": abort_level_immediate,
+            "abort_near_level_slew": abort and not abort_level_immediate,
             "support_allowance_valid": bool(getattr(candidate, "recovery_support_valid", False)),
             "requested_thrust": requested_thrust,
             "limited": quaternion_angle(q, desired_q) > 1e-9
@@ -1422,7 +1445,12 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
         target = self._limit_final_recovery_target(now, target, candidate.source, candidate if wall else None)
         target = self._limit_final_approach_target(now, target, candidate.source, candidate if wall else None)
         if wall:
-            target = self._limit_wall_publication(now, target, candidate)
+            # The previous seed is stamped at actual publication, not at the
+            # start of its timer. Use the current time at the matching boundary:
+            # otherwise processing time is subtracted from every slew interval,
+            # making configured thrust/rate limits slower as CPU work increases.
+            # The limiter retains its 50 ms cap; final freshness is checked below.
+            target = self._limit_wall_publication(rospy.Time.now(), target, candidate)
             if target is None:
                 return self.OUTPUT_NONE
         if wall:

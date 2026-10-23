@@ -1221,9 +1221,11 @@ class WallPerchDecisionNode(WallDetachVerticalMixin, WallHorizontalVelocityMixin
         if self._range_locked():
             now = self._range_feedback_now().to_sec()
             s = self.detach_range.read_snapshot(now)
+            velocity, velocity_valid = self._range_control_velocity(s, now)
             # Single-frame/short-loss support has no invented velocity. Stability
-            # still requires valid range velocity through _range_height_settled.
-            return bool((s.valid and (not s.velocity_valid or s.velocity >= -self.max_down_velocity_mps))
+            # still requires valid range velocity through _range_height_settled;
+            # the separate fast-loss deadline bounds support without a speed.
+            return bool((s.valid and (not velocity_valid or velocity >= -self.max_down_velocity_mps))
                         or (self.detach_range.invalid_since is not None
                             and now-self.detach_range.invalid_since < self.detach_range.config.loss_support_s))
         if self.odom is None:

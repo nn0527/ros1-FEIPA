@@ -130,12 +130,14 @@ class FinalTargetLimitsTest(unittest.TestCase):
                 self.control(WallPerchStatus.STATE_RECOVER))
             self.assertAlmostEqual(t.thrust,.85,places=6)
 
-    def test_recover_to_abort_retains_thrust_history_without_delaying_safe_level_projection(self):
+    def test_near_level_recover_to_abort_retains_axis_and_thrust_continuity(self):
         n=self.node()
         first=self.publish(WallPerchStatus.STATE_RECOVER)
         before=n.last_published_control
         t=self.publish(WallPerchStatus.STATE_ABORT,3)
-        self.assertAlmostEqual(tilt(tuple(getattr(t.orientation,k) for k in "xyzw")),5.)
+        previous_tilt = tilt(before[0])
+        self.assertLessEqual(tilt(tuple(getattr(t.orientation,k) for k in "xyzw"))-previous_tilt,.200001)
+        self.assertTrue(n.wall_publication_slew['abort_near_level_slew'])
         self.assertLessEqual(abs(t.thrust-before[1]),.010001)
         self.assertEqual(n.last_published_control[2],self.fx.now)
         self.assertLess(tilt(tuple(getattr(first.orientation,k) for k in "xyzw")),5.)

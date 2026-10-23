@@ -77,7 +77,7 @@ wall_perch_decision_node:
   recover_time_s: 1.00
   recover_timeout_s: 15.00
   # Keep one departure height/base through DETACH, RECOVER and handover.
-  detach_height_kp: 0.50
+  detach_height_kp: 0.30
   detach_velocity_kp: 0.30
   detach_velocity_ki: 0.12
   detach_vertical_integral_limit: 0.06
@@ -96,6 +96,9 @@ wall_perch_decision_node:
   detach_range_velocity_window_s: 0.8
   detach_range_velocity_min_dt_s: 0.05
   detach_range_height_only_kp: 0.15
+  # Range-only speed-loop candidate; legacy/non-range gains stay unchanged.
+  # Reduced from 0.30 after fast feedback exposed frequent correction saturation.
+  detach_range_control_velocity_kp: 0.18
   detach_range_control_blend_s: 0.30
   detach_range_loss_support_s: 0.30
   detach_range_control_timeout_s: 15.0
@@ -120,7 +123,8 @@ wall_perch_decision_node:
   detach_range_future_tolerance_s: 0.10
   detach_range_height_filter_tau_s: 0.10
   detach_range_velocity_filter_tau_s: 0.25
-  # Parallel observer only; it does not drive thrust until separately validated.
+  # Fast adjacent-range velocity damps all range-owned departure/recovery paths.
+  # The slow window remains an independent stability/handover check.
   detach_range_fast_velocity_filter_tau_s: 0.10
   detach_range_fast_velocity_max_gap_s: 0.60
   detach_range_jump_m: 0.25
@@ -129,6 +133,16 @@ wall_perch_decision_node:
   return_thrust_slew_per_s: 0.50
   recovery_horizontal_velocity_ki: 0.30
   recovery_horizontal_integral_limit_mps2: 0.20
+  # Smooth ordinary recovery reentry; never delays emergency leveling or kill.
+  recovery_horizontal_reentry_blend_s: 0.30
+  # Already-qualified, continuously valid feedback: taper correction to zero
+  # from 30 to the existing 45 deg/s limit; do not reacquire at high rates.
+  recovery_horizontal_rate_soft_deg_s: 30.0
+  # Measured tilt: taper velocity correction before the unchanged >10 deg gate.
+  recovery_horizontal_tilt_soft_deg: 5.0
+  recovery_horizontal_tilt_stop_deg: 8.0
+  # After >=8 deg, require fresh level/low-rate samples before smooth reentry.
+  recovery_horizontal_level_hold_s: 0.30
   departure_retreat_speed_mps: 0.05
   departure_clearance_distance_m: 0.30
   departure_clearance_hold_s: 0.30

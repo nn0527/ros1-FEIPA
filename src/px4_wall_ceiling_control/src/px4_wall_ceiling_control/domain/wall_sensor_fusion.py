@@ -137,7 +137,7 @@ class FusionPolicy:
 
     Call observe_* / tick / complete under one node lock.  Execute the returned
     Operation in a different thread, then pass its result to complete.  Snapshot
-    and verify operations must force ParamPull before reading both ParamGets.
+    and verify operations require named, fresh FCU readback of both parameters.
     """
     def __init__(self, journal, vehicle_id, enabled=False, restore_tilt_deg=80.,
                  application_settle_s=1.2, odom_timeout_s=.3,
@@ -190,6 +190,9 @@ class FusionPolicy:
         self.ready_after = 0.
         self.request_stamp = self.confirmed_stamp = 0.
         self.in_flight = None
+        self.operation_stage = 'executing'
+        self.execution_started_mono = None
+        self.refresh_on_arm = False
         self.revision = self.sequence = 0
         self.retry_count = self.failures = 0
         self.next_attempt = 0.
@@ -236,6 +239,10 @@ class FusionPolicy:
                 # stale frames themselves never authorize a request.
                 self.recovery_entry_pending = True
             self._observe_recovery_threshold(now, monotonic)
+            # Capture qualified evidence at the sample rate. A delayed timer
+            # must not lose a crossing while subsequent fresh poses stay level.
+            # This changes only intent; the worker still serializes all writes.
+            self._update_restore_intent(now, monotonic)
         return True
 
     def observe_wall(self, state, source, now, monotonic):
@@ -251,16 +258,47 @@ class FusionPolicy:
             self.wall_state = state
             if state in RECOVERY_STATES and self.odom.fresh(now, monotonic):
                 self._observe_recovery_threshold(now, monotonic)
+                self._update_restore_intent(now, monotonic)
         return True
 
     def observe_fcu(self, connected, armed, source, now, monotonic):
+        rearmed = not self.armed and bool(armed)
         if not self.fcu.observe(source, now, monotonic):
             return False
         self.connected, self.armed = bool(connected), bool(armed)
+        if rearmed and not self.restore_required and self.originals:
+            self.refresh_on_arm = True
         return True
 
     def _vehicle_fresh(self, now, monotonic):
         return self.connected and self.fcu.fresh(now, monotonic)
+
+    def _suspension_allowed(self, now, monotonic):
+        return bool(self._vehicle_fresh(now, monotonic) and self.armed
+                    and self.wall.fresh(now, monotonic)
+                    and self.wall_state == "WALL_HOLD")
+
+    def _update_restore_intent(self, now, monotonic):
+        if self.restore_required and not self.restore_intent:
+            if ((self._vehicle_fresh(now, monotonic) and not self.armed)
+                    or self._recovery_allows_restore(now, monotonic)):
+                self._request_restore(monotonic)
+
+    def authorize_operation(self, operation, now, monotonic):
+        """Recheck live intent immediately before work and after durable I/O.
+
+        The worker calls this under the node lock. A recovery sample can arrive
+        between policy ticks or while fsync is pending; it must invalidate a
+        queued disable before that disable reaches the FCU.
+        """
+        self._update_restore_intent(now, monotonic)
+        if self.in_flight != operation or operation.revision != self.revision:
+            return False
+        if not self._vehicle_fresh(now, monotonic):
+            raise RuntimeError('fresh FCU state unavailable before parameter dispatch')
+        if operation.kind == 'set' and not self.restore_intent:
+            return self._suspension_allowed(now, monotonic)
+        return True
 
     def _record(self, pending=None):
         return {"version": 1, "vehicle_id": self.vehicle_id,
@@ -283,6 +321,16 @@ class FusionPolicy:
         self.next_attempt = monotonic + min(self.retry_max_s,
                                            self.retry_initial_s * 2 ** min(self.failures-1, 8))
 
+    def _operation_failed(self, operation, reason, monotonic):
+        self._failed(reason, monotonic)
+        if (operation.kind == 'set' and self.restore_intent
+                and operation.revision != self.revision):
+            # An old disable may genuinely fail after recovery was requested.
+            # Keep its diagnostic and unknown parameter evidence, but do not
+            # count its retry delay against the new restoration transaction.
+            self.failures = 0
+            self.next_attempt = monotonic
+
     def _operation(self, kind, now, monotonic, parameter="", value=-1):
         self.sequence += 1
         operation = Operation(self.sequence, kind, self.revision, now, monotonic,
@@ -292,8 +340,21 @@ class FusionPolicy:
                 "request_stamp": now}):
             return None
         self.in_flight = operation
+        self.operation_stage = 'executing'
+        self.execution_started_mono = monotonic
         self.request_stamp = now
         return operation
+
+    def mark_operation_stage(self, operation, stage, now, monotonic):
+        if self.in_flight != operation:
+            return False
+        self.operation_stage = stage
+        if stage == 'executing':
+            self.execution_started_mono = monotonic
+            self.request_stamp = now
+        else:
+            self.execution_started_mono = None
+        return True
 
     def _request_restore(self, monotonic):
         if self.restore_intent:
@@ -302,13 +363,18 @@ class FusionPolicy:
         self.revision += 1
         self.restore_done.clear()
         self.settle_until = None
+        # Disable failures belong to the old intent. Recovery must not inherit
+        # their exponential retry delay; an actual in-flight write still owns
+        # the serial slot until its worker returns.
+        self.error = ""
+        self.failures = 0
+        self.next_attempt = monotonic
         # Keep any outstanding set in the journal until its actual return.
         op = self.in_flight
         pending = ({"token": op.token, "parameter": op.parameter,
                     "value": op.value, "request_stamp": op.issued_at}
                    if op and op.kind == "set" else None)
         self._save(monotonic, pending)
-        self.next_attempt = max(self.next_attempt, monotonic)
 
     def _observe_recovery_threshold(self, now, monotonic):
         # This runs at the odometry rate, so a crossing followed by equal-angle
@@ -344,14 +410,9 @@ class FusionPolicy:
         if self.fatal:
             return None
         vehicle_fresh = self._vehicle_fresh(now, monotonic)
-        if self.restore_required and not self.restore_intent:
-            # Attitude evidence can latch intent while the FCU link is down;
-            # only executing requests (and disarm authorization) needs a fresh
-            # connected State.  Otherwise a reconnect after leveling could
-            # lose the short threshold-crossing event forever.
-            if ((vehicle_fresh and not self.armed)
-                    or self._recovery_allows_restore(now, monotonic)):
-                self._request_restore(monotonic)
+        # Latch qualifying attitude even while disconnected; execution still
+        # requires a fresh connected FCU, and an unresolved write stays serial.
+        self._update_restore_intent(now, monotonic)
         if self.restart_pending:
             # Deployed MAVROS 1.20.1 waits at most 1 s * (3 + 2) for a
             # PARAM_SET.  Ten monotonic seconds drain a previous process's
@@ -366,7 +427,8 @@ class FusionPolicy:
             self.restart_pending = False
             self.error = ""
         if self.in_flight is not None:
-            if monotonic-self.in_flight.issued_mono > self.request_timeout_s:
+            if (self.execution_started_mono is not None
+                    and monotonic-self.execution_started_mono > self.request_timeout_s):
                 self.error = "{} timed out; waiting for unresolved service call".format(self.in_flight.kind)
             return None
         if monotonic < self.next_attempt or not vehicle_fresh:
@@ -384,12 +446,11 @@ class FusionPolicy:
                 if monotonic >= self.settle_until:
                     return self._operation("verify", now, monotonic)
             else:
-                # After a process restart we cannot assume the vehicle is
-                # still attached.  Reconciliation alone never authorizes a
-                # fresh disable in ordinary flight.
-                if self.restarted_obligation and not (
-                        self.wall.fresh(now, monotonic) and self.wall_state == "WALL_HOLD"):
-                    self.error = "pending journal: waiting for fresh HOLD or qualified recovery evidence"
+                # The same live HOLD guard applies to scheduling and dispatch,
+                # including partial suspension in a normal, unrestarted cycle.
+                # Outside HOLD keep the restore obligation, but never enqueue
+                # another disable that dispatch would immediately cancel.
+                if not self._suspension_allowed(now, monotonic):
                     return None
                 for key in (FLOW, RANGE):
                     if key not in self.disable_done:
@@ -401,21 +462,21 @@ class FusionPolicy:
             return None
         if self.idle_pending and self.wall_state == "IDLE":
             self.idle_pending = False
-            self.originals.clear()
-            self.confirmed.clear()
-            self.restored = False
             self.cycle_consumed = False
             self.disable_done.clear()
             self.restore_done.clear()
             self.restore_intent = False
-            self.ready_after = 0.
             self.error = ""
+        if self.refresh_on_arm and self.wall_state == "IDLE":
+            self.refresh_on_arm = False
+            # Keep the verified snapshot visible until this fresh read completes.
+            return self._operation('snapshot', now, monotonic)
         if not self.originals:
             if self.wall_state == "IDLE":
                 return self._operation("snapshot", now, monotonic)
             self.error = "no safe IDLE snapshot; parameter writes inhibited"
             return None
-        if self.wall_state == "WALL_HOLD" and not self.cycle_consumed:
+        if self._suspension_allowed(now, monotonic) and not self.cycle_consumed:
             self.episode_id = uuid.uuid4().hex
             self.cycle_consumed = True
             self.restore_required = True
@@ -434,16 +495,24 @@ class FusionPolicy:
         if self.in_flight != operation:
             return False
         self.in_flight = None
+        self.execution_started_mono = None
+        self.operation_stage = ''
         if not success:
+            if values.get('cancelled') is True:
+                # No FCU write occurred. Do not erase confirmed evidence or
+                # classify a same-revision state change as a transport failure.
+                self.error = ''
+                self.next_attempt = monotonic
+                return True
             if operation.kind == "set":
                 self.confirmed.pop(operation.parameter, None)
-            self._failed(reason or "{} failed".format(operation.kind), monotonic)
+            self._operation_failed(operation, reason or "{} failed".format(operation.kind), monotonic)
             return True
         if operation.kind == "set":
             value = values.get(operation.parameter)
             if type(value) is not int or value != operation.value:
                 self.confirmed.pop(operation.parameter, None)
-                self._failed("PARAM_SET acknowledgement value mismatch", monotonic)
+                self._operation_failed(operation, "PARAM_SET acknowledgement value mismatch", monotonic)
                 return True
             self.confirmed[operation.parameter] = value
             self.confirmed_stamp = now
@@ -514,6 +583,11 @@ class FusionPolicy:
         ready = (not active or (phase == "READY" and self.in_flight is None
                               and connected and self.wall.fresh(now, monotonic)))
         reason = self.error
+        if not reason and self.in_flight is not None and self.operation_stage != 'executing':
+            reason = 'parameter transaction: '+self.operation_stage
+        if (not reason and self.restore_required and not self.restore_intent
+                and self.in_flight is None and not self._suspension_allowed(now, monotonic)):
+            reason = 'suspension paused: waiting for fresh HOLD or qualified recovery evidence'
         if active and not connected:
             reason = reason or "waiting for fresh connected FCU state"
         if phase == "READY" and not self.wall.fresh(now, monotonic):
