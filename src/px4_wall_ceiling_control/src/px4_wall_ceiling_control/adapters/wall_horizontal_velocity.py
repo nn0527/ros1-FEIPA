@@ -76,7 +76,7 @@ class WallHorizontalVelocityMixin:
             float(rospy.get_param('~recovery_horizontal_velocity_ki', .30)),
             float(rospy.get_param('~recovery_horizontal_integral_limit_mps2', .20)))
         self.departure_retreat_speed = float(rospy.get_param('~departure_retreat_speed_mps', .05))
-        self.departure_clearance_distance = float(rospy.get_param('~departure_clearance_distance_m', .30))
+        self.departure_clearance_distance = float(rospy.get_param('~departure_clearance_distance_m', .50))
         self.departure_clearance_hold = float(rospy.get_param('~departure_clearance_hold_s', .30))
         self.departure_heading_tolerance = math.radians(float(rospy.get_param('~departure_heading_tolerance_deg', 10.)))
         if not (0 < self.departure_retreat_speed <= .10
@@ -238,6 +238,9 @@ class WallHorizontalVelocityMixin:
     def _update_departure_clearance(self, now):
         if not getattr(self, 'departure_active', False):
             return
+        if getattr(self, '_locked_recovery', lambda: False)():
+            self._update_simple_departure_clearance(now)
+            return
         reason = ''
         attitude = self._current_quaternion() if self._odom_fresh(now) else None
         yaw = getattr(self, 'departure_yaw', None)
@@ -245,8 +248,8 @@ class WallHorizontalVelocityMixin:
             reason = '离墙动作阶段无效'
         elif not getattr(self, 'horizontal_velocity_enabled', False) or not self.horizontal_velocity_ready:
             reason = '离墙等待新鲜有效光流和水平速度'
-        elif attitude is None or rotate_vector(attitude, (0.,0.,1.))[2] < math.cos(math.radians(5.)):
-            reason = '离墙等待实测总倾角≤5°'
+        elif attitude is None or rotate_vector(attitude, (0.,0.,1.))[2] < math.cos(math.radians(10. if getattr(self, '_locked_recovery', lambda: False)() else 5.)):
+            reason = '离墙等待实测姿态回到工作倾角范围'
         elif yaw is None:
             reason = '接管航向缺失，禁止猜测退墙方向'
         else:
@@ -593,7 +596,8 @@ class WallHorizontalVelocityMixin:
             preserve_attitude_confirmation=preserve_attitude_confirmation)
         if getattr(self, 'departure_active', False):
             self.departure_level_at = None
-            self._reset_departure_evidence(reason)
+            if not getattr(self, '_locked_recovery', lambda: False)():
+                self._reset_departure_evidence(reason)
 
     def _horizontal_phase_allowed(self, now):
         if self.state in (W.STATE_IDLE,W.STATE_FRONT_WALL_DETECT,W.STATE_STABILIZE_HOVER,
@@ -618,6 +622,9 @@ class WallHorizontalVelocityMixin:
         return False
 
     def _prepare_horizontal_velocity(self, now):
+        if getattr(self, '_locked_recovery', lambda: False)():
+            self._prepare_simple_recovery_velocity(now)
+            return
         if not getattr(self,'horizontal_velocity_enabled',False):return
         self.recovery_attitude_confirmation_pending = False
         if not self._wall_fusion_ready(now):
@@ -733,6 +740,10 @@ class WallHorizontalVelocityMixin:
             or self._departure_clearance_ready(now)))
 
     def _horizontal_attitude(self, now, quaternion):
+        if getattr(self, 'abort_land_requested', False):
+            return quaternion
+        if getattr(self, '_locked_recovery', lambda: False)():
+            return self._simple_recovery_attitude(now)
         if (self.state == W.STATE_DETACH_ROTATE and getattr(self, 'detach_range_enabled', False)
                 and not getattr(self, 'bench_wait_for_ranges', False)):
             self.horizontal_velocity_active = False

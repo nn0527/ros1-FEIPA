@@ -19,9 +19,9 @@ wall_perch_decision_node:
   front_ready_distance_m: 0.50
   # 前距连续满足0.4 s后直接进入SLOW_APPROACH。
   front_ready_hold_s: 0.40
-  # 对应 PX4 翻转触发距离／保持时间：WP_FLP_TRD_DIST / WP_FLP_TRD_HLD
+  # 一帧新鲜有效的原始前距≤0.20 m即可翻转；0表示单帧，不经过距离滤波或连续确认。
   flip_trigger_distance_m: 0.20
-  flip_trigger_hold_s: 0.30
+  flip_trigger_hold_s: 0.0
   # 对应 PX4 顶部接触距离／保持时间：WP_TOP_CT_DIST / WP_TOP_CT_HLD
   top_contact_distance_m: 0.056
   # 旧顶部准入判断仅保留作诊断；顶部距离、有效帧和新鲜度均不参与HOLD准入。
@@ -39,7 +39,7 @@ wall_perch_decision_node:
   # 正常流程跳过STABILIZE_HOVER；保留参数仅用于旧状态兼容。
   stabilize_time_s: 0.00
   # 有效的前向原始距离超过此阈值时，中止翻转前的接近过程。
-  approach_abort_front_distance_m: 1.3
+  approach_abort_front_distance_m: 1.8
   approach_timeout_s: 20.00
   flip_time_s: 2.00
   # 独立的实际经过时间上限：控制步长受限，停顿后不会通过补步追赶轨迹。
@@ -68,12 +68,13 @@ wall_perch_decision_node:
   detach_stable_hold_s: 0.50
   detach_request_timeout_s: 8.00
   # 脱离姿态轨迹的规划时长。
-  # 在 3 秒内转动 90 度，设定值采用五次曲线。
+  # 名义90度五次曲线时长3秒；接入动态制动后允许延长，以实际规划完成为准。
   detach_time_s: 3.00
   detach_duration_timeout_s: 10.00
   detach_max_tracking_error_deg: 30.0
-  # 以下动态制动参数仅供非测距兼容路径；测距离墙固定五次曲线回平。
-  # 已发布目标倾角进入30度后，继承目标角度/速度/加速度重新插值。
+  # 测距与非测距正常离墙均启用以下动态制动；专用台架保留定时轨迹。
+  # 第一段目标与实测不匹配时按跟踪误差门等待；第二段实测倾角≤30度锁存制动，
+  # 继承最终已发布目标的角度/速度/加速度重新插值，结合实测姿态和角速度。
   # 制动能力是规划假设，需台架/试飞验证；此处不修改PX4角速度积分。
   detach_brake_enabled: true
   detach_brake_target_deg: 30.0
@@ -123,6 +124,8 @@ wall_perch_decision_node:
   # 一键操作的显式目标高度，单位为垂直方向的米；不替代实测高度。
   detach_range_manual_target_m: 1.5
   detach_range_handover_wait_s: 6.0
+  # 以下为兼容路径阈值；简化版锁定姿态RECOVER统一使用 domain/simple_recovery.py：
+  # 总倾角10°、角速20°/s、高差0.20m、垂直/水平速度0.25m/s，连续0.50s且2个新测距。
   detach_range_height_tolerance_m: 0.10
   detach_range_speed_tolerance_mps: 0.20
   detach_range_stable_time_s: 1.0
@@ -166,7 +169,7 @@ wall_perch_decision_node:
   # 倾角达到或超过 8 度后，须取得新鲜、接近水平且低角速度的样本，才平滑重新接入。
   recovery_horizontal_level_hold_s: 0.30
   departure_retreat_speed_mps: 0.05
-  departure_clearance_distance_m: 0.30
+  departure_clearance_distance_m: 0.50
   departure_clearance_hold_s: 0.30
   departure_heading_tolerance_deg: 10.0
   # 垂直目标速度限幅，世界东-北-天坐标系中向上为正。正常脱离使用

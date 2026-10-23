@@ -22,6 +22,9 @@ class RecoveryHorizontalDepartureTests(unittest.TestCase):
         self.f.setUp()
         self.addCleanup(self.f.doCleanups)
         self.n = self.f.n
+        # Preserve the legacy multi-frame 0.30 m contract in this suite;
+        # captured RECOVER's single-frame >0.50 m path has its own tests.
+        self.n.departure_clearance_distance = .30
         # These cases isolate PI/evidence behavior after the transition. The
         # production 0.30 s blend is covered by test_recovery_continuous_control.
         self.n.recovery_horizontal_reentry_blend_s = .02

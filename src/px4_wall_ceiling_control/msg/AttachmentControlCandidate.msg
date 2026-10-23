@@ -48,3 +48,6 @@ bool range_feedback_valid
 
 # Range departure before first lock: attitude/feedforward support, no Z/vz loop.
 bool departure_support_only
+
+# Captured-attitude demo recovery profile (10 degree output envelope).
+bool recover_attitude_locked

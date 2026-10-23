@@ -3,8 +3,6 @@
 import fcntl
 import hashlib
 import json
-import math
-import os
 import queue
 import threading
 import time
@@ -15,13 +13,13 @@ from std_msgs.msg import String
 from nav_msgs.msg import Odometry
 
 from px4_wall_ceiling_control.domain.wall_sensor_fusion import (
-    FLOW, RANGE, FusionPolicy, RestoreJournal,
+    FusionPolicy,
 )
 from px4_wall_ceiling_control.msg import WallPerchStatus, WallSensorFusionStatus
 
 
 from px4_wall_ceiling_control.adapters.fusion_mavlink import MavrosParameterTransport
-from px4_wall_ceiling_control.domain.fusion_worker import StagedRestoreJournal, SerialParameterWorker
+from px4_wall_ceiling_control.domain.fusion_worker import MemoryRestoreJournal, SerialParameterWorker
 
 
 class WallSensorFusionManagerNode:
@@ -36,25 +34,17 @@ class WallSensorFusionManagerNode:
                 raise ValueError("set ~vehicle_id or MAVROS target_system_id and fcu_url; vehicle identity is required")
             vehicle_id = "{}|sys={}|fcu={}".format(namespace, int(target), fcu_url)
         identity_hash = hashlib.sha256(vehicle_id.encode("utf-8")).hexdigest()[:24]
-        journal_directory = rospy.get_param("~journal_directory",
-                                             os.path.expanduser("~/.ros/wall_sensor_fusion"))
-        journal_path = rospy.get_param("~journal_path", os.path.join(
-            journal_directory, identity_hash + ".json"))
-        # Keep the process lock until process exit, including shutdown while
-        # the worker still owns a service request.  Recovered pending requests
-        # additionally use the MAVROS-version-specific quarantine below.
-        journal_path = os.path.abspath(os.path.expanduser(journal_path))
-        os.makedirs(os.path.dirname(journal_path), mode=0o700, exist_ok=True)
-        self.journal_lock = open(journal_path + ".lock", "a")
-        fcntl.flock(self.journal_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Prevent concurrent managers, without durable records or disk sync.
+        # /tmp is volatile on the Pi; this lock does not store recovery state.
+        self.process_lock = open("/tmp/wall_sensor_fusion_" + identity_hash + ".lock", "a")
+        fcntl.flock(self.process_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         settings = {key: float(rospy.get_param("~" + key, default)) for key, default in (
             ("restore_tilt_deg", 80.), ("application_settle_s", 1.2),
             ("odom_timeout_s", .3), ("status_timeout_s", .6), ("state_timeout_s", 1.5),
             ("future_tolerance_s", .1), ("request_timeout_s", 5.),
             ("retry_initial_s", 1.), ("retry_max_s", 8.), ("restart_quarantine_s", 10.))}
-        self.durable_journal = RestoreJournal(journal_path, vehicle_id)
-        self.staged_journal = StagedRestoreJournal(self.durable_journal)
-        self.policy = FusionPolicy(self.staged_journal, vehicle_id,
+        self.journal = MemoryRestoreJournal()
+        self.policy = FusionPolicy(self.journal, vehicle_id,
                                   enabled=bool(rospy.get_param("~enabled", False)), **settings)
         self.publisher = rospy.Publisher(
             rospy.get_param("~status_topic", "/wall_perch/sensor_fusion_status"),
@@ -62,7 +52,7 @@ class WallSensorFusionManagerNode:
         self.transport = MavrosParameterTransport(namespace)
         self.worker = SerialParameterWorker(self.transport.execute,
                                             lambda: rospy.Time.now().to_sec(),
-                                            journal=self.durable_journal, authorize=self._authorize)
+                                            authorize=self._authorize)
         self.diagnostics_publisher = rospy.Publisher(
             "/wall_perch/sensor_fusion_operation", String, queue_size=10)
         self.state_names = {getattr(WallPerchStatus, "STATE_" + name): name for name in (
@@ -80,8 +70,8 @@ class WallSensorFusionManagerNode:
             State, self._on_state, queue_size=1, tcp_nodelay=True)
         self.timer = rospy.Timer(rospy.Duration(.1), self._on_timer)
         rospy.on_shutdown(self.worker.close)
-        rospy.loginfo("wall EKF parameter manager enabled=%s vehicle=%s journal=%s; status is not actual fusion evidence",
-                      self.policy.enabled, vehicle_id, journal_path)
+        rospy.loginfo("wall EKF parameter manager enabled=%s vehicle=%s recovery=memory_only; status is not actual fusion evidence",
+                      self.policy.enabled, vehicle_id)
 
     @staticmethod
     def _times(message):
@@ -126,7 +116,7 @@ class WallSensorFusionManagerNode:
             operation = self.policy.tick(now, monotonic)
             if operation is not None:
                 self.policy.mark_operation_stage(operation, 'queued', now, monotonic)
-                self.worker.submit(operation, self.staged_journal.load(), dict(self.policy.originals))
+                self.worker.submit(operation)
             data = self.policy.status(now, monotonic)
         message = WallSensorFusionStatus()
         message.header.stamp = rospy.Time.from_sec(now)

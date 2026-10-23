@@ -66,20 +66,119 @@ class DepartureDemoTests(unittest.TestCase):
         self.assertAlmostEqual(n.detach_range.started, 10.02)
         self.assertTrue(math.isnan(n.detach_vertical_controller.reference))
 
-    def test_timed_trajectory_does_not_pause_for_lag_or_replan_braking(self):
+    def test_first_stage_waits_for_measured_attitude_then_resumes_without_catchup(self):
+        from px4_wall_ceiling_control.domain.geometry import quaternion_angle
         n = self.n
         n.detach_brake_enabled = True
-        with mock.patch.object(n, '_advance_detach_braking', side_effect=AssertionError('adaptive brake')):
-            for i in range(1, 151):
-                t = 10.+i*.02
-                self.fx.seconds = t
-                self.fx.fx.feedback(n, t, tilt=90., height=math.nan, vz=math.nan)
-                self.fx.fx.output(n, t, tilt=90.)
-                n._advance_detach_progress(at(t))
-        self.assertAlmostEqual(n._detach_progress(), 1.)
-        self.assertFalse(n.detach_tracking_limited)
+        # Keep the aircraft at the wall while its reference tries to rotate.
+        for i in range(1, 151):
+            t = 10.+i*.02
+            self.brake_frame(t, 90., measured=90., rate=0.)
+        self.assertTrue(n.detach_tracking_limited)
+        self.assertFalse(n.detach_brake_triggered)
         self.assertIsNone(n.detach_brake_planner)
-        self.assertAlmostEqual(n._detach_target_quaternion()[3], 1.)
+        self.assertLessEqual(quaternion_angle(n._detach_target_quaternion(), quaternion(90.)),
+                             n.detach_max_tracking_error_rad+1.e-8)
+        before = n.detach_elapsed_s
+        self.brake_frame(13.02, 90., measured=90., rate=0.)
+        self.assertAlmostEqual(n.detach_elapsed_s, before)
+        # A new measured pose closes the error. Resume only one bounded tick.
+        self.brake_frame(13.50, 60., measured=65., rate=-10.)
+        self.assertGreater(n.detach_elapsed_s, before)
+        self.assertLessEqual(n.detach_elapsed_s-before, .05+1.e-9)
+        self.assertFalse(n.detach_brake_triggered)
+
+    def brake_frame(self, t, sent, measured=54., rate=-54.):
+        n = self.n
+        self.fx.seconds = t
+        self.fx.fx.feedback(n, t, tilt=measured, rate=rate,
+                            height=math.nan, vz=math.nan)
+        self.fx.fx.output(n, t, tilt=sent)
+        with mock.patch.object(n, '_height_feedback', side_effect=AssertionError('local height used')):
+            n._advance_detach_progress(at(t))
+
+    def engage_brake(self):
+        n = self.n
+        n.detach_brake_enabled = True
+        for t, sent in ((10.02, 31.8), (10.04, 30.9), (10.06, 30.)):
+            self.brake_frame(t, sent, measured=30. if t == 10.06 else 54.)
+        self.assertIsNotNone(n.detach_brake_planner)
+        return n.detach_brake_planner
+
+    def test_range_path_engages_brake_with_exact_published_reference(self):
+        from px4_wall_ceiling_control.domain.geometry import quaternion_angle
+        planner = self.engage_brake()
+        self.assertAlmostEqual(math.degrees(planner.angle), 30.)
+        self.assertAlmostEqual(math.degrees(planner.rate), -45., delta=1.e-4)
+        self.assertLess(quaternion_angle(self.n._detach_target_quaternion(), quaternion(30.)), 1.e-7)
+        self.assertTrue(self.n._simple_departure())
+        self.assertFalse(self.n._range_locked())
+        before = (planner.angle, planner.rate, planner.accel)
+        self.n._candidate(at(10.06))
+        self.assertEqual((planner.angle, planner.rate, planner.accel), before)
+
+    def test_range_braking_reacts_to_measured_speed_and_does_not_finish_at_three_seconds(self):
+        from px4_wall_ceiling_control.domain.geometry import quaternion_angle
+        planner = self.engage_brake()
+        # Replay real-like fast closing near level. The nominal clock already
+        # reached three seconds, but adaptive planning must own completion.
+        self.n.detach_elapsed_s = 3.
+        self.brake_frame(10.08, 30., measured=3., rate=-54.)
+        self.assertGreater(planner.goal, 0.)
+        self.assertLess(self.n._detach_progress(), 1.)
+        self.n._update_state_machine(at(10.08))
+        self.assertEqual(self.n.state, W.STATE_DETACH_ROTATE)
+        # The actual range candidate carries the planner reference to mux;
+        # horizontal recovery must not replace it with a level attitude.
+        status = self.n._build_status(at(10.08))
+        candidate = self.n._build_control_candidate(status, self.n.maneuver_id, 2)
+        self.assertTrue(candidate.departure_support_only)
+        fx = fixtures.mux_fixtures.CandidateLatencyTest()
+        fx.setUp(); self.addCleanup(fx.doCleanups)
+        fx.now = at(10.06)
+        fx.accept(fx.candidate(phase=W.STATE_SLOW_APPROACH, maneuver=self.n.maneuver_id))
+        fx.now = at(10.08)
+        fx.node.flight_state_at = fx.node.odom_at = fx.now
+        fx.node.odom.header.stamp = fx.now
+        fx.accept(candidate)
+        fx.seed_publication(angle=30., thrust=candidate.thrust_normalized, age=.02)
+        self.assertEqual(fx.node._publish_candidate(fx.now, candidate), fx.node.OUTPUT_ATTITUDE_THRUST)
+        target = fx.node.attitude_publisher.publish.call_args.args[0]
+        self.assertLess(quaternion_angle(tuple(getattr(target.orientation, k) for k in 'xyzw'),
+                                        self.n._detach_target_quaternion()), 1.e-7)
+
+    def test_range_brake_freezes_on_stale_output_and_reports_actual_activation(self):
+        planner = self.engage_brake()
+        self.brake_frame(10.08, 30.)
+        before = (planner.angle, planner.rate, planner.accel, planner.elapsed)
+        self.fx.seconds = 10.4
+        self.fx.fx.feedback(self.n, 10.4, tilt=54., rate=-54., height=math.nan, vz=math.nan)
+        self.n._advance_detach_progress(at(10.4))
+        self.assertTrue(self.n.detach_brake_paused)
+        self.assertEqual((planner.angle, planner.rate, planner.accel, planner.elapsed), before)
+        self.assertLess(self.n._detach_progress(), 1.)
+        status = self.n._build_status(at(10.4))
+        self.n._publish_departure_trace(at(10.4), status)
+        trace = json.loads(self.n.departure_trace_publisher.publish.call_args.args[0].data)
+        self.assertTrue(trace['brake_enabled'])
+        self.assertTrue(trace['brake_active'])
+        self.assertTrue(trace['brake_paused'])
+        self.assertIn('等待', trace['brake_reason'])
+
+    def test_range_brake_finishes_and_enters_captured_recovery_without_range(self):
+        planner = self.engage_brake()
+        for i in range(1, 251):
+            t = 10.06+i*.02
+            self.brake_frame(t, math.degrees(planner.angle), measured=0., rate=0.)
+            self.n._update_state_machine(at(t))
+            self.assertFalse(self.n.detach_brake_fault)
+            if self.n.state == W.STATE_RECOVER:
+                break
+        self.assertTrue(planner.done)
+        self.assertEqual(self.n.state, W.STATE_RECOVER)
+        self.assertTrue(self.n.recover_attitude_locked)
+        self.assertFalse(self.n.abort_land_requested)
+        self.assertFalse(self.n._range_locked())
 
     def test_horizontal_correction_cannot_modify_rotation_even_near_level(self):
         n = self.n

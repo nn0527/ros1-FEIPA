@@ -547,6 +547,9 @@ class WallDetachVerticalMixin:
                 self.detach_fast_invalid_since = now.to_sec()
 
     def _reset_range_task(self):
+        self.recover_attitude_locked = self.recover_stable = self.abort_land_requested = False
+        self.recover_entry_attitude = (0., 0., 0., 1.)
+        self.detach_final_pitch_deg = math.nan
         self._reset_range_control_velocity()
         if hasattr(self, 'detach_range'):
             self.detach_range.reset()
@@ -601,7 +604,23 @@ class WallDetachVerticalMixin:
             mode=mode, episode=r.episode, maneuver_id=self.maneuver_id,
             request_time_s=requested_at.to_sec() if requested_at else None,
             rotation_time_s=r.started, level_stable_time_s=self.detach_level_stable_at,
+            detach_final_pitch_deg=getattr(self, 'detach_final_pitch_deg', math.nan),
+            recover_attitude_locked=getattr(self, 'recover_attitude_locked', False),
+            recover_entry_attitude=getattr(self, 'recover_entry_attitude', None),
+            recover_stable=getattr(self, 'recover_stable', False),
+            abort_land_requested=getattr(self, 'abort_land_requested', False),
             progress=self._detach_progress(), trajectory_duration_s=self.detach_time_s,
+            rotation_control_stage=('BRAKE' if getattr(self, 'detach_brake_triggered', False)
+                                    else 'TRACKING_WAIT' if getattr(self, 'detach_tracking_limited', False)
+                                    else 'TRACKING'),
+            tracking_limited=getattr(self, 'detach_tracking_limited', False),
+            nominal_elapsed_s=getattr(self, 'detach_elapsed_s', 0.),
+            brake_triggered=getattr(self, 'detach_brake_triggered', False),
+            brake_enabled=getattr(self, 'detach_brake_enabled', False),
+            brake_active=getattr(self, 'detach_brake_planner', None) is not None,
+            brake_paused=getattr(self, 'detach_brake_paused', False),
+            brake_reason=getattr(self, 'detach_brake_reason', ''),
+            brake_fault=getattr(self, 'detach_brake_fault', ''),
             measured_tilt_deg=tilt(measured) if measured else None,
             measured_rate_deg_s=math.degrees(math.sqrt(sum(getattr(omega, k)**2 for k in 'xyz'))) if omega else None,
             measured_body_rate_rad_s=tuple(getattr(omega, k) for k in 'xyz') if omega else None,
@@ -646,7 +665,7 @@ class WallDetachVerticalMixin:
         if not self._range_locked() or self.state not in (W.STATE_DETACH_ROTATE, W.STATE_RECOVER, W.STATE_EXIT, W.STATE_ABORT):
             return '仅本轮离墙测距接管后允许一键定高'
         r = self.detach_range
-        if r.target_revision:
+        if r.target_source == 'manual_fixed_range_height':
             return '本轮已提交一键定高，重复点击不会重置预算'
         if self.detach_range_posctl_request_at is not None:
             return 'POSCTL交回请求已发出，不能再改变高度目标'
@@ -829,7 +848,7 @@ class WallDetachVerticalMixin:
         failure = ''
         if clock_reversed or seconds < r.action_started:
             failure = '测距控制时钟倒退'
-        elif r.target_revision and seconds-r.action_started >= r.config.control_timeout_s:
+        elif r.target_source == 'manual_fixed_range_height' and seconds-r.action_started >= r.config.control_timeout_s:
             failure = '手动测距闭环总时间预算超时'
         elif r.invalid_since is not None and seconds-r.invalid_since >= r.config.loss_support_s:
             failure = '测距失效超过短时支撑上限'
@@ -898,6 +917,10 @@ class WallDetachVerticalMixin:
             if r.invalid_since is None or now.to_sec()-r.invalid_since >= r.config.loss_support_s:
                 return math.nan
             return self._range_hold_thrust(now, float(output.thrust))
+        # Capture a previously unavailable RECOVER-entry height BEFORE the
+        # first valid range thrust calculation, not after sending an old target.
+        if getattr(self, '_locked_recovery', lambda: False)():
+            self._capture_simple_recovery_height(now)
         velocity, velocity_valid = self._range_control_velocity(s, now.to_sec())
         try:
             thrust = c.update_range(s.height, velocity if velocity_valid else None,
@@ -920,6 +943,8 @@ class WallDetachVerticalMixin:
 
     def _range_stability_ready(self, now):
         """All gates run continuously; duplicate timer ticks add no samples."""
+        if getattr(self, '_locked_recovery', lambda: False)():
+            return self._simple_recovery_stability(now)
         s, c = self.detach_range.read_snapshot(now.to_sec()), self.detach_range.config
         reason = ''
         if self.detach_range_faulted or self.state == W.STATE_ABORT:
@@ -1031,7 +1056,15 @@ class WallDetachVerticalMixin:
         status.detach_range_stable_samples = getattr(self, 'detach_range_stable_samples', 0)
         status.detach_range_handover_ready = phase == 'HANDOVER_READY'
         status.detach_range_block_reason = getattr(self, 'detach_range_block_reason', s.reason)
-        status.detach_range_config_json = json.dumps(asdict(r.config), sort_keys=True)
+        config = asdict(r.config)
+        if getattr(self, 'recover_attitude_locked', False):
+            from px4_wall_ceiling_control.domain.simple_recovery import (
+                HEIGHT_MARGIN_M, SPEED_MARGIN_MPS, STABLE_TIME_S, MAX_TILT_DEG, MAX_RATE_RAD_S)
+            config.update(height_tolerance_m=HEIGHT_MARGIN_M, speed_tolerance_mps=SPEED_MARGIN_MPS,
+                          stable_time_s=STABLE_TIME_S, stable_min_samples=2,
+                          recovery_max_tilt_deg=MAX_TILT_DEG,
+                          recovery_max_rate_deg_s=math.degrees(MAX_RATE_RAD_S))
+        status.detach_range_config_json = json.dumps(config, sort_keys=True)
         status.detach_range_rejections_json = json.dumps(r.rejected, sort_keys=True, ensure_ascii=False)
         status.detach_posctl_request_time = rospy.Time.from_sec(getattr(self, 'detach_range_posctl_request_at', None) or 0.)
         status.detach_posctl_confirmed_time = rospy.Time.from_sec(getattr(self, 'detach_range_posctl_confirmed_at', None) or 0.)

@@ -98,6 +98,7 @@ class AutoDecisionTests(unittest.TestCase):
         n.auto_approach=True;n.manual_approach=False;n.state=S.STATE_SLOW_APPROACH
         n.cancel_requested=n.rearm_required=False;n.fault_count=0
         n.state_entered_at=rospy.Time.from_sec(10);n.approach_timeout_s=20
+        n.flip_trigger_distance_m=.2;n.flip_trigger_hold_s=.3
         n._mode_requested=n._entry_height_ready=n._safety_ok=n._auto_takeover_confirmed=lambda *a:True
         n._approach_far_distance=lambda *a:None
         n._odom_fresh=lambda *a:False;n.recover_time_s=1
@@ -177,7 +178,7 @@ class AutoDecisionTests(unittest.TestCase):
     def test_far_distance_and_flight_failure_still_abort(self):
         for cause in ('far','flight','cancel'):
             n=self.node()
-            if cause=='far':n._approach_far_distance=lambda *a:1.31
+            if cause=='far':n._approach_far_distance=lambda *a:1.81
             if cause=='flight':n._safety_ok=lambda *a:False
             if cause=='cancel':n.cancel_requested=True
             n._update_state_machine(rospy.Time.from_sec(15));self.assertEqual(n.state,S.STATE_ABORT,cause)

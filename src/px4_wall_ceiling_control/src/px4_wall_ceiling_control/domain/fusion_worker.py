@@ -1,4 +1,4 @@
-"""Durable serial parameter work, deliberately outside the policy/callback lock."""
+"""Serial parameter work, deliberately outside the policy/callback lock."""
 import copy
 import queue
 import threading
@@ -7,6 +7,24 @@ import time
 
 class OperationCancelled(RuntimeError):
     """The live policy revoked a queued operation before any FCU write."""
+
+
+class MemoryRestoreJournal:
+    """Keep the current cycle's originals and intent in memory only.
+
+    A new node starts empty: no filesystem reads, writes or crash recovery.
+    """
+    def __init__(self):
+        self.data = None
+
+    def load(self):
+        return copy.deepcopy(self.data)
+
+    def save(self, data):
+        self.data = copy.deepcopy(data)
+
+    def clear(self):
+        self.data = None
 
 
 class StagedRestoreJournal:

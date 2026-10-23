@@ -181,6 +181,17 @@ class RangeHeightFeedback:
         self.target_source = 'manual_fixed_range_height'
         self.action_started = now
 
+    def capture_recovery_target(self, now):
+        """One explicit phase-boundary reanchor; never refresh while retreating."""
+        s = self.read_snapshot(now)
+        if not s.valid or not math.isfinite(s.projected_height) or s.projected_height <= 0:
+            raise ValueError('恢复退墙等待新鲜有效的实际测距高度')
+        self.target = s.projected_height
+        self.target_revision += 1
+        self.target_source = 'recover_entry_range_height'
+        self.action_started = now
+        return self.target
+
     @property
     def locked(self):
         return self.lock_source is not None

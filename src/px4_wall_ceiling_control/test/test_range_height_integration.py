@@ -59,8 +59,17 @@ class RangeDetachNodeTests(unittest.TestCase):
         return m
 
     def prepare_stability(self, node=None):
+        """Exercise legacy gates with stubbed horizontal/clearance readiness.
+
+        The captured-attitude demo uses actual recovery adapters in
+        test_positive_recovery, including its distinct EXIT latch behavior.
+        """
         n = node or self.n
-        self.fx.enter(n, W.STATE_RECOVER, self.seconds)
+        # These cases explicitly exercise the legacy path. Do not run the
+        # demo's new RECOVER-entry height reanchor before disabling that path.
+        with mock.patch.object(n, '_simple_departure', return_value=False):
+            self.fx.enter(n, W.STATE_RECOVER, self.seconds)
+        n.recover_attitude_locked = False
         n._detach_progress = lambda: 1.
         n._wall_fusion_samples_ready = lambda now: True
         n._range_px4_ready = lambda now: True

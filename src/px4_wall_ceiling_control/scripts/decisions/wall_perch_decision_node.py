@@ -45,7 +45,11 @@ from px4_wall_ceiling_control.adapters.wall_detach_vertical import WallDetachVer
 from px4_wall_ceiling_control.adapters.wall_detach_braking import WallDetachBrakingMixin
 
 
-class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, WallHorizontalVelocityMixin):
+from px4_wall_ceiling_control.adapters.wall_simple_recovery import WallSimpleRecoveryMixin
+from px4_wall_ceiling_control.domain.simple_recovery import ENTRY_TILT_DEG
+
+
+class WallPerchDecisionNode(WallSimpleRecoveryMixin, WallDetachBrakingMixin, WallDetachVerticalMixin, WallHorizontalVelocityMixin):
     STATE_NAMES = {
         WallPerchStatus.STATE_IDLE: "IDLE",
         WallPerchStatus.STATE_FRONT_WALL_DETECT: "FRONT_WALL_DETECT",
@@ -94,7 +98,7 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
             rospy.get_param("~flip_trigger_distance_m", 0.20)
         )
         self.flip_trigger_hold_s = float(
-            rospy.get_param("~flip_trigger_hold_s", 0.10)
+            rospy.get_param("~flip_trigger_hold_s", 0.0)
         )
         self.top_contact_distance_m = float(
             rospy.get_param("~top_contact_distance_m", 0.05)
@@ -392,7 +396,7 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
         self.front_range = None
         self.front_received_at = None
         self.front_source_stamp = None
-        self.approach_abort_front_distance_m = float(rospy.get_param("~approach_abort_front_distance_m", 1.3))
+        self.approach_abort_front_distance_m = float(rospy.get_param("~approach_abort_front_distance_m", 1.8))
         self.approach_far_sample = None
         self.front_filtered_m = None
         self.top_range = None
@@ -628,10 +632,12 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
         if previous is None:
             self.front_ready_since = self.front_ready_last_sample_at = None
             self.flip_ready_since = self.flip_ready_last_sample_at = None
-        if self._approach_stage() and self._mode_requested(now) and message.range > getattr(self, "approach_abort_front_distance_m", 1.3):
+        if self._approach_stage() and self._mode_requested(now) and message.range > getattr(self, "approach_abort_front_distance_m", 1.8):
             self.approach_far_sample = (now, float(message.range))
         self.front_range = message
         self.front_received_at = now
+        with getattr(self, 'feedback_lock', nullcontext()):
+            self._observe_recovery_clearance(message, now)
         self.front_filtered_m = self._filter_range(message, previous)
         (
             self.front_ready_since,
@@ -646,7 +652,9 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
             self.flip_ready_since,
             self.flip_ready_last_sample_at,
         ) = self._record_hold_sample(
-            self.front_filtered_m <= self.flip_trigger_distance_m
+            (message.range <= self.flip_trigger_distance_m + 1.e-8
+             if self.flip_trigger_hold_s <= 0.0 else
+             self.front_filtered_m <= self.flip_trigger_distance_m)
             and (not getattr(self, "auto_approach", False) or not self._approach_stage() or self._auto_approach_ranges_ready(now)),
             message.header.stamp,
             self.flip_ready_since,
@@ -1137,6 +1145,9 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
         return True
 
     def _top_required(self):
+        if self._simple_departure() and (self.state == WallPerchStatus.STATE_DETACH_ROTATE
+                                         or self._locked_recovery()):
+            return False
         if self._approach_stage() or self.state in (
             WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE,
         ):
@@ -1202,7 +1213,7 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
         message = getattr(self, "front_range", None)
         if (message is not None and self._front_fresh(now) and is_valid_range(message)
                 and self._sensor_health_fresh(now) and self.sensor_health.front_valid
-                and message.range > getattr(self, "approach_abort_front_distance_m", 1.3)):
+                and message.range > getattr(self, "approach_abort_front_distance_m", 1.8)):
             return float(message.range)
         return None
 
@@ -1412,6 +1423,7 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
             return False
         if self._simple_departure() and (
                 self.state == WallPerchStatus.STATE_DETACH_ROTATE
+                or self._locked_recovery()
                 or (self.state == WallPerchStatus.STATE_WALL_HOLD and self.detach_requested)):
             # The demo's command-to-level segment needs attitude/authority only.
             # Range velocity damps thrust; a single descent estimate must not
@@ -1476,6 +1488,16 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
         if not fresh:
             self.flip_ready_since = None
             self.flip_ready_last_sample_at = None
+        if self.flip_trigger_hold_s <= 0.0:
+            # A single accepted raw sample is sufficient; filtering and the
+            # shared two-sample hold helper must not delay this gate.
+            sample = getattr(self, "front_range", None)
+            return bool(fresh and self._front_flip_input_ready(now)
+                        and self.flip_ready_since is not None
+                        and self.flip_ready_last_sample_at is not None
+                        and sample is not None and is_valid_range(sample)
+                        # Range.range is float32: admit 0.20 m after wire rounding.
+                        and sample.range <= self.flip_trigger_distance_m + 1.e-8)
         return self._held_samples(
             fresh,
             self.flip_ready_since,
@@ -1767,6 +1789,12 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
             self.detach_stable_samples = 0
         elif new_state == WallPerchStatus.STATE_RECOVER:
             if self._simple_departure() and old_state == WallPerchStatus.STATE_DETACH_ROTATE:
+                self.recover_entry_attitude = self._current_quaternion()
+                self.recover_attitude_locked = True
+                self.recover_stable = False
+                self._begin_departure_clearance(now)
+                self.departure_yaw = euler_from_quaternion(self.recover_entry_attitude)[2]
+                self._begin_simple_recovery(now)
                 self.detach_level_stable_at = now.to_sec()
                 rospy.loginfo('wall departure demo: LEVEL_STABLE request=%.9f rotation=%.9f stable=%.9f',
                               getattr(self, 'detach_requested_at', now).to_sec(), self.detach_range.started,
@@ -1798,7 +1826,8 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
                 self.detach_recovered_since = self.detach_recovered_last_stamp = None
                 self.detach_recovered_samples = 0
                 self.detach_level_stable_at = None
-                self._begin_departure_clearance(now)
+                if not self._simple_departure():
+                    self._begin_departure_clearance(now)
         elif new_state == WallPerchStatus.STATE_ABORT:
             if self._range_task_active():
                 self.detach_range_failure_cause = self.detach_range_failure_cause or reason
@@ -1855,6 +1884,21 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
         return abs(self._euler_from_quaternion(quaternion)[1]) >= self.pin_pitch_rad
 
     def _update_state_machine(self, now):
+        # Landing is a terminal branch. Never wait for range/flow/settling and
+        # never run the normal ABORT -> EXIT -> POSCTL path for this request.
+        if getattr(self, 'abort_land_requested', False):
+            flight = self.flight_state
+            if (flight is not None and is_fresh(self.flight_state_received_at, self.state_timeout_s, now)
+                    and is_fresh_source(flight.header.stamp, self.state_timeout_s, now)):
+                if not flight.armed:
+                    self.abort_land_requested = False
+                    self.rearm_required = True
+                    self._enter_state(WallPerchStatus.STATE_IDLE, now, '降落分支解除武装，释放ROS控制')
+                elif flight.mode.upper() == 'AUTO.LAND':
+                    self.last_reason = 'PX4 AUTO.LAND反馈已确认，停止ROS姿态推力输出'
+                elif flight.mode.upper() != 'OFFBOARD':
+                    self.last_reason = '人工/外部模式接管，停止ROS姿态推力输出'
+            return
         if self._range_task_active() and self.state != WallPerchStatus.STATE_EXIT:
             flight = self.flight_state
             if (flight is not None and flight.connected and flight.mode.upper() != 'OFFBOARD'
@@ -1891,7 +1935,7 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
                 self.approach_far_sample = None
                 self._enter_state(WallPerchStatus.STATE_ABORT, now,
                     "approach front distance {:.3f} m exceeds {:.3f} m".format(
-                        far_distance, getattr(self, "approach_abort_front_distance_m", 1.3)))
+                        far_distance, getattr(self, "approach_abort_front_distance_m", 1.8)))
                 return
 
         if self.state == WallPerchStatus.STATE_IDLE:
@@ -1979,8 +2023,11 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
                 elif self._flip_ready(now):
                     self._enter_state(WallPerchStatus.STATE_FLIP_TO_WALL, now, "flip distance reached")
                 else:
-                    self.last_reason = ("自动接近：目标前向%.2f m/s、横向0；等待前距≤0.20 m连续0.30 s" % self.horizontal_approach_speed
-                        if getattr(self,"horizontal_velocity_enabled",False) else "自动接近：前倾3°；等待前距≤0.20 m连续0.30 s")
+                    flip_gate = ("前距≤%.2f m单帧原始有效数据" % self.flip_trigger_distance_m
+                                 if self.flip_trigger_hold_s <= 0.0 else
+                                 "前距≤%.2f m连续%.2f s" % (self.flip_trigger_distance_m, self.flip_trigger_hold_s))
+                    self.last_reason = (("自动接近：目标前向%.2f m/s、横向0；等待" % self.horizontal_approach_speed
+                        if getattr(self,"horizontal_velocity_enabled",False) else "自动接近：前倾3°；等待") + flip_gate)
             elif not self._safety_ok(now):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "approach safety failure")
@@ -2061,6 +2108,15 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
             bench = getattr(self, "bench_wait_for_ranges", False)
             if not bench:
                 self._advance_detach_progress(now)
+            if (self._simple_departure() and self._detach_progress() >= 1.
+                    and self._odom_fresh(now)):
+                pitch = math.degrees(euler_from_quaternion(self._current_quaternion())[1])
+                self.detach_final_pitch_deg = pitch
+                if pitch < 0.:
+                    self.abort_land_requested = True
+                    self._enter_state(WallPerchStatus.STATE_ABORT, now,
+                                      'detach最终俯仰角%.3f°为负，请求PX4 AUTO.LAND' % pitch)
+                    return
             if not bench and getattr(self, "detach_brake_fault", ""):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, self.detach_brake_fault)
@@ -2073,8 +2129,21 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
             elif not bench and (self.detach_clock_reversed or self._state_age(now) >= self.detach_duration_timeout_s):
                 self.fault_count += 1
                 self._enter_state(WallPerchStatus.STATE_ABORT, now, "detach clock reversed" if self.detach_clock_reversed else "detach rotation timeout")
+            elif self._simple_departure() and self._detach_progress() >= 1.:
+                pitch = math.degrees(euler_from_quaternion(self._current_quaternion())[1])
+                self.detach_final_pitch_deg = pitch
+                tilt = math.acos(clamp(rotate_vector(self._current_quaternion(), (0., 0., 1.))[2], -1., 1.))
+                # The 0..5 degree braking objective and the strict <10 degree
+                # RECOVER entry cone are separate contracts. Exclude equality
+                # despite quaternion roundoff; negative pitch keeps the land branch.
+                if 0. <= pitch and tilt < math.radians(ENTRY_TILT_DEG) - 1.e-12:
+                    self._enter_state(WallPerchStatus.STATE_RECOVER, now,
+                                      'detach最终俯仰角%.3f°，实测倾角%.3f°，平滑恢复悬停基准并准备退墙' %
+                                      (pitch, math.degrees(tilt)))
+                else:
+                    self.last_reason = 'detach轨迹结束，等待实测倾角<%.0f°；当前%.3f°' % (ENTRY_TILT_DEG, math.degrees(tilt))
             elif ((self._attitude_recovered() and self._rates_safe(self.recover_max_rate_rps))
-                  if bench else self._detach_rotation_ready(now)):
+                  if bench else (not self._simple_departure() and self._detach_rotation_ready(now))):
                 self._enter_state(WallPerchStatus.STATE_RECOVER, now, "detach measured and published attitude recovered")
 
         elif self.state == WallPerchStatus.STATE_RECOVER:
@@ -2101,6 +2170,10 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
                 and self._vertical_speed_safe()
             )
             if self._range_locked():
+                if self._locked_recovery() and self.departure_clear_confirmed:
+                    self._enter_state(WallPerchStatus.STATE_EXIT, now,
+                        '单帧墙距>%.2fm：停止退墙，申请POSCTL交接；等待安全交接条件' % self.departure_clearance_distance)
+                    return
                 if self._range_stability_ready(now):
                     self._enter_state(WallPerchStatus.STATE_EXIT, now, '测距闭环稳定，准备交回POSCTL')
                 return
@@ -2136,7 +2209,9 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
                         self._enter_state(WallPerchStatus.STATE_ABORT, now, self.detach_vertical_fault or '本轮测距控制异常')
                     return
                 if flight is not None and flight.mode.upper() == 'OFFBOARD':
-                    if not self._range_stability_ready(now):
+                    if self._locked_recovery():
+                        self._range_stability_ready(now)
+                    elif not self._range_stability_ready(now):
                         self._enter_state(WallPerchStatus.STATE_RECOVER, now, self.detach_range_block_reason)
                 elif is_fresh(self.flight_state_received_at, self.state_timeout_s, now):
                     self.detach_range_faulted = True
@@ -2230,10 +2305,9 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
             return
         self.detach_step_at = now
         self.detach_step_dt = min(delta, .05)
-        if self._simple_departure():
-            self.detach_elapsed_s = min(self.detach_time_s, self.detach_elapsed_s+self.detach_step_dt)
-            self.detach_tracking_limited = False
-            return
+        # Both normal departure paths must use measured-rate braking before
+        # advancing the nominal timed reference. Range-height control changes
+        # thrust feedback, not whether attitude braking is executed.
         if self._advance_detach_braking(now, self.detach_step_dt):
             return
         elapsed = self.detach_elapsed_s
@@ -2399,6 +2473,8 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
         return self.flip_thrust_value
 
     def _candidate(self, now):
+        if getattr(self, 'abort_land_requested', False) and not self._flight_ready(now):
+            return False, None, math.nan, 0.
         if (self.state == WallPerchStatus.STATE_SLOW_APPROACH
                 and not getattr(self, "auto_approach", False)
                 and not getattr(self, "ignore_range_loss_during_attachment", False)
@@ -2459,7 +2535,7 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
             quaternion = self._detach_target_quaternion()
             thrust = self._detach_vertical_thrust(now, self.detach_step_dt)
         elif self.state in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT, WallPerchStatus.STATE_ABORT):
-            quaternion = self.q_hover
+            quaternion = self.recover_entry_attitude if self._locked_recovery() else self.q_hover
             thrust = (self._detach_vertical_thrust(now, min(.05, max(0., self.control_dt)))
                       if getattr(self, "detach_vertical_active", False) else self._recovery_height_thrust())
 
@@ -2485,6 +2561,12 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
 
     def _build_status(self, now):
         status = WallPerchStatus()
+        status.recover_attitude_locked = getattr(self, 'recover_attitude_locked', False)
+        status.recover_stable = getattr(self, 'recover_stable', False)
+        status.abort_land_requested = getattr(self, 'abort_land_requested', False)
+        status.detach_final_pitch_deg = getattr(self, 'detach_final_pitch_deg', math.nan)
+        for key, value in zip('xyzw', getattr(self, 'recover_entry_attitude', (0., 0., 0., 1.))):
+            setattr(status.recover_entry_attitude, key, value)
         status.header.stamp = now
         status.state = self.state
         status.state_name = self.STATE_NAMES[self.state]
@@ -2524,13 +2606,7 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
             self.front_ready_last_sample_at,
             self.front_ready_hold_s,
         )
-        status.flip_ready = self._held_status(
-            status.front_range_fresh
-            and self.front_filtered_m <= self.flip_trigger_distance_m,
-            self.flip_ready_since,
-            self.flip_ready_last_sample_at,
-            self.flip_trigger_hold_s,
-        )
+        status.flip_ready = self._flip_ready(now)
         status.top_contact_ready = (self._late_top_frame_ready(now)
             if self.state in (WallPerchStatus.STATE_FLIP_TO_WALL, WallPerchStatus.STATE_WALL_CAPTURE)
             else self._held_status(
@@ -2637,6 +2713,7 @@ class WallPerchDecisionNode(WallDetachBrakingMixin, WallDetachVerticalMixin, Wal
         candidate.control_phase = status.state
         candidate.maneuver_id = maneuver_id
         candidate.control_sequence = control_sequence
+        candidate.recover_attitude_locked = getattr(status, "recover_attitude_locked", False)
         candidate.horizontal_velocity_enabled = status.horizontal_velocity_enabled
         candidate.horizontal_velocity_active = status.horizontal_velocity_active
         candidate.approach_paused = status.approach_paused

@@ -60,7 +60,10 @@ def replay():
 class DetachBrakingReplayTests(unittest.TestCase):
     def test_log64_engages_and_retracts_acceleration_demand_with_bounded_commands(self):
         trigger, rows, node = replay()
-        self.assertAlmostEqual(trigger, 2.550527, delta=.02)
+        samples = json.loads((Path(__file__).parent/'fixtures'/'detach_brake_log64.json').read_text())['samples']
+        expected = next(s['t'] for s in samples if math.acos(max(-1., min(1.,
+            rotate_vector(s['q'], (0., 0., 1.))[2]))) <= math.radians(30.)+1.e-12)
+        self.assertAlmostEqual(trigger, expected, places=6)
         self.assertGreater(len(rows), 30)
         self.assertTrue(all(0. <= r['new_target_deg'] <= 90.1 for r in rows))
         self.assertLessEqual(max(abs(r['new_target_rate_deg_s']) for r in rows), 56.25001)

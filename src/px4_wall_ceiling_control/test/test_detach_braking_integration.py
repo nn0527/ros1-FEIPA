@@ -39,7 +39,7 @@ class DetachBrakingIntegrationTests(unittest.TestCase):
         node = self.node()
         # Three final publications establish a constant -45 deg/s reference.
         for seconds, sent in ((10.02, 31.8), (10.04, 30.9), (10.06, 30.)):
-            self.frame(node, seconds, sent)
+            self.frame(node, seconds, sent, measured=30. if seconds == 10.06 else 54.)
         self.assertIsNotNone(node.detach_brake_planner)
         return node
 
@@ -48,15 +48,32 @@ class DetachBrakingIntegrationTests(unittest.TestCase):
         return (planner.angle, planner.rate, planner.accel, planner.elapsed,
                 planner.replan_count)
 
-    def test_trigger_uses_final_published_target_instead_of_candidate(self):
+    def test_target_below_thirty_does_not_trigger_before_measured_crossing(self):
         node = self.node()
-        node.detach_elapsed_s = 2.2
-        # Nominal candidate has crossed 30 deg, but final output has not.
-        self.frame(node, 10.02, sent=40., measured=45.)
-        candidate = node._detach_target_quaternion()
-        self.assertLess(quaternion_angle(candidate, node.q_hover), math.radians(30.))
+        for t, sent in ((10.02, 25.), (10.04, 24.), (10.06, 23.)):
+            self.frame(node, t, sent=sent, measured=30.01)
+        self.assertFalse(node.detach_brake_triggered)
         self.assertIsNone(node.detach_brake_planner)
         self.assertIsNone(node.detach_brake_target)
+
+    def test_measured_thirty_triggers_even_when_published_target_is_above_thirty(self):
+        node = self.node()
+        self.frame(node, 10.02, sent=41., measured=31.)
+        self.frame(node, 10.04, sent=40., measured=30.)
+        self.assertTrue(node.detach_brake_triggered)
+        self.assertIsNotNone(node.detach_brake_planner)
+        self.assertAlmostEqual(math.degrees(node.detach_brake_planner.angle), 40.)
+        self.assertLess(quaternion_angle(node._detach_target_quaternion(), quaternion(40.)), 1.e-7)
+
+    def test_measured_crossing_latches_until_fresh_publication_history_and_resets(self):
+        node = self.node()
+        self.frame(node, 10.02, sent=40., measured=30.)
+        self.assertTrue(node.detach_brake_triggered)
+        self.assertIsNone(node.detach_brake_planner)
+        self.frame(node, 10.04, sent=39., measured=32.)
+        self.assertIsNotNone(node.detach_brake_planner)
+        node._reset_detach_braking()
+        self.assertFalse(node.detach_brake_triggered)
 
     def test_engagement_inherits_exact_published_angle_and_reference_velocity(self):
         node = self.engage()
@@ -73,7 +90,7 @@ class DetachBrakingIntegrationTests(unittest.TestCase):
 
     def test_missing_publication_history_holds_target_without_inventing_velocity(self):
         node = self.node()
-        self.frame(node, 10.02, sent=30.)
+        self.frame(node, 10.02, sent=30., measured=30.)
         self.assertIsNone(node.detach_brake_planner)
         self.assertLess(quaternion_angle(node.detach_brake_target, quaternion(30.)), 1.e-7)
         self.frame(node, 10.04, sent=30., source=10.02)
@@ -86,7 +103,7 @@ class DetachBrakingIntegrationTests(unittest.TestCase):
     def test_seed_at_reference_rate_cap_discards_outward_acceleration(self):
         node = self.node()
         for seconds, sent in ((10.02, 31.8), (10.04, 30.9), (10.06, 29.7)):
-            self.frame(node, seconds, sent)
+            self.frame(node, seconds, sent, measured=30. if seconds == 10.06 else 54.)
         planner = node.detach_brake_planner
         self.assertIsNotNone(planner)
         self.assertAlmostEqual(planner.rate, -node.detach_brake_max_rate)

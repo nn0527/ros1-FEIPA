@@ -12,9 +12,6 @@ wall_sensor_fusion_manager_node:
   # Fresh named PARAM_VALUE exchanges; never force-pull the full parameter table.
   parameter_reply_timeout_s: 0.60
   parameter_reply_retries: 2
-  # MAVROS 1.20.1 waits up to 5 s for PARAM_SET ACK. On a pending-write
-  # restart, isolate the old service for 10 s before issuing any new calls.
-  restart_quarantine_s: 10.0
   retry_initial_s: 1.0
   retry_max_s: 8.0
   mavros_namespace: /mavros
@@ -22,7 +19,6 @@ wall_sensor_fusion_manager_node:
   state_topic: /mavros/state
   wall_status_topic: /wall_perch/status
   status_topic: /wall_perch/sensor_fusion_status
-  # ros1_noetic mounts this workspace from the Pi, retaining restore records
-  # across both node and container restarts. File name uses vehicle identity.
-  journal_directory: /root/ros_ws/.wall_sensor_fusion
-  # Optional vehicle_id and journal_path must identify this FCU consistently.
+  # Original values and restore intent live only in memory for the current run.
+  # No durable restore journal is read or written; no restart recovery.
+  # Optional vehicle_id identifies the FCU and its process lock.

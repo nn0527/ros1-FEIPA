@@ -1262,6 +1262,10 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
                              and control.horizontal_velocity_enabled
                              and control.horizontal_velocity_active)))
 
+    def _recovery_tilt_limit_deg(self, control):
+        from px4_wall_ceiling_control.domain.simple_recovery import MAX_TILT_DEG
+        return MAX_TILT_DEG if getattr(control, 'recover_attitude_locked', False) else self.recovery_max_tilt_deg
+
     def _limit_final_recovery_target(self, now, target, source, candidate=None):
         # Project only the desired axis here. Continuity is applied later from
         # the last actual publication, never from an unsent projected target.
@@ -1273,7 +1277,7 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
             return target
         q = tuple(getattr(target.orientation, k) for k in "xyzw")
         q, _ = limit_recovery_attitude(q, None, 0.,
-            math.radians(self.recovery_max_tilt_deg), 0., 0.)
+            math.radians(self._recovery_tilt_limit_deg(control)), 0., 0.)
         target.orientation = Quaternion(x=q[0], y=q[1], z=q[2], w=q[3])
         cap = self.recovery_final_thrust_cap
         if getattr(control, "recovery_support_valid", False):
@@ -1374,14 +1378,14 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
         abort_level_immediate = False
         if phase in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT):
             prev_axis, _ = axis_yaw(q_previous)
-            if math.acos(max(-1., min(1., prev_axis[2]))) > math.radians(self.recovery_max_tilt_deg) + 1e-6:
+            if math.acos(max(-1., min(1., prev_axis[2]))) > math.radians(self._recovery_tilt_limit_deg(candidate)) + 1e-6:
                 # Normal RECOVER is admitted only after both measured and sent
                 # axes have settled in the cone. A phase error cannot project
                 # an actually published large tilt instantaneously to 5 deg.
                 self.wall_candidate_rejection = "recovery_entry_published_axis_outside_cone"
                 return None
             q, _ = limit_recovery_attitude(q, q_previous, dt,
-                math.radians(self.recovery_max_tilt_deg), math.radians(self.recovery_tilt_slew_deg_s),
+                math.radians(self._recovery_tilt_limit_deg(candidate)), math.radians(self.recovery_tilt_slew_deg_s),
                 math.radians(self.recovery_yaw_slew_deg_s))
         elif abort:
             # ABORT is also a long-lived near-level recovery state. Ordinary

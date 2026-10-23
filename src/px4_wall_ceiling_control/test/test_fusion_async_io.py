@@ -5,11 +5,74 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 
-from px4_wall_ceiling_control.domain.fusion_worker import StagedRestoreJournal, SerialParameterWorker
+from px4_wall_ceiling_control.domain.fusion_worker import MemoryRestoreJournal, StagedRestoreJournal, SerialParameterWorker
 from px4_wall_ceiling_control.domain.wall_sensor_fusion import FLOW, RANGE, Operation
 from px4_wall_ceiling_control.adapters.fusion_mavlink import decode_integer_parameter, MavrosParameterTransport
-from test_wall_sensor_fusion import Harness, MemoryJournal
+from test_wall_sensor_fusion import Harness, MemoryJournal, load_node_without_ros
+
+
+class MemoryRecoveryTests(unittest.TestCase):
+    def test_full_parameter_cycle_never_syncs_disk_and_requires_verification(self):
+        h = Harness(journal=MemoryRestoreJournal())
+        calls = []
+        def execute(op):
+            calls.append((op.kind, op.parameter, op.value))
+            if op.kind == 'set':
+                h.values[op.parameter] = op.value
+                return {op.parameter: op.value}
+            return dict(h.values)
+        worker = SerialParameterWorker(execute, lambda: h.now,
+            monotonic_clock=lambda: h.mono,
+            authorize=lambda op: h.policy.authorize_operation(op, h.now, h.mono))
+        self.addCleanup(worker.close)
+        def dispatch():
+            op = h.tick()
+            self.assertIsNotNone(op)
+            worker.submit(op)
+            result = worker.results.get(timeout=1)
+            self.assertTrue(result[1], result[-1])
+            h.policy.complete(*result)
+            diagnostic = worker.diagnostics.get(timeout=1)
+            self.assertNotIn('persist_s', diagnostic)
+            self.assertNotIn('clear_s', diagnostic)
+        with mock.patch('os.fsync', side_effect=AssertionError('unexpected disk sync')):
+            dispatch()  # Read original values while IDLE.
+            h.feed(state='WALL_HOLD', tilt=90.)
+            dispatch(); h.feed(); dispatch()
+            self.assertEqual(h.values, {FLOW: 0, RANGE: 0})
+            h.feed(state='DETACH_ROTATE', tilt=79.)
+            dispatch(); h.feed(); dispatch()
+            self.assertFalse(h.status()['control_ready'])
+            self.assertIsNone(h.tick())  # Still waiting for application settle.
+            h.feed(dt=1.201, state='RECOVER', tilt=0.)
+            dispatch()  # Fresh readback of both original values.
+            self.assertTrue(h.status()['control_ready'])
+            self.assertTrue(h.status()['parameters_restored'])
+            self.assertFalse(h.status()['restore_required'])
+            self.assertIsNone(h.journal.load())
+        self.assertEqual([call[:2] for call in calls], [
+            ('snapshot', ''), ('set', FLOW), ('set', RANGE),
+            ('set', RANGE), ('set', FLOW), ('verify', '')])
+        self.assertIsNone(MemoryRestoreJournal().load())
+
+    def test_live_node_uses_memory_and_worker_without_durable_journal(self):
+        node_module = load_node_without_ros()
+        node_module.rospy = mock.MagicMock()
+        node_module.rospy.get_param.side_effect = lambda name, default=None: (
+            'test-fcu' if name == '~vehicle_id' else default)
+        node_module.WallPerchStatus = mock.MagicMock()
+        with mock.patch.object(node_module, 'MavrosParameterTransport'), \
+                mock.patch.object(node_module, 'SerialParameterWorker') as worker, \
+                mock.patch('builtins.open', mock.mock_open()), \
+                mock.patch.object(node_module.fcntl, 'flock'), \
+                mock.patch('os.fsync', side_effect=AssertionError('unexpected disk sync')):
+            node = node_module.WallSensorFusionManagerNode()
+        self.assertIsInstance(node.policy.journal, MemoryRestoreJournal)
+        self.assertIsNone(node.policy.journal.load())
+        self.assertNotIn('journal', worker.call_args.kwargs)
+        self.assertFalse(node.policy.startup_reconcile)
 
 
 class AsyncJournalTests(unittest.TestCase):

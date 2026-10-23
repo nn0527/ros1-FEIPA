@@ -202,3 +202,10 @@ bool detach_range_manual_recovery
 string detach_range_previous_fault
 bool detach_range_manual_available
 string detach_range_manual_block_reason
+
+# Captured-attitude demo recovery profile (10 degree output envelope).
+bool recover_attitude_locked
+geometry_msgs/Quaternion recover_entry_attitude
+float32 detach_final_pitch_deg
+bool recover_stable
+bool abort_land_requested

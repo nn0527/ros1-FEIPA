@@ -115,7 +115,7 @@ class HoldConfigLatencyTests(unittest.TestCase):
             self.n._wall_fusion_samples_ready = lambda now: True
             request = SetRangeHeightRequest(request_id='no-parameter-io',
                 maneuver_id=self.n.maneuver_id, episode=self.n.detach_range.episode,
-                expected_target_revision=0, requested_at=fixtures.at(self.seconds))
+                expected_target_revision=self.n.detach_range.target_revision, requested_at=fixtures.at(self.seconds))
             result = self.n._on_set_range_height(request)
             self.assertTrue(result.success, result.message)
             self.assertEqual(self.n.detach_range.target, config.manual_target_m)

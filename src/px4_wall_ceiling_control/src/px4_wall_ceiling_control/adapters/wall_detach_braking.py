@@ -40,6 +40,7 @@ class WallDetachBrakingMixin:
         self.detach_brake_fault = self.detach_brake_reason = ''
         self.detach_brake_paused = False
         self.detach_brake_start_progress = 0.
+        self.detach_brake_triggered = False
 
     @staticmethod
     def _brake_q(output):
@@ -65,6 +66,12 @@ class WallDetachBrakingMixin:
         planner = self.detach_brake_planner
         output = self._valid_wall_output(now)
         measured = self._current_quaternion() if self._odom_fresh(now) else None
+        if planner is None and measured is not None:
+            measured_tilt = math.acos(clamp(rotate_vector(measured, (0., 0., 1.))[2], -1., 1.))
+            # Crossing is measured, inclusive, and latched for this departure.
+            # Publication history seeds continuity; it never triggers braking.
+            if measured_tilt <= self.detach_brake_trigger + 1.e-12:
+                self.detach_brake_triggered = True
         if output is None or measured is None:
             self.detach_brake_paused = True
             self.detach_brake_reason = '回平减速等待新鲜实测与最终发布反馈'
@@ -79,9 +86,8 @@ class WallDetachBrakingMixin:
             self.detach_brake_paused = True
             self.detach_brake_reason = '回平减速拒绝倒序发布反馈'
             return True
-        tilt = math.acos(clamp(rotate_vector(sent, (0., 0., 1.))[2], -1., 1.))
         if planner is None:
-            if tilt > self.detach_brake_trigger:
+            if not self.detach_brake_triggered:
                 self.detach_brake_paused = False
                 self.detach_brake_reason = ''
                 self.detach_brake_target = None
