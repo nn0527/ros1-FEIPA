@@ -101,8 +101,12 @@ class RecoveryContinuousFeedbackTests(unittest.TestCase):
         value = self.tick(11.02,actual=q(2.))
         self.assertTrue(self.n.horizontal_velocity_ready)
         self.assertEqual(self.n.horizontal_gate_at,gate)
-        self.assertLess(angle(value,q(2.)),.1)
-        self.assertLess(self.n.recovery_horizontal_weight,.02)
+        fraction = .02/.15
+        weight = fraction*fraction*(3.-2.*fraction)
+        self.assertAlmostEqual(self.n.recovery_horizontal_weight,weight)
+        self.assertLess(angle(value,q(2.)),7.*weight+.001)
+        self.assertTrue(self.n.recovery_soft_reentry)
+        self.assertAlmostEqual(self.n.recovery_blend_duration_s,.15)
         self.assertFalse(self.n.recovery_horizontal_controller.integral_active)
 
     def test_fast_rotation_never_establishes_a_new_sensor_epoch(self):
@@ -224,10 +228,10 @@ class EarlyTiltPriorityTests(unittest.TestCase):
         self.assertFalse(self.n.horizontal_velocity_active)
         value = self.tick(11.4,tilt=5.,actual=q(2.))
         self.assertTrue(self.n.horizontal_velocity_active)
-        self.assertLess(self.n.recovery_horizontal_weight,.1)
+        self.assertLess(self.n.recovery_horizontal_weight,.3)
         # A 100ms test tick consumes only the existing 50ms blend cap.
         self.assertAlmostEqual(self.n.recovery_blend_elapsed,.05)
-        fraction = .05/.30
+        fraction = .05/.15
         self.assertAlmostEqual(self.n.recovery_horizontal_weight,fraction*fraction*(3.-2.*fraction))
         self.assertLess(angle(value,q(2.)),7.*self.n.recovery_horizontal_weight+.001)
         self.assertFalse(self.n.recovery_horizontal_controller.integral_active)

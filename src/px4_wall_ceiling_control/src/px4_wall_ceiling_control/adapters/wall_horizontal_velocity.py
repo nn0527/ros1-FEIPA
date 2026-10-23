@@ -39,9 +39,16 @@ class WallHorizontalVelocityMixin:
         self.horizontal_flow_quality_min = int(rospy.get_param('~horizontal_flow_quality_min', 1))
         self.horizontal_reacquire_time = float(rospy.get_param('~horizontal_reacquire_time_s', .30))
         self.recovery_horizontal_reentry_blend_s = float(rospy.get_param('~recovery_horizontal_reentry_blend_s', .30))
+        self.recovery_horizontal_soft_reentry_blend_s = float(rospy.get_param('~recovery_horizontal_soft_reentry_blend_s',
+            min(.15, self.recovery_horizontal_reentry_blend_s)))
+        self.recovery_horizontal_soft_pause_max_s = float(rospy.get_param('~recovery_horizontal_soft_pause_max_s', .75))
         self.recovery_horizontal_rate_soft = math.radians(float(rospy.get_param('~recovery_horizontal_rate_soft_deg_s', 30.)))
         if not (math.isfinite(self.recovery_horizontal_reentry_blend_s)
                 and 0 < self.recovery_horizontal_reentry_blend_s <= 2.
+                and math.isfinite(self.recovery_horizontal_soft_reentry_blend_s)
+                and 0 < self.recovery_horizontal_soft_reentry_blend_s <= self.recovery_horizontal_reentry_blend_s
+                and math.isfinite(self.recovery_horizontal_soft_pause_max_s)
+                and 0 < self.recovery_horizontal_soft_pause_max_s <= 2.
                 and math.isfinite(self.recovery_horizontal_rate_soft)
                 and 0 < self.recovery_horizontal_rate_soft < math.radians(45.)):
             raise ValueError('invalid recovery correction transition settings')
@@ -173,7 +180,18 @@ class WallHorizontalVelocityMixin:
         self.horizontal_applied_axis = None
         self.horizontal_integral_reason = reason
 
-    def _reset_recovery_horizontal(self, reason, clear_departure=False):
+    def _reset_recovery_blend(self):
+        self.recovery_blend_seed = None
+        self.recovery_blend_elapsed = 0.
+        # Resets also run on partially initialized/disabled horizontal nodes.
+        self.recovery_blend_duration_s = getattr(self, 'recovery_horizontal_reentry_blend_s', .30)
+        self.recovery_blend_established = False
+        self.recovery_soft_pause_at = None
+        self.recovery_soft_reentry = False
+        self.recovery_horizontal_weight = 0.
+
+    def _reset_recovery_horizontal(self, reason, clear_departure=False,
+                                   preserve_attitude_confirmation=False):
         controller = getattr(self, 'recovery_horizontal_controller', None)
         if controller is not None:
             controller.reset()
@@ -182,12 +200,10 @@ class WallHorizontalVelocityMixin:
         self.recovery_control_at = None
         self.recovery_integral_budget = 0.
         self.recovery_baseline_axis = None
-        self.recovery_blend_seed = None
-        self.recovery_blend_elapsed = 0.
-        self.recovery_horizontal_weight = 0.
+        self._reset_recovery_blend()
         self.recovery_horizontal_rate_weight = 1.
         guard = getattr(self, 'recovery_tilt_guard', None)
-        if guard is not None:
+        if guard is not None and not preserve_attitude_confirmation:
             # Real feedback loss may not erase a pending level-first latch.
             # Only a new maneuver/release explicitly clears it.
             guard.reset(preserve_pause=not clear_departure)
@@ -311,6 +327,9 @@ class WallHorizontalVelocityMixin:
                 reason = '恢复最终姿态输出无效'
         if reason:
             controller.clear_integral()
+            # Ownership/output loss is not a soft attitude pause. Never reuse
+            # its fast-reentry entitlement, even if sensor feedback survives.
+            self._reset_recovery_blend()
             self.recovery_integral_sample = None
             self.recovery_integral_budget = 0.
             self.recovery_candidate_axis = None
@@ -489,10 +508,12 @@ class WallHorizontalVelocityMixin:
             return attitude_from_axis_yaw(axis, yaw)
         return quaternion
 
-    def _blend_recovery_correction(self, quaternion, yaw, dt, applied_axis):
+    def _blend_recovery_correction(self, quaternion, yaw, dt, applied_axis, now):
         """Blend only valid velocity correction; rate suspension keeps leveling."""
         correction_weight = min(self.recovery_horizontal_rate_weight, self.recovery_tilt_guard.weight)
         if correction_weight <= 0.:
+            if self.recovery_blend_established and self.recovery_soft_pause_at is None:
+                self.recovery_soft_pause_at = now
             self.recovery_blend_seed = None
             self.recovery_blend_elapsed = 0.
             self.recovery_horizontal_weight = 0.
@@ -501,11 +522,22 @@ class WallHorizontalVelocityMixin:
             # _recovery_integral_interval validates ownership/source/receipt
             # before exposing applied_axis. No old command is used as feedback.
             self.recovery_blend_seed = cone_axis(applied_axis or (0.,0.,1.), math.radians(5.))
+            pause = self.recovery_soft_pause_at
+            self.recovery_soft_reentry = bool(self.recovery_blend_established
+                and applied_axis is not None and pause is not None
+                and 0. <= (now-pause).to_sec() <= self.recovery_horizontal_soft_pause_max_s)
+            self.recovery_blend_duration_s = (self.recovery_horizontal_soft_reentry_blend_s
+                if self.recovery_soft_reentry else self.recovery_horizontal_reentry_blend_s)
+            if not self.recovery_soft_reentry:
+                self.recovery_blend_established = False
+            self.recovery_soft_pause_at = None
             self.recovery_blend_elapsed = min(.05, max(0., dt))
         else:
-            self.recovery_blend_elapsed = min(self.recovery_horizontal_reentry_blend_s,
+            self.recovery_blend_elapsed = min(self.recovery_blend_duration_s,
                 self.recovery_blend_elapsed+min(.05, max(0., dt)))
-        fraction = self.recovery_blend_elapsed/self.recovery_horizontal_reentry_blend_s
+        fraction = min(1., self.recovery_blend_elapsed/self.recovery_blend_duration_s)
+        if fraction >= 1.:
+            self.recovery_blend_established = True
         blend = fraction*fraction*(3.-2.*fraction)
         axis = rotate_vector(quaternion, (0.,0.,1.))
         # Measured tilt/rate attenuate toward level, not an old velocity command.
@@ -545,7 +577,7 @@ class WallHorizontalVelocityMixin:
         self.horizontal_gate_at = None
         self._reset_horizontal_feedback(reason)
 
-    def _reset_horizontal_feedback(self, reason):
+    def _reset_horizontal_feedback(self, reason, preserve_attitude_confirmation=False):
         """Clear feedback/control history without restarting a safe attitude epoch."""
         self.horizontal_measured = (math.nan,math.nan)
         self.horizontal_confirm_at = self.horizontal_last_flow_sample = None
@@ -556,7 +588,9 @@ class WallHorizontalVelocityMixin:
         self.horizontal_velocity_reason = reason
         self.horizontal_controller.reset()
         self._clear_horizontal_integral(reason)
-        self._reset_recovery_horizontal(reason)
+        self.recovery_attitude_confirmation_pending = preserve_attitude_confirmation
+        self._reset_recovery_horizontal(reason,
+            preserve_attitude_confirmation=preserve_attitude_confirmation)
         if getattr(self, 'departure_active', False):
             self.departure_level_at = None
             self._reset_departure_evidence(reason)
@@ -578,6 +612,7 @@ class WallHorizontalVelocityMixin:
 
     def _prepare_horizontal_velocity(self, now):
         if not getattr(self,'horizontal_velocity_enabled',False):return
+        self.recovery_attitude_confirmation_pending = False
         if not self._wall_fusion_ready(now):
             self._reset_horizontal_gate(self.wall_fusion_reason)
             return
@@ -603,6 +638,11 @@ class WallHorizontalVelocityMixin:
                 self.recovery_tilt_guard.suspend()
             self._reset_horizontal_gate('等待机体接近水平（≤10°）且' + ('俯仰角速度' if entry_pitch_only else '角速度') + '≤45°/s');return
         if self.horizontal_gate_at is None:self.horizontal_gate_at = now
+        # Pose confirmation runs alongside sensor acquisition, not after it.
+        # Hard feedback faults below still discard this confirmation. Soft
+        # waiting never qualifies a sensor sample or changes the pose fence.
+        if recovery:
+            self.recovery_tilt_guard.update(now.to_sec(), self.odom.header.stamp.to_sec(), tilt, rate)
         # Establish the attitude epoch before waiting for the post-restoration
         # samples. Otherwise the last arriving sensor moves the attitude fence
         # past already qualified samples and adds another estimator/flow period.
@@ -626,13 +666,14 @@ class WallHorizontalVelocityMixin:
         elif not is_fresh_receipt(self.horizontal_estimator_at,1.,now) or estimate is None:reason = '估计器反馈过期'
         elif not (estimate.attitude_status_flag and estimate.velocity_horiz_status_flag) or estimate.const_pos_mode_status_flag:reason = 'PX4水平速度估计未有效（或处于恒位置推算）'
         elif not is_fresh_receipt(flow_at,self.horizontal_flow_timeout,now) or flow is None:reason = '光流反馈过期'
-        elif (flow_at < self.horizontal_gate_at or self.horizontal_estimator_at < self.horizontal_gate_at):reason = '等待恢复水平后的新光流及估计器样本'
         elif flow.quality < self.horizontal_flow_quality_min or flow.integration_time_us <= 0 or not all(math.isfinite(v) for v in (flow.integrated_x,flow.integrated_y,flow.integrated_xgyro,flow.integrated_ygyro,flow.distance)) or flow.distance <= 0:reason = '光流质量、积分时间或测距无效'
         else:
             # Source stamps are converted by MAVROS; small mapping skew is allowed.
             # Keep independent receipt freshness, replay and source-age protection.
             clock_now=max(now.to_sec(),rospy.Time.now().to_sec())
             reason=self.horizontal_flow_clock.reason(flow.header.stamp.to_sec(),clock_now,frame_error)
+        if not reason and (flow_at < self.horizontal_gate_at or self.horizontal_estimator_at < self.horizontal_gate_at):
+            reason = '等待恢复水平后的新光流及估计器样本'
         if reason:
             self.horizontal_confirm_at = self.horizontal_last_flow_sample = None
             self.horizontal_flow_samples = 0
@@ -640,8 +681,12 @@ class WallHorizontalVelocityMixin:
             self.horizontal_velocity_active = False
             self.horizontal_velocity_reason = reason
             self._clear_horizontal_integral(reason)
-            self._reset_recovery_horizontal(reason)
+            self.recovery_attitude_confirmation_pending = bool(recovery
+                and reason == '等待恢复水平后的新光流及估计器样本')
+            self._reset_recovery_horizontal(reason,
+                preserve_attitude_confirmation=self.recovery_attitude_confirmation_pending)
         else:
+            self.recovery_attitude_confirmation_pending = recovery
             if self.horizontal_last_flow_sample != flow_at:
                 self.horizontal_last_flow_sample = flow_at
                 self.horizontal_flow_samples += 1
@@ -651,8 +696,6 @@ class WallHorizontalVelocityMixin:
             self.horizontal_velocity_reason = '水平速度反馈有效' if self.horizontal_velocity_ready else '等待光流连续有效确认'
             self.recovery_horizontal_rate_weight = (max(0., min(1.,
                 (math.radians(45.)-rate)/(math.radians(45.)-self.recovery_horizontal_rate_soft))) if recovery else 1.)
-            if recovery:
-                self.recovery_tilt_guard.update(now.to_sec(), self.odom.header.stamp.to_sec(), tilt, rate)
             if recovery and self.horizontal_velocity_ready and self.recovery_horizontal_rate_weight < 1.:
                 self.horizontal_velocity_reason = ('恢复反馈连续有效；角速度 %.1f°/s；水平修正权重 %.2f，暂停积分'
                     % (math.degrees(rate),self.recovery_horizontal_rate_weight))
@@ -696,7 +739,8 @@ class WallHorizontalVelocityMixin:
         if not self.horizontal_velocity_ready:
             self._clear_horizontal_integral(self.horizontal_velocity_reason)
             self.horizontal_controller.reset()
-            self._reset_recovery_horizontal(self.horizontal_velocity_reason)
+            self._reset_recovery_horizontal(self.horizontal_velocity_reason,
+                preserve_attitude_confirmation=getattr(self, 'recovery_attitude_confirmation_pending', False))
             return (self._horizontal_baseline_attitude(yaw) or quaternion) if self.state == W.STATE_SLOW_APPROACH else quaternion
         if not self.horizontal_equilibrium.ready:
             self._clear_horizontal_integral('平衡基准无效')
@@ -731,7 +775,7 @@ class WallHorizontalVelocityMixin:
             # Do not store time/integral to catch up after a blend or rate pause.
             if (self.recovery_horizontal_rate_weight < 1. or self.recovery_tilt_guard.weight < 1.
                     or self.recovery_blend_seed is None
-                    or self.recovery_blend_elapsed < self.recovery_horizontal_reentry_blend_s):
+                    or self.recovery_blend_elapsed < self.recovery_blend_duration_s):
                 integral_dt = 0.
                 self.recovery_integral_budget = 0.
                 self.recovery_integral_reason = '恢复修正平滑接入或姿态/角速度受限：暂停积分'
@@ -739,7 +783,7 @@ class WallHorizontalVelocityMixin:
         quaternion = controller.attitude(desired,self.horizontal_measured,yaw,dt,baseline,
             integrate=integral_dt>0.,integral_dt=integral_dt,max_tilt=math.radians(5.),applied_axis=applied)
         if not approaching:
-            quaternion = self._blend_recovery_correction(quaternion, yaw, dt, applied)
+            quaternion = self._blend_recovery_correction(quaternion, yaw, dt, applied, now)
         axis = rotate_vector(quaternion,(0.,0.,1.))
         if approaching:
             self.horizontal_candidate_axis = axis
@@ -756,6 +800,12 @@ class WallHorizontalVelocityMixin:
                 if getattr(self, 'departure_active', False) else '恢复水平制动：等待水平速度和姿态持续稳定'))
         if not approaching:
             self.horizontal_velocity_reason += '；实际修正接入权重 %.2f' % self.recovery_horizontal_weight
+            fraction = min(1., self.recovery_blend_elapsed/self.recovery_blend_duration_s)
+            self.horizontal_velocity_reason += ('；倾角权重 %.2f、角速度权重 %.2f、接入权重 %.2f；%s接入 %.2f/%.2fs'
+                % (self.recovery_tilt_guard.weight, self.recovery_horizontal_rate_weight,
+                   fraction*fraction*(3.-2.*fraction),
+                   '软恢复' if self.recovery_soft_reentry else '完整',
+                   self.recovery_blend_elapsed, self.recovery_blend_duration_s))
             if self.recovery_horizontal_rate_weight < 1.:
                 self.horizontal_velocity_reason += '；角速度受限但反馈连续有效，暂停积分'
             if self.recovery_tilt_guard.weight < 1.:

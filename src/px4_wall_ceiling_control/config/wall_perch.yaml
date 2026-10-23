@@ -135,6 +135,9 @@ wall_perch_decision_node:
   recovery_horizontal_integral_limit_mps2: 0.20
   # 普通恢复重新接入时平滑过渡；不延迟紧急回平或急停。
   recovery_horizontal_reentry_blend_s: 0.30
+  # 仅同一有效反馈周期内的短暂软暂停可使用快速接入；硬失效仍完整确认。
+  recovery_horizontal_soft_reentry_blend_s: 0.15
+  recovery_horizontal_soft_pause_max_s: 0.75
   # 对于已经通过准入且持续有效的反馈，角速度从 30 度／秒增加到现有的
   # 45 度／秒上限时，将修正量逐渐降至零；高角速度时不重新准入。
   recovery_horizontal_rate_soft_deg_s: 30.0
