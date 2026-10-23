@@ -79,7 +79,7 @@ wall_perch_decision_node:
   # 脱离、恢复和控制权交接全过程共用同一个离墙高度基准及支撑推力基准。
   detach_height_kp: 0.30
   detach_velocity_kp: 0.30
-  detach_velocity_ki: 0.12
+  detach_velocity_ki: 0.06
   detach_vertical_integral_limit: 0.06
   detach_vertical_correction_limit: 0.12
   detach_support_max_thrust: 0.85
@@ -98,7 +98,7 @@ wall_perch_decision_node:
   detach_range_height_only_kp: 0.15
   # 仅用于雷达测距的速度环候选增益；旧路径及非雷达路径的增益保持不变。
   # 快速反馈暴露出修正量频繁饱和后，由原来的 0.30 下调。
-  detach_range_control_velocity_kp: 0.15
+  detach_range_control_velocity_kp: 0.10
   detach_range_control_blend_s: 0.30
   detach_range_loss_support_s: 0.30
   detach_range_control_timeout_s: 15.0
