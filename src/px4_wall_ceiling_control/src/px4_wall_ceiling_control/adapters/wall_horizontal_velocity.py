@@ -13,6 +13,7 @@ from px4_wall_ceiling_control.domain.horizontal_equilibrium import HorizontalEqu
 from px4_wall_ceiling_control.domain.flow_timestamps import FlowTimestampGuard
 from px4_wall_ceiling_control.domain.recovery_attitude_limits import attitude_from_axis_yaw, cone_axis
 from px4_wall_ceiling_control.domain.recovery_tilt_guard import RecoveryTiltGuard
+from px4_wall_ceiling_control.domain.straight_retreat import StraightRetreatAttitude
 from px4_wall_ceiling_control.freshness import is_fresh, is_fresh_receipt, is_fresh_source
 from px4_wall_ceiling_control.msg import (
     WallPerchStatus as W, AttachmentControlCandidate as C, WallSensorFusionStatus,
@@ -79,6 +80,10 @@ class WallHorizontalVelocityMixin:
         self.departure_clearance_distance = float(rospy.get_param('~departure_clearance_distance_m', .50))
         self.departure_clearance_hold = float(rospy.get_param('~departure_clearance_hold_s', .30))
         self.departure_heading_tolerance = math.radians(float(rospy.get_param('~departure_heading_tolerance_deg', 10.)))
+        self.departure_attitude_controller = StraightRetreatAttitude(
+            float(rospy.get_param('~departure_lateral_velocity_kp', .5)),
+            math.radians(float(rospy.get_param('~departure_roll_correction_deg', 2.))),
+            math.radians(float(rospy.get_param('~departure_roll_rate_deg_s', 1.))))
         if not (0 < self.departure_retreat_speed <= .10
                 and .20 <= self.departure_clearance_distance <= 1.
                 and .20 <= self.departure_clearance_hold <= 2.

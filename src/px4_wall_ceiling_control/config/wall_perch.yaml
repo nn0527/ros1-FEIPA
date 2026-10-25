@@ -169,6 +169,12 @@ wall_perch_decision_node:
   # 倾角达到或超过 8 度后，须取得新鲜、接近水平且低角速度的样本，才平滑重新接入。
   recovery_horizontal_level_hold_s: 0.30
   departure_retreat_speed_mps: 0.05
+  # 固定接管前航向，前向速度主要通过俯仰控制；侧向只做独立弱阻尼。
+  departure_lateral_velocity_kp: 0.50
+  # 相对可信悬停横滚基准的修正上限；总倾角仍受原5°及最终mux约束。
+  departure_roll_correction_deg: 2.0
+  # 候选横滚目标变化率，不代表实测机体角速度上限。
+  departure_roll_rate_deg_s: 1.0
   departure_clearance_distance_m: 0.50
   departure_clearance_hold_s: 0.30
   departure_heading_tolerance_deg: 10.0

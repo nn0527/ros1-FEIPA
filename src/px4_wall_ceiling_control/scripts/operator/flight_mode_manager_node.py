@@ -882,6 +882,9 @@ class FlightModeManagerNode(RCTakeoverManager):
             return False
         if not is_fresh_source(s.header.stamp, self.status_timeout_s, now, future_tolerance_s=0.):
             return False
+        if self._captured_recovery():
+            # Captured RECOVER no longer waits for range/velocity convergence.
+            return bool(s.recover_stable)
         try:
             config = json.loads(s.detach_range_config_json)
             timeout = float(config['timeout_s'])
@@ -890,15 +893,6 @@ class FlightModeManagerNode(RCTakeoverManager):
             future = float(config['future_tolerance_s'])
         except (ValueError, TypeError, KeyError):
             return False
-        if self._captured_recovery():
-            from px4_wall_ceiling_control.domain.simple_recovery import HEIGHT_MARGIN_M, SPEED_MARGIN_MPS
-            return bool(s.detach_range_valid and s.detach_range_fast_velocity_valid
-                and math.isfinite(s.detach_range_fast_velocity_mps)
-                and abs(s.detach_range_fast_velocity_mps) <= SPEED_MARGIN_MPS
-                and math.isfinite(s.detach_range_target_m) and math.isfinite(s.detach_range_height_m)
-                and abs(s.detach_range_target_m-s.detach_range_height_m) <= HEIGHT_MARGIN_M+1.e-7
-                and is_fresh_source(s.detach_range_source_time, timeout, now, future_tolerance_s=future)
-                and is_fresh(s.detach_range_received_time, timeout, now))
         return bool(s.detach_range_valid and s.detach_range_velocity_valid
             and math.isfinite(s.detach_range_velocity_mps)
             and abs(s.detach_range_velocity_mps) <= min(speed_limit, self.handover_max_vertical_speed_mps)
@@ -965,21 +959,18 @@ class FlightModeManagerNode(RCTakeoverManager):
 
     def _captured_recovery_handover_ready(self, now):
         from px4_wall_ceiling_control.domain.geometry import rotate_vector
-        from px4_wall_ceiling_control.adapters.odometry import linear_velocity_parent_frame
-        from px4_wall_ceiling_control.domain.simple_recovery import within_margins
+        from px4_wall_ceiling_control.domain.simple_recovery import attitude_within_margins
         if (not self._wall_return_exit_ready(now) or not getattr(self.wall, 'recover_stable', False)
                 or self._range_px4_rc_failure(now) or not self._wall_fusion_handover_ready(now)
                 or self.output_mode != 2 or not is_fresh(self.output_at, self.output_timeout_s, now)
                 or self.odom is None or not is_fresh(self.odom_at, self.odom_timeout_s, now)
+                or not is_fresh_source(self.odom.header.stamp, self.odom_timeout_s, now)
                 or not odometry_attitude_horizontal_is_finite(self.odom, self.odom_twist_in_child_frame)):
             return False
         q = self.odom.pose.pose.orientation
         tilt = math.acos(max(-1., min(1., rotate_vector((q.x, q.y, q.z, q.w), (0., 0., 1.))[2])))
         a = self.odom.twist.twist.angular
-        velocity = linear_velocity_parent_frame(self.odom, self.odom_twist_in_child_frame)
-        return within_margins(tilt, math.sqrt(a.x*a.x+a.y*a.y+a.z*a.z),
-            self.wall.detach_range_target_m-self.wall.detach_range_height_m,
-            self.wall.detach_range_fast_velocity_mps, math.hypot(*velocity[:2]))
+        return attitude_within_margins(tilt, math.sqrt(a.x*a.x+a.y*a.y+a.z*a.z))
 
     def _handover_ready(self, now):
         if self._captured_recovery():
@@ -1128,7 +1119,8 @@ class FlightModeManagerNode(RCTakeoverManager):
 
     def _wall_return_reason(self, confirmed=False):
         if self._wall_range_mode() and not confirmed and not getattr(self, 'wall_fault_return_ready', False):
-            return '测距闭环已稳定，准备交回POSCTL；等待新鲜飞控模式确认'
+            return ('姿态已稳定，准备交回POSCTL；等待新鲜飞控模式确认' if self._captured_recovery()
+                    else '测距闭环已稳定，准备交回POSCTL；等待新鲜飞控模式确认')
         if getattr(self, "wall_fault_return_ready", False):
             result = "故障恢复后已安全交回" if confirmed else "故障恢复完成，准备安全交回"
             return result + self._pilot_mode() + "；本次侧吸未正常完成：" + getattr(self, "wall_failure_reason", "侧吸故障")
@@ -1591,12 +1583,15 @@ class FlightModeManagerNode(RCTakeoverManager):
                 elif getattr(self, "ceiling_approach_timeout_returning", False):
                     self.phase_reason = "吸顶接近超时：保持FAULT，等待有效遥控输入、飞控估计和连续输出后请求ALTCTL"
                 elif self._wall_return_requires_exit() and not self._wall_return_exit_ready(now):
-                    self.phase_reason = "离墙条件重新确认中：保持受控输出，等待新的有效EXIT后交回" + self._pilot_mode()
+                    self.phase_reason = (('姿态稳定条件重新确认中：保持受控输出，等待有效EXIT后交回'
+                        if self._captured_recovery() else '离墙条件重新确认中：保持受控输出，等待新的有效EXIT后交回')
+                        + self._pilot_mode())
                 else:
                     prefix = (self._wall_return_reason() + "；"
                         if getattr(self, "selected_mode", None) == OperatorCommand.MODE_WALL
                         and (self.completed or getattr(self, "wall_fault_return_ready", False)) else "")
-                    self.phase_reason = prefix + "等待水平速度、姿态持续稳定和新鲜有效估计后交回" + self._pilot_mode()
+                    self.phase_reason = prefix + ('等待姿态持续稳定、有效遥控及新鲜飞控估计后交回'
+                        if self._captured_recovery() else '等待水平速度、姿态持续稳定和新鲜有效估计后交回') + self._pilot_mode()
             elif flight_fresh:
                 failure_reason = "unexpected flight mode during return: {}".format(
                     flight_mode or "unknown"

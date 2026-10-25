@@ -56,7 +56,7 @@ class RetreatTests(unittest.TestCase):
         self.assertAlmostEqual(n.detach_range.target, expected)
         self.assertEqual(n.detach_range.target_revision, revision)
 
-    def test_missing_front_feedback_does_not_inhibit_retreat(self):
+    def test_missing_front_feedback_keeps_zero_target_without_retreat(self):
         n = self.n
         n.front_range = n.front_received_at = None
         n.sensor_health = None
@@ -65,8 +65,8 @@ class RetreatTests(unittest.TestCase):
             self.frame(t)
             n._simple_recovery_attitude(at(t))
         self.assertTrue(n.horizontal_velocity_active)
-        self.assertTrue(n.departure_feedback_valid)
-        self.assertAlmostEqual(n.recovery_horizontal_controller.target[0], -.05)
+        self.assertFalse(n.departure_feedback_valid)
+        self.assertEqual(n.recovery_horizontal_controller.target, (0., 0.))
 
     def test_delayed_height_is_captured_before_first_range_thrust_update(self):
         n = self.n
@@ -100,22 +100,21 @@ class RetreatTests(unittest.TestCase):
         # must never be reported as an already-submitted manual request.
         self.assertNotIn('本轮已提交一键定高', n._manual_range_height_block_reason(at(13.1)))
 
-    def test_single_frame_stops_target_and_survives_near_bad_missing_frames(self):
+    def test_front_frames_no_longer_latch_or_drive_retreat(self):
         n = self.n
         self.frame(13.1)
         n.recovery_horizontal_controller.target = (-.05, 0.)
         self.front(13.1, .5001)
-        self.assertTrue(n.departure_clear_confirmed)
-        self.assertEqual(n.departure_clear_samples, 1)
-        self.assertEqual(n.recovery_horizontal_controller.target, (0., 0.))
+        self.assertFalse(n.departure_clear_confirmed)
+        self.assertEqual(n.departure_clear_samples, 0)
         self.front(13.11, .2)
         self.front(13.12, math.nan)
         self.frame(14.)
         n._simple_recovery_attitude(at(14.))
-        self.assertTrue(n.departure_clear_confirmed)
+        self.assertFalse(n.departure_clear_confirmed)
         self.assertEqual(n.recovery_horizontal_controller.target, (0., 0.))
         n._reset_horizontal_feedback('temporary fusion pause')
-        self.assertTrue(n.departure_clear_confirmed)
+        self.assertFalse(n.departure_clear_confirmed)
         n._begin_departure_clearance(at(15.))
         self.assertFalse(n.departure_clear_confirmed)
 
@@ -126,13 +125,13 @@ class RetreatTests(unittest.TestCase):
                 self.front(13.1, distance, source=source)
                 self.assertFalse(self.n.departure_clear_confirmed)
 
-    def test_clearance_enters_exit_without_distance_dwell_but_not_false_stable(self):
+    def test_large_front_frame_does_not_bypass_attitude_stability(self):
         n = self.n
         self.frame(13.1)
         self.front(13.1, .6)
         self.assertFalse(n.recover_stable)
         n._update_state_machine(at(13.1))
-        self.assertEqual(n.state, W.STATE_EXIT)
+        self.assertEqual(n.state, W.STATE_RECOVER)
         self.assertFalse(n.recover_stable)
 
     def test_baseline_levels_smoothly_even_before_fusion_restored(self):
@@ -151,16 +150,16 @@ class RetreatTests(unittest.TestCase):
         self.assertAlmostEqual(previous[2], 1., places=8)
         self.assertFalse(n.horizontal_velocity_active)
 
-    def test_after_blend_backward_command_is_not_opposed_by_entry_pitch(self):
+    def test_after_blend_has_zero_target_and_preserves_hover_correction_limits(self):
         n = self.n
         for i in range(1, 61):
             t = 13.+i*.02
             self.frame(t)
             q = n._simple_recovery_attitude(at(t))
         axis = rotate_vector(q, (0., 0., 1.))
-        self.assertLess(axis[0], 0.)
+        self.assertAlmostEqual(axis[0], 0.)
         self.assertLessEqual(math.acos(axis[2]), math.radians(5.))
-        self.assertAlmostEqual(n.recovery_horizontal_controller.target[0], -.05)
+        self.assertEqual(n.recovery_horizontal_controller.target, (0., 0.))
 
     def test_missing_trusted_baseline_or_high_rate_cannot_command_retreat(self):
         n = self.n

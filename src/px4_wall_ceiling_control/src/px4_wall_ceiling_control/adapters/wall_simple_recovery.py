@@ -1,10 +1,10 @@
-"""Reanchor height, blend to trusted hover, retreat until one clearance frame."""
+"""Keep existing height/hover support; hand over after attitude stabilizes."""
 import math
 from px4_wall_ceiling_control.adapters.odometry import linear_velocity_parent_frame
-from px4_wall_ceiling_control.domain.geometry import rotate_vector, euler_from_quaternion
+from px4_wall_ceiling_control.domain.geometry import rotate_vector
 from px4_wall_ceiling_control.domain.recovery_attitude_limits import attitude_from_axis_yaw
 from px4_wall_ceiling_control.domain.simple_recovery import (
-    MAX_TILT_DEG, STABLE_TIME_S, within_margins,
+    STABLE_TIME_S, attitude_within_margins,
 )
 from px4_wall_ceiling_control.freshness import is_fresh_receipt, is_fresh_source
 from px4_wall_ceiling_control.msg import WallPerchStatus as W
@@ -14,6 +14,8 @@ class WallSimpleRecoveryMixin:
     def _begin_simple_recovery(self, now):
         self.recover_baseline_axis = rotate_vector(self.recover_entry_attitude, (0., 0., 1.))
         self.recover_baseline_at = now
+        self.departure_attitude_controller.reset(self.recover_baseline_axis, self.departure_yaw)
+        self.recovery_attitude_at = now
         self.recover_height_captured = False
         self._capture_simple_recovery_height(now)
 
@@ -33,50 +35,10 @@ class WallSimpleRecoveryMixin:
         self.recover_height_captured = True
         return True
 
-    def _observe_recovery_clearance(self, message, now):
-        """Latch in the input callback, so one frame cannot be lost between ticks."""
-        started = getattr(self, 'departure_started_at', None)
-        if (not self._locked_recovery() or not getattr(self, 'departure_active', False)
-                or self.departure_clear_confirmed or started is None
-                or message.header.stamp <= started
-                or not is_fresh_source(message.header.stamp, self.sensor_timeout_s, now, future_tolerance_s=0.)):
-            return
-        distance = float(message.range)
-        if (not math.isfinite(distance) or not message.min_range <= distance <= message.max_range
-                or distance <= self.departure_clearance_distance):
-            return
-        self.departure_distance = distance
-        self.departure_clear_confirmed = True
-        self.departure_clear_samples = 1
-        self.departure_clear_last_stamp = self.departure_clear_since = message.header.stamp
-        self.departure_clearance_reason = '单帧墙距>%.2fm已锁存，停止退墙并申请接管' % self.departure_clearance_distance
-        # Stop the velocity TARGET now; measured speed is then actively braked.
-        self.recovery_horizontal_controller.target = (0., 0.)
-        self.recovery_horizontal_controller.clear_integral()
-
     def _update_simple_departure_clearance(self, now):
-        # A front-lidar dropout is not a velocity/attitude fault, nor does it
-        # erase a previously latched clearance. No wall-health dwell is needed.
-        front = getattr(self, 'front_range', None)
-        if front is not None:
-            self._observe_recovery_clearance(front, now)
-        q = self._current_quaternion() if self._odom_fresh(now) else None
-        yaw = getattr(self, 'departure_yaw', None)
-        rate = getattr(getattr(getattr(self, 'odom', None), 'twist', None), 'twist', None)
-        a = rate.angular if rate is not None else None
-        valid = bool(self.horizontal_velocity_ready and q is not None and yaw is not None
-            and rotate_vector(q, (0., 0., 1.))[2] >= math.cos(math.radians(MAX_TILT_DEG))
-            and a is not None and all(math.isfinite(v) for v in (a.x, a.y, a.z))
-            and math.sqrt(a.x*a.x+a.y*a.y+a.z*a.z) <= math.radians(20.))
-        if valid:
-            measured_yaw = euler_from_quaternion(q)[2]
-            valid = abs(math.atan2(math.sin(measured_yaw-yaw), math.cos(measured_yaw-yaw))) <= self.departure_heading_tolerance
-        self.departure_feedback_valid = valid
-        if self.departure_clear_confirmed:
-            self.departure_clearance_reason = '单帧离墙距离已锁存，等待制动稳定及安全接管'
-        else:
-            self.departure_clearance_reason = ('向后退墙；等待一帧有效墙距>%.2fm（测距丢失不暂停）'
-                % self.departure_clearance_distance if valid else '退墙暂停：等待有效速度、姿态及冻结航向')
+        # No automatic retreat or wall-distance admission in captured RECOVER.
+        self.departure_feedback_valid = False
+        self.departure_clearance_reason = '已取消自动后退；仅等待姿态稳定后接管'
 
     def _simple_recovery_baseline(self, now):
         """Level toward verified, frozen POSCTL feedforward even while EKF restores."""
@@ -139,7 +101,9 @@ class WallSimpleRecoveryMixin:
     def _simple_recovery_attitude(self, now):
         baseline, trusted = self._simple_recovery_baseline(now)
         yaw = self.departure_yaw
-        quaternion = attitude_from_axis_yaw(baseline, yaw)
+        previous = getattr(self, 'recovery_attitude_at', now)
+        attitude_dt = min(.05, max(0., (now-previous).to_sec()))
+        self.recovery_attitude_at = now
         height_captured = self._capture_simple_recovery_height(now)
         self._prepare_simple_recovery_velocity(now)
         self.horizontal_velocity_active = False
@@ -147,64 +111,71 @@ class WallSimpleRecoveryMixin:
             self.recovery_horizontal_controller.reset()
             self.recovery_control_at = now
             if not trusted:
-                self.horizontal_velocity_reason = '可信悬停基准缺失，禁止猜测退墙姿态'
+                self.horizontal_velocity_reason = '可信悬停基准缺失，禁止猜测恢复姿态'
             elif not height_captured:
-                self.horizontal_velocity_reason = '退墙等待实际测距高度基准'
-            return quaternion
-        forward = (-self.departure_retreat_speed
-                   if self.state == W.STATE_RECOVER and self.departure_feedback_valid
-                   and not self.departure_clear_confirmed else 0.)
+                self.horizontal_velocity_reason = '恢复等待实际测距高度基准'
+            # Continue the existing smooth roll return even without velocity.
+            return self.departure_attitude_controller.attitude(
+                baseline, attitude_from_axis_yaw(baseline, yaw), 0., yaw,
+                attitude_dt, max(math.radians(5.), math.acos(max(-1., min(1., baseline[2])))), 0.)
         previous = getattr(self, 'recovery_control_at', None)
         dt = min(.05, max(0., (now-previous).to_sec())) if previous is not None else 0.
         self.recovery_control_at = now
-        if self.departure_clear_confirmed:
-            self.recovery_horizontal_controller.target = (0., 0.)
+        # Clear any earlier retreat target immediately, not through its ramp.
+        self.recovery_horizontal_controller.target = (0., 0.)
         # Five degrees after leveling; preserve a larger entry angle only
         # while its baseline is smoothly moving inward, never jump its target.
         tilt_limit = max(math.radians(5.), math.acos(max(-1., min(1., baseline[2]))))
-        result = self.recovery_horizontal_controller.attitude(
-            (forward*math.cos(yaw), forward*math.sin(yaw)), self.horizontal_measured,
-            yaw, dt, baseline, integrate=False, max_tilt=tilt_limit)
+        heading = (math.cos(yaw), math.sin(yaw))
+        left = (-heading[1], heading[0])
+        measured_forward = sum(a*b for a, b in zip(self.horizontal_measured, heading))
+        measured_left = sum(a*b for a, b in zip(self.horizontal_measured, left))
+        base_forward = sum(a*b for a, b in zip(baseline[:2], heading))
+        forward_baseline = (base_forward*heading[0], base_forward*heading[1], baseline[2])
+        controller = self.recovery_horizontal_controller
+        # Preserve the on-device independent lateral damping and roll slew.
+        forward_attitude = controller.attitude(
+            (0., 0.), (measured_forward*heading[0], measured_forward*heading[1]),
+            yaw, dt, forward_baseline, integrate=False, max_tilt=tilt_limit)
+        remaining = math.sqrt(max(0., controller.max_acceleration**2
+                                  - math.hypot(*controller.acceleration)**2))
+        result = self.departure_attitude_controller.attitude(
+            baseline, forward_attitude, measured_left, yaw, attitude_dt, tilt_limit, remaining)
         self.horizontal_velocity_active = True
-        self.horizontal_velocity_reason = '可信悬停基准退墙：目标前向%.2f m/s；%s' % (forward, self.departure_clearance_reason)
+        self.horizontal_velocity_reason = '可信悬停基准零速修正；已取消自动后退，等待姿态稳定接管'
         return result
 
     def _simple_recovery_stability(self, now):
-        s = self.detach_range.read_snapshot(now.to_sec())
-        self._prepare_simple_recovery_velocity(now)
-        velocity, valid = self._range_control_velocity(s, now.to_sec())
         q = self._current_quaternion()
         reason = ''
-        if (not getattr(self, 'recover_height_captured', False)
-                or self.detach_range_faulted or not self._detach_vertical_feedback_ok(now)):
-            reason = '等待有效姿态和测距闭环'
-        elif not s.valid or not valid:
-            reason = '等待新鲜测距高度及测距速度'
-        elif not self.horizontal_velocity_ready or not self._departure_clearance_ready(now):
-            reason = self.departure_clearance_reason
+        if self.detach_range_faulted or not self._odom_fresh(now) or q is None:
+            reason = '等待新鲜有效姿态且本轮无故障'
         elif not self._flight_ready(now) or self._valid_wall_output(now) is None:
             reason = '等待新鲜OFFBOARD权限和最终输出'
         else:
             angular = self.odom.twist.twist.angular
             tilt = math.acos(max(-1., min(1., rotate_vector(q, (0., 0., 1.))[2])))
             rate = math.sqrt(angular.x**2+angular.y**2+angular.z**2)
-            if not within_margins(tilt, rate, s.target-s.height, velocity, math.hypot(*self.horizontal_measured)):
-                reason = '等待姿态≤10°、角速≤20°/s、高差≤0.20m、垂直/水平速度≤0.25m/s'
-            elif math.hypot(*self.recovery_horizontal_controller.target) > .01:
-                reason = '等待退墙速度目标归零'
+            if not attitude_within_margins(tilt, rate):
+                reason = '等待总倾角≤10°、总角速度≤20°/s连续稳定0.5秒'
         if reason:
             self.detach_range_stable_since = self.detach_range_stable_source = None
             self.detach_range_stable_samples = 0
             self.recover_stable = self.horizontal_velocity_stable = False
             self.detach_range_block_reason = reason
             return False
-        if s.source != self.detach_range_stable_source:
-            self.detach_range_stable_source = s.source
+        source = self.odom.header.stamp.to_sec()
+        previous = self.detach_range_stable_source
+        if previous is not None and (source < previous or source-previous > self.odom_timeout_s):
+            self.detach_range_stable_since = None
+            self.detach_range_stable_samples = 0
+        if source != previous:
+            self.detach_range_stable_source = source
             self.detach_range_stable_samples += 1
             if self.detach_range_stable_since is None:
                 self.detach_range_stable_since = now.to_sec()
         self.recover_stable = bool(self.detach_range_stable_samples >= 2
-            and now.to_sec()-self.detach_range_stable_since >= STABLE_TIME_S)
+            and source-self.detach_range_stable_since >= STABLE_TIME_S-1.e-9)
         self.horizontal_velocity_stable = self.recover_stable
-        self.detach_range_block_reason = '稳定确认，等待POSCTL交接' if self.recover_stable else '余量范围内连续稳定确认中'
+        self.detach_range_block_reason = '姿态稳定，等待POSCTL交接' if self.recover_stable else '姿态连续稳定确认中'
         return self.recover_stable

@@ -4,8 +4,7 @@ Horizontal command is a normalized thrust proxy, not force or acceleration.
 """
 import math
 from px4_wall_ceiling_control.domain.geometry import (
-    quaternion_normalize, quaternion_multiply, euler_from_quaternion, rotate_vector)
-from px4_wall_ceiling_control.freshness import clamp
+    quaternion_normalize, quaternion_multiply, euler_from_quaternion, rotate_vector, clamp)
 
 
 def axis_yaw(q):

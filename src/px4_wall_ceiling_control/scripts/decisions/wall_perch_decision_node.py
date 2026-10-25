@@ -636,8 +636,6 @@ class WallPerchDecisionNode(WallSimpleRecoveryMixin, WallDetachBrakingMixin, Wal
             self.approach_far_sample = (now, float(message.range))
         self.front_range = message
         self.front_received_at = now
-        with getattr(self, 'feedback_lock', nullcontext()):
-            self._observe_recovery_clearance(message, now)
         self.front_filtered_m = self._filter_range(message, previous)
         (
             self.front_ready_since,
@@ -1633,7 +1631,9 @@ class WallPerchDecisionNode(WallSimpleRecoveryMixin, WallDetachBrakingMixin, Wal
 
     def _capture_attitude_references(self):
         quaternion = self._current_quaternion()
-        yaw = self._euler_from_quaternion(quaternion)[2] if quaternion else 0.0
+        yaw = getattr(self, 'horizontal_takeover_yaw', None)
+        if yaw is None or not math.isfinite(yaw):
+            yaw = self._euler_from_quaternion(quaternion)[2] if quaternion else 0.0
         self.q_hover, self.q_wall = self._hover_and_wall_quaternions(
             yaw, self.wall_angle_rad
         )
@@ -1793,7 +1793,10 @@ class WallPerchDecisionNode(WallSimpleRecoveryMixin, WallDetachBrakingMixin, Wal
                 self.recover_attitude_locked = True
                 self.recover_stable = False
                 self._begin_departure_clearance(now)
-                self.departure_yaw = euler_from_quaternion(self.recover_entry_attitude)[2]
+                # q_hover was captured near level before attachment. Never
+                # recapture yaw from the disturbed pose at recovery entry.
+                if self.departure_yaw is None:
+                    self.departure_yaw = euler_from_quaternion(self.q_hover)[2]
                 self._begin_simple_recovery(now)
                 self.detach_level_stable_at = now.to_sec()
                 rospy.loginfo('wall departure demo: LEVEL_STABLE request=%.9f rotation=%.9f stable=%.9f',
@@ -2138,7 +2141,7 @@ class WallPerchDecisionNode(WallSimpleRecoveryMixin, WallDetachBrakingMixin, Wal
                 # despite quaternion roundoff; negative pitch keeps the land branch.
                 if 0. <= pitch and tilt < math.radians(ENTRY_TILT_DEG) - 1.e-12:
                     self._enter_state(WallPerchStatus.STATE_RECOVER, now,
-                                      'detach最终俯仰角%.3f°，实测倾角%.3f°，平滑恢复悬停基准并准备退墙' %
+                                      'detach最终俯仰角%.3f°，实测倾角%.3f°，平滑恢复悬停基准并等待姿态稳定接管（无自动后退）' %
                                       (pitch, math.degrees(tilt)))
                 else:
                     self.last_reason = 'detach轨迹结束，等待实测倾角<%.0f°；当前%.3f°' % (ENTRY_TILT_DEG, math.degrees(tilt))
@@ -2170,12 +2173,10 @@ class WallPerchDecisionNode(WallSimpleRecoveryMixin, WallDetachBrakingMixin, Wal
                 and self._vertical_speed_safe()
             )
             if self._range_locked():
-                if self._locked_recovery() and self.departure_clear_confirmed:
-                    self._enter_state(WallPerchStatus.STATE_EXIT, now,
-                        '单帧墙距>%.2fm：停止退墙，申请POSCTL交接；等待安全交接条件' % self.departure_clearance_distance)
-                    return
                 if self._range_stability_ready(now):
-                    self._enter_state(WallPerchStatus.STATE_EXIT, now, '测距闭环稳定，准备交回POSCTL')
+                    reason = ('姿态稳定，准备交回POSCTL（无自动后退）' if self._locked_recovery()
+                              else '测距闭环稳定，准备交回POSCTL')
+                    self._enter_state(WallPerchStatus.STATE_EXIT, now, reason)
                 return
             if (
                 self._state_age(now) >= self.recover_time_s

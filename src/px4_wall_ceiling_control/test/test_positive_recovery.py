@@ -10,7 +10,7 @@ import rospy
 from mavros_msgs.msg import State, AttitudeTarget, OpticalFlowRad
 from geometry_msgs.msg import Quaternion
 from px4_wall_ceiling_control.msg import WallPerchStatus as W
-from px4_wall_ceiling_control.domain.simple_recovery import within_margins
+from px4_wall_ceiling_control.domain.simple_recovery import within_margins, attitude_within_margins
 from px4_wall_ceiling_control.domain.geometry import euler_from_quaternion
 from px4_wall_ceiling_control.adapters.wall_horizontal_velocity import WallHorizontalVelocityMixin
 import test_range_height_integration as fixtures
@@ -102,7 +102,7 @@ class PositiveRecoveryTests(unittest.TestCase):
         self.assertIsNone(result[1])
         self.assertTrue(math.isnan(result[2]))
 
-    def test_no_retreat_before_recover_and_retreat_begins_on_entry(self):
+    def test_recover_keeps_heading_initialization_without_automatic_retreat(self):
         n = self.n
         n._begin_departure_clearance.assert_not_called()
         self.finish(4.)
@@ -116,7 +116,7 @@ class PositiveRecoveryTests(unittest.TestCase):
         self.assertEqual(self.n.state, W.STATE_RECOVER)
         self.assertFalse(self.n.abort_land_requested)
 
-    def test_relaxed_stability_requires_real_new_samples_and_duration(self):
+    def test_attitude_stability_uses_new_poses_not_range_or_speed_convergence(self):
         self.finish(5.)
         n = self.n
         n.recover_height_captured = True  # Isolate stability from height admission.
@@ -134,9 +134,40 @@ class PositiveRecoveryTests(unittest.TestCase):
             self.fx.fx.output(n, t, tilt=8.)
             self.assertEqual(n._simple_recovery_stability(at(t)), expected)
         self.assertEqual(n.detach_range_stable_samples, 3)
-        n.horizontal_measured = (.251, 0.)
-        self.assertFalse(n._simple_recovery_stability(at(13.51)))
+        n.horizontal_measured = (2., 0.)
+        snapshot.valid = False
+        snapshot.height = math.nan
+        n._range_control_velocity = mock.Mock(side_effect=AssertionError('range velocity used'))
+        self.assertTrue(n._simple_recovery_stability(at(13.51)))
+        self.fx.fx.feedback(n, 13.52, tilt=10.1, rate=18.)
+        self.fx.fx.output(n, 13.52, tilt=8.)
+        self.assertFalse(n._simple_recovery_stability(at(13.52)))
         self.assertFalse(n.recover_stable)
+
+    def test_attitude_handover_never_reads_range_and_resets_on_rate_excursion(self):
+        self.finish(5.)
+        n = self.n
+        n.detach_range.read_snapshot = mock.Mock(side_effect=AssertionError('range snapshot used'))
+        n._prepare_simple_recovery_velocity = mock.Mock(side_effect=AssertionError('flow required'))
+        for t, rate, expected in ((13., 18., False), (13.25, 18., False),
+                                  (13.51, 21., False), (13.6, 18., False),
+                                  (13.85, 18., False), (14.11, 18., True)):
+            self.fx.fx.feedback(n, t, tilt=8., rate=rate)
+            self.fx.fx.output(n, t, tilt=8.)
+            self.assertEqual(n._simple_recovery_stability(at(t)), expected)
+
+    def test_duplicate_and_stale_pose_cannot_fill_attitude_dwell(self):
+        self.finish(5.)
+        n = self.n
+        self.fx.fx.feedback(n, 13., tilt=8., rate=18.)
+        self.fx.fx.output(n, 13., tilt=8.)
+        self.assertFalse(n._simple_recovery_stability(at(13.)))
+        self.fx.fx.output(n, 13.2, tilt=8.)
+        self.assertFalse(n._simple_recovery_stability(at(13.2)))
+        self.assertEqual(n.detach_range_stable_samples, 1)
+        self.fx.fx.output(n, 14., tilt=8.)
+        self.assertFalse(n._simple_recovery_stability(at(14.)))
+        self.assertEqual(n.detach_range_stable_samples, 0)
 
     def test_range_pd_remains_active_in_recover_without_local_z(self):
         self.fx.frame(10.2, distance=1.)
@@ -166,7 +197,7 @@ class PositiveRecoveryTests(unittest.TestCase):
         n._prepare_simple_recovery_velocity(at(13.))
         self.assertFalse(n.horizontal_velocity_ready)
 
-    def test_retreat_uses_frozen_heading_and_bounded_hover_correction(self):
+    def test_zero_speed_uses_frozen_heading_and_bounded_hover_correction(self):
         self.finish(4.9)
         n = self.n
         n.recover_height_captured = True
@@ -180,14 +211,14 @@ class PositiveRecoveryTests(unittest.TestCase):
         n.recovery_horizontal_controller.attitude = mock.Mock(return_value=n.recover_entry_attitude)
         self.assertEqual(n._simple_recovery_attitude(at(13.)), quaternion(4.9))
         args = n.recovery_horizontal_controller.attitude.call_args
-        self.assertEqual(args.args[0], (-.05, 0.))
+        self.assertEqual(args.args[0], (0., 0.))
         self.assertFalse(args.kwargs['integrate'])
         self.assertAlmostEqual(math.degrees(args.kwargs['max_tilt']), 5.)
         n.departure_clear_confirmed = True
         n._simple_recovery_attitude(at(13.02))
         self.assertEqual(n.recovery_horizontal_controller.attitude.call_args.args[0], (0., 0.))
 
-    def test_complete_recovery_with_real_retreat_and_nonzero_motion_reaches_exit(self):
+    def test_complete_recovery_without_retreat_or_clearance_reaches_exit(self):
         from sensor_msgs.msg import Range
         from px4_wall_ceiling_control.msg import SensorHealth
         n = self.n
@@ -208,7 +239,7 @@ class PositiveRecoveryTests(unittest.TestCase):
             flow = OpticalFlowRad(distance=1., quality=100, integration_time_us=20000)
             flow.header.stamp = at(t)
             n.horizontal_flow_snapshot = (flow, at(t), '')
-            front = Range(range=.1 if i < 4 else .6, min_range=.03, max_range=40.)
+            front = Range(range=.1, min_range=.03, max_range=40.)
             front.header.stamp = at(t)
             n.front_range = front
             n.front_received_at = at(t)
@@ -220,10 +251,10 @@ class PositiveRecoveryTests(unittest.TestCase):
             saw_retreat |= n.recovery_horizontal_controller.target[0] < 0.
             if n.state == W.STATE_EXIT and n.recover_stable:
                 break
-        self.assertTrue(saw_retreat)
+        self.assertFalse(saw_retreat)
         self.assertEqual(n.state, W.STATE_EXIT)
         self.assertTrue(n.recover_stable)
-        self.assertTrue(n.departure_clear_confirmed)
+        self.assertFalse(n.departure_clear_confirmed)
         n.flight_state.mode = 'POSCTL'
         n.flight_state.header.stamp = n.flight_state_received_at = at(t+.1)
         self.fx.seconds = t+.1
@@ -349,6 +380,12 @@ class LandingManagerTests(unittest.TestCase):
 
 
 class RecoveryMarginTests(unittest.TestCase):
+    def test_attitude_only_thresholds_reject_nonfinite_and_excess(self):
+        self.assertTrue(attitude_within_margins(math.radians(10.), math.radians(20.)))
+        for tilt, rate in ((math.radians(10.01), 0.), (0., math.radians(20.01)),
+                           (math.nan, 0.), (0., math.inf)):
+            self.assertFalse(attitude_within_margins(tilt, rate))
+
     def test_nonzero_motion_within_margins_is_accepted(self):
         self.assertTrue(within_margins(math.radians(8.), math.radians(18.), .18, .23, .20))
         for index, excess in enumerate((math.radians(10.1), math.radians(20.1), .201, .251, .251)):
@@ -358,11 +395,12 @@ class RecoveryMarginTests(unittest.TestCase):
             values[index] = math.nan
             self.assertFalse(within_margins(*values))
 
-    def test_manager_uses_same_margins_and_ignores_bad_local_z(self):
+    def test_manager_uses_attitude_margins_without_height_or_speed_thresholds(self):
         fx = fixtures.RangeModeManagerTests()
         fx.setUp(); self.addCleanup(fx.doCleanups)
         n = fx.n
         n.wall.recover_attitude_locked = n.wall.recover_stable = True
+        n.odom.header.stamp = at(10.)
         n.wall.detach_range_fast_velocity_valid = True
         n.wall.detach_range_fast_velocity_mps = .23
         n.wall.detach_range_height_m = 1.06
@@ -375,5 +413,35 @@ class RecoveryMarginTests(unittest.TestCase):
         n.odom.twist.twist.angular.y = math.radians(18.)
         n._wall_horizontal_ready = mock.Mock(side_effect=AssertionError('legacy stability gate'))
         self.assertTrue(n._handover_ready(at(10.)))
+        n.wall.detach_range_valid = n.wall.detach_range_fast_velocity_valid = False
+        n.wall.detach_range_config_json = ''
+        n.wall.detach_range_height_m = n.wall.detach_range_fast_velocity_mps = math.nan
+        n.odom.twist.twist.linear.x = 2.
+        self.assertTrue(n._handover_ready(at(10.)))
+        n.odom.twist.twist.angular.y = math.radians(20.1)
+        self.assertFalse(n._handover_ready(at(10.)))
+        n.odom.twist.twist.angular.y = math.radians(18.)
         n.wall.recover_stable = False
+        self.assertFalse(n._handover_ready(at(10.)))
+
+    def test_manager_keeps_rc_estimator_fusion_and_output_safety_checks(self):
+        fx = fixtures.RangeModeManagerTests()
+        fx.setUp(); self.addCleanup(fx.doCleanups)
+        n = fx.n
+        n.wall.recover_attitude_locked = n.wall.recover_stable = True
+        n.odom.header.stamp = at(10.)
+        self.assertTrue(n._handover_ready(at(10.)))
+        n.rc_at = at(9.)
+        self.assertFalse(n._handover_ready(at(10.)))
+        n.rc_at = at(10.)
+        n.estimator.pos_horiz_rel_status_flag = False
+        self.assertFalse(n._handover_ready(at(10.)))
+        n.estimator.pos_horiz_rel_status_flag = True
+        n._wall_fusion_handover_ready = lambda now: False
+        self.assertFalse(n._handover_ready(at(10.)))
+        n._wall_fusion_handover_ready = lambda now: True
+        n.output_at = at(9.)
+        self.assertFalse(n._handover_ready(at(10.)))
+        n.output_at = at(10.)
+        n.odom.header.stamp = at(9.)
         self.assertFalse(n._handover_ready(at(10.)))
