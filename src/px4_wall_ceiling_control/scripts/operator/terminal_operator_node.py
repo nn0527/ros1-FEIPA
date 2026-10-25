@@ -2,6 +2,7 @@
 """One-shot terminal commands for a persistent attachment operator intent."""
 
 import json
+from functools import wraps
 import threading
 import time
 import rospy
@@ -9,12 +10,32 @@ from mavros_msgs.msg import State, RCIn
 from mavros_msgs.srv import ParamGet
 from std_msgs.msg import Bool, String
 
-from px4_wall_ceiling_control.msg import OperatorCommand
+from px4_wall_ceiling_control.msg import OperatorCommand, WallPerchStatus
 from px4_wall_ceiling_control.adapters.kill_switch import KillSwitchConfig
+
+from px4_wall_ceiling_control.domain.momentary_switch import MomentarySwitch
+
+
+def serialized(callback):
+    @wraps(callback)
+    def wrapped(self, *args, **kwargs):
+        lock = getattr(self, "intent_lock", None)
+        if lock is None:  # Also support legacy isolated test fixtures.
+            return callback(self, *args, **kwargs)
+        with lock:
+            return callback(self, *args, **kwargs)
+    return wrapped
 
 
 class TerminalOperatorNode:
     def __init__(self):
+        self.intent_lock = threading.RLock()
+        self.rc_wall_toggle_enabled = bool(rospy.get_param("~rc_wall_toggle_enabled", False))
+        self.rc_wall_channel_index = int(rospy.get_param("~rc_wall_channel_index", 11))
+        if self.rc_wall_channel_index < 0:
+            raise ValueError("rc_wall_channel_index must be nonnegative")
+        self.wall_status, self.wall_status_at = None, None
+        self.wall_switch = MomentarySwitch()
         self.front_sensor_masked = False
         self.front_mask_seen_offboard = False
         rospy.set_param("/attachment/front_sensor_masked", False)
@@ -33,7 +54,6 @@ class TerminalOperatorNode:
         self.request_acks = {}
         self.command_ack_pub = rospy.Publisher("/attachment/terminal_ack", String, queue_size=10)
         self.kill_pub = rospy.Publisher("/attachment/kill_switch", String, queue_size=1)
-        rospy.Subscriber("/mavros/rc/in", RCIn, self._on_rc, queue_size=1)
         self.command_pub = rospy.Publisher(
             "/operator/command", OperatorCommand, queue_size=10
         )
@@ -43,12 +63,15 @@ class TerminalOperatorNode:
         self.wall_detach_pub = rospy.Publisher(
             "/wall_perch/detach", Bool, queue_size=10
         )
+        rospy.Subscriber("/wall_perch/status", WallPerchStatus, self._on_wall_status, queue_size=1)
+        rospy.Subscriber("/mavros/rc/in", RCIn, self._on_rc, queue_size=1)
         rospy.Subscriber(
             "/attachment/terminal_command", String, self._on_command, queue_size=10
         )
         rospy.Subscriber("/mavros/state", State, self._on_state, queue_size=10)
         self.timer = rospy.Timer(rospy.Duration(0.1), self._on_timer)
 
+    @serialized
     def _on_command(self, message):
         if not message.data.lstrip().startswith("{"):
             return self._apply_command(message)  # Preserve existing terminal commands.
@@ -136,6 +159,7 @@ class TerminalOperatorNode:
         else:
             rospy.logwarn("terminal operator: use ceiling, wall, detach or cancel")
 
+    @serialized
     def _on_state(self, message):
         self.flight_at = rospy.Time.now()
         self.flight_connected, self.flight_armed = message.connected, message.armed
@@ -185,10 +209,51 @@ class TerminalOperatorNode:
         finally:
             self.kill_config_loading = False
 
+    @serialized
     def _on_rc(self, message):
         self.rc_channels, self.rc_at = tuple(message.channels), rospy.Time.now()
+        if getattr(self, "rc_wall_toggle_enabled", False):
+            now = time.monotonic()
+            pwm = (self.rc_channels[self.rc_wall_channel_index]
+                   if len(self.rc_channels) > self.rc_wall_channel_index else None)
+            if self.wall_switch.update(pwm, now):
+                self._on_wall_toggle()
         if self.kill_guard_enabled and self._kill_report().get("active"):
             self._release_intent()
+
+    @serialized
+    def _on_wall_status(self, message):
+        self.wall_status, self.wall_status_at = message, rospy.Time.now()
+        # A rejected/timed-out request can be retried by either operator input.
+        if (self.mode == OperatorCommand.MODE_WALL
+                and message.state == WallPerchStatus.STATE_WALL_HOLD
+                and not message.detach_pending and not self.detach_pulse):
+            self.detaching = False
+
+    def _on_wall_toggle(self):
+        now = rospy.Time.now()
+        fresh = lambda stamp, limit: stamp is not None and 0 <= (now-stamp).to_sec() <= limit
+        wall = self.wall_status
+        if (not self.flight_connected or not self.flight_armed
+                or not fresh(self.flight_at, 1.5) or wall is None
+                or not fresh(self.wall_status_at, 0.5)
+                or not fresh(wall.header.stamp, 0.5)):
+            rospy.logwarn("CH12 ignored: FCU must be armed and flight/wall feedback fresh")
+            return
+        if (self.mode == OperatorCommand.MODE_STANDBY and not self.detaching
+                and wall.state == WallPerchStatus.STATE_IDLE
+                and not wall.keep_ownership and not wall.fault_detected):
+            command = "wall"
+        elif (self.mode == OperatorCommand.MODE_WALL
+                and wall.state == WallPerchStatus.STATE_WALL_HOLD
+                and not self.detaching and not self.detach_pulse
+                and not wall.detach_pending and not wall.fault_detected):
+            command = "detach"
+        else:
+            rospy.loginfo("CH12 ignored during wall transition, recovery or another action")
+            return
+        rospy.loginfo("CH12 requested %s through shared terminal/web operator", command)
+        self._apply_command(String(data=command))
 
     def _kill_report(self):
         now = rospy.Time.now()
@@ -197,6 +262,7 @@ class TerminalOperatorNode:
         fresh = self.rc_at is not None and 0 <= (now - self.rc_at).to_sec() <= 0.25
         return self.kill_config.report(self.rc_channels, fresh)
 
+    @serialized
     def _on_timer(self, _event):
         if getattr(self, "kill_guard_enabled", False):
             safety = self._kill_report()

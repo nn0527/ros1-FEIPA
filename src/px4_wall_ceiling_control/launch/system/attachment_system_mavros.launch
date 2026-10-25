@@ -1,4 +1,6 @@
 <launch>
+  <arg name="rc_wall_toggle_enabled" default="false" />
+  <arg name="rc_wall_channel_index" default="11" />
   <!-- Explicit default lets rospy cache this setting instead of querying Master per log. -->
   <param name="/rosout_disable_topics_generation" value="false" />
   <!--
@@ -98,6 +100,8 @@
   <node if="$(eval arg('operator_source') == 'terminal')"
         pkg="px4_wall_ceiling_control" type="terminal_operator_node.py"
         name="terminal_operator_node" output="screen">
+    <param name="rc_wall_toggle_enabled" value="$(arg rc_wall_toggle_enabled)" />
+    <param name="rc_wall_channel_index" value="$(arg rc_wall_channel_index)" />
     <param name="kill_guard_enabled" value="$(arg kill_guard_enabled)" />
   </node>
 
