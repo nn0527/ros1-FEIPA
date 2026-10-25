@@ -242,7 +242,13 @@ class TerminalOperatorNode:
             return
         if (self.mode == OperatorCommand.MODE_STANDBY and not self.detaching
                 and wall.state == WallPerchStatus.STATE_IDLE
-                and not wall.keep_ownership and not wall.fault_detected):
+                and not wall.keep_ownership):
+            # In IDLE, fault_detected includes the expected absence of OFFBOARD.
+            # Check odometry separately; fresh, armed FCU/kill/pilot-mode checks
+            # here and the manager's preflight gates still guard acquisition.
+            if not wall.odom_fresh:
+                rospy.logwarn("CH12 wall rejected: wall odometry unavailable or stale")
+                return
             command = "wall"
         elif (self.mode == OperatorCommand.MODE_WALL
                 and wall.state == WallPerchStatus.STATE_WALL_HOLD
@@ -250,7 +256,11 @@ class TerminalOperatorNode:
                 and not wall.detach_pending and not wall.fault_detected):
             command = "detach"
         else:
-            rospy.loginfo("CH12 ignored during wall transition, recovery or another action")
+            rospy.loginfo(
+                "CH12 ignored: operator_mode=%s wall_state=%s detaching=%s "
+                "detach_pending=%s keep_ownership=%s fault_detected=%s reason=%s",
+                self.mode, wall.state, self.detaching, wall.detach_pending,
+                wall.keep_ownership, wall.fault_detected, wall.reason)
             return
         rospy.loginfo("CH12 requested %s through shared terminal/web operator", command)
         self._apply_command(String(data=command))
