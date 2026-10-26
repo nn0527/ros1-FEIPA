@@ -111,6 +111,8 @@ def serve(runtime_factory, socket_path):
             return  # A concurrent SSH connection already started the service.
         path.unlink(missing_ok=True)
         broker = SharedBridge(runtime_factory())
+        from px4_wall_ceiling_control.rc_startup import install as install_rc_startup
+        rc_startup = install_rc_startup(broker)
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         listener.bind(str(path))
         os.chmod(str(path), 0o600)

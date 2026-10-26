@@ -45,6 +45,7 @@ class TerminalOperatorNode:
         self.ceiling_status, self.ceiling_status_at = None, None
         self.wall_status, self.wall_status_at = None, None
         self.wall_switch = MomentarySwitch()
+        self.pilot_handover_request_time = rospy.Time(0)
         self.front_sensor_masked = False
         self.front_mask_seen_offboard = False
         rospy.set_param("/attachment/front_sensor_masked", False)
@@ -158,6 +159,7 @@ class TerminalOperatorNode:
                          "wall": OperatorCommand.MODE_WALL,
                          "incline": OperatorCommand.MODE_INCLINE}[command]
             self.was_offboard = False
+            self.pilot_handover_request_time = rospy.Time(0)
             if command == "ceiling":
                 self.front_sensor_masked = True
                 self.front_mask_seen_offboard = False
@@ -172,6 +174,7 @@ class TerminalOperatorNode:
             ):
                 rospy.logwarn("terminal operator: no attachment to detach")
                 return
+            self.pilot_handover_request_time = rospy.Time(0)
             self.detaching = True
             self.detach_pulse = True
             rospy.loginfo("terminal operator: detach requested")
@@ -181,6 +184,7 @@ class TerminalOperatorNode:
             self.mode = OperatorCommand.MODE_STANDBY
             self.detaching = False
             self.detach_pulse = False
+            self.pilot_handover_request_time = rospy.Time(0)
             rospy.logwarn("terminal operator: behavior cancel requested")
         else:
             rospy.logwarn("terminal operator: use ceiling, wall, incline, detach or cancel")
@@ -213,10 +217,12 @@ class TerminalOperatorNode:
             self.detaching = False
             self.detach_pulse = False
             self.was_offboard = False
+            self.pilot_handover_request_time = rospy.Time(0)
 
     def _release_intent(self):
         self.mode = OperatorCommand.MODE_STANDBY
         self.detaching = self.detach_pulse = self.was_offboard = False
+        self.pilot_handover_request_time = rospy.Time(0)
 
     def _load_kill_config(self):
         try:
@@ -281,6 +287,8 @@ class TerminalOperatorNode:
                 or not fresh(wall.header.stamp, 0.5)):
             rospy.logwarn("CH12 ignored: FCU must be armed and flight/wall feedback fresh")
             return
+        if self._request_captured_handover(now, wall):
+            return
         if (self.mode == OperatorCommand.MODE_STANDBY and not self.detaching
                 and wall.state == WallPerchStatus.STATE_IDLE
                 and not wall.keep_ownership):
@@ -306,6 +314,24 @@ class TerminalOperatorNode:
         rospy.loginfo("CH12 requested %s through shared terminal/web operator", command)
         self._apply_command(String(data=command))
 
+    def _request_captured_handover(self, now, wall):
+        if (self.mode == OperatorCommand.MODE_WALL and self.flight_mode == "OFFBOARD"
+                and wall.state in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT)
+                and wall.recover_attitude_locked and wall.keep_ownership
+                and wall.odom_fresh and not wall.fault_detected):
+            # A new edge after rotation is consent to hand over, not another
+            # detach pulse. The manager independently checks all live gates.
+            safety = self._kill_report() if self.kill_guard_enabled else {"valid": True, "active": False}
+            if not safety["valid"] or safety["active"]:
+                rospy.logwarn("CH12 handover rejected: kill switch active or unavailable")
+                return True
+            if getattr(self, "pilot_handover_request_time", rospy.Time(0)).to_sec() == 0:
+                self.pilot_handover_request_time = now
+                self._publish_intent()
+                rospy.loginfo("CH12 pilot handover requested; hold captured attitude until live POSCTL confirmation")
+            return True
+        return False
+
     def _on_attachment_toggle(self):
         now = rospy.Time.now()
         fresh = lambda stamp, limit: stamp is not None and 0 <= (now-stamp).to_sec() <= limit
@@ -317,6 +343,8 @@ class TerminalOperatorNode:
                       and fresh(wall.header.stamp, .5))
         ceiling_fresh = (ceiling is not None and fresh(self.ceiling_status_at, .5)
                          and fresh(ceiling.header.stamp, .5))
+        if wall_fresh and self._request_captured_handover(now, wall):
+            return
         command = None
         if self.mode == OperatorCommand.MODE_STANDBY and not self.detaching:
             if not (fresh(self.rc_at, .25) and self.mode_selector.selected is not None):
@@ -384,8 +412,10 @@ class TerminalOperatorNode:
             OperatorCommand.MODE_WALL,
             OperatorCommand.MODE_INCLINE,
         )
+        command.pilot_handover_request_time = getattr(self, "pilot_handover_request_time", rospy.Time(0))
         command.source = "terminal"
-        command.reason = "detach pending" if self.detaching else "terminal request"
+        command.reason = ("CH12 pilot handover requested" if command.pilot_handover_request_time.to_sec() > 0
+                          else "detach pending" if self.detaching else "terminal request")
         self.command_pub.publish(command)
 
 

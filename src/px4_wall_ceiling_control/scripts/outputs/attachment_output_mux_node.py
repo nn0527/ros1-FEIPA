@@ -990,6 +990,14 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
         return free, free
 
     def _assisted_attitude(self, now, quaternion, source, candidate=None):
+        control = self._wall_control(now, candidate) if source == AttachmentControlCandidate.SOURCE_WALL else None
+        if (control is not None and control.recover_attitude_locked
+                and control.control_phase in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT)):
+            # Sticks cannot trim the saved attitude before the explicit CH12
+            # handover. Clear old trims too; do not slew them into this hold.
+            self.rc_roll_rad = self.rc_pitch_rad = self.rc_yaw_rad = 0.0
+            self.rc_trim_at = now
+            return quaternion
         if not getattr(self, "rc_assist_enabled", False):
             return self._preflip_bias_attitude(now, quaternion, source, candidate)
         if self._calibrated_rc_axes(now, source):

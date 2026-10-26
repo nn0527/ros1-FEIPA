@@ -134,31 +134,24 @@ class RetreatTests(unittest.TestCase):
         self.assertEqual(n.state, W.STATE_RECOVER)
         self.assertFalse(n.recover_stable)
 
-    def test_baseline_levels_smoothly_even_before_fusion_restored(self):
+    def test_target_stays_captured_even_before_fusion_restored(self):
         n = self.n
         n._wall_fusion_samples_ready = lambda now: False
         n.wall_fusion_reason = 'restoring'
-        previous = n.recover_baseline_axis
+        expected = n.recover_entry_attitude
         for i in range(1, 61):
             t = 13.+i*.02
             self.frame(t)
-            q = n._simple_recovery_attitude(at(t))
-            axis = rotate_vector(q, (0., 0., 1.))
-            step = math.acos(max(-1., min(1., sum(a*b for a,b in zip(axis, previous)))))
-            self.assertLessEqual(step, math.radians(.201))
-            previous = axis
-        self.assertAlmostEqual(previous[2], 1., places=8)
+            self.assertEqual(n._simple_recovery_attitude(at(t)), expected)
         self.assertFalse(n.horizontal_velocity_active)
 
-    def test_after_blend_has_zero_target_and_preserves_hover_correction_limits(self):
+    def test_no_baseline_blend_or_velocity_correction_during_wait(self):
         n = self.n
+        expected = n.recover_entry_attitude
         for i in range(1, 61):
             t = 13.+i*.02
             self.frame(t)
-            q = n._simple_recovery_attitude(at(t))
-        axis = rotate_vector(q, (0., 0., 1.))
-        self.assertAlmostEqual(axis[0], 0.)
-        self.assertLessEqual(math.acos(axis[2]), math.radians(5.))
+            self.assertEqual(n._simple_recovery_attitude(at(t)), expected)
         self.assertEqual(n.recovery_horizontal_controller.target, (0., 0.))
 
     def test_missing_trusted_baseline_or_high_rate_cannot_command_retreat(self):

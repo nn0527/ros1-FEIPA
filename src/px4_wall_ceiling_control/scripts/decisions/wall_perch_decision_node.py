@@ -2184,7 +2184,7 @@ class WallPerchDecisionNode(InclineAttachmentMixin, WallSimpleRecoveryMixin, Wal
             )
             if self._range_locked():
                 if self._range_stability_ready(now):
-                    reason = ('姿态稳定，准备交回POSCTL（无自动后退）' if self._locked_recovery()
+                    reason = ('姿态稳定，保持翻转结束姿态，等待CH12确认交回（无自动后退）' if self._locked_recovery()
                               else '测距闭环稳定，准备交回POSCTL')
                     self._enter_state(WallPerchStatus.STATE_EXIT, now, reason)
                 return

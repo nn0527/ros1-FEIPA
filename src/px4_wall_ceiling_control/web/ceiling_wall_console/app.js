@@ -132,7 +132,7 @@ function paint(s){
   text("repairMavros",s.mavros_repair?.state==="RUNNING"?"正在重启 MAVROS…":"重启 MAVROS（地面恢复）");
   text("repairStatus",m.repairReason||(s.mavros_repair&&s.mavros_repair.state!=="IDLE"?s.mavros_repair.reason:"先确认落地、上锁且电机停止；自动清理旧控制、雷达和日志，再重启 MAVROS。成功后手动启动基础链路。"));
   $("start").disabled=!v.canStart;$("attach").disabled=!v.canAttach;$("detach").disabled=!v.canDetach;
-  $("stop").disabled=!m.canStop;$("stop").title=m.stopReason;text("stopStatus",m.stopReason||"落地上锁后可停止；飞控反馈过期时需人工确认电机已停止。");
+  $("stop").disabled=!m.canStop;$("stop").title=m.stopReason;text("stopStatus",m.stopReason||(fresh(s,"runtime")?.rc_startup_enabled?"落地上锁后停止控制、雷达和记录，保留遥控启动监听；可直接拨杆重新启动。":"落地上锁后可停止；飞控反馈过期时需人工确认电机已停止。"));
   $("inclineAction").disabled=busy || !s.session?.control || !s.session?.feedback_live || !s.can_incline;
   const incline=fresh(s,"wall");
   text("inclineReason",incline?.incline_active?"斜墙："+incline.incline_phase+" · "+incline.reason:(s.incline_blockers||[]).join("；")||"斜墙已就绪");
@@ -231,7 +231,7 @@ $("repairMavros").addEventListener("click",()=>{if(!latest||!maintenanceView(lat
 $("start").addEventListener("click",()=>{if(!latest||!view(latest,busy).canStart||!form.reportValidity())return;const data=Object.fromEntries(new FormData(form));data.baud=Number(data.baud);data.hover_thrust=Number(data.hover_thrust);data.detach_range_manual_target_m=Number(data.detach_range_manual_target_m);action("/api/start",data);});
 $("attach").addEventListener("click",()=>{if(latest&&view(latest,busy).canAttach){wasDetaching=false;action("/api/ceiling");}});
 $("detach").addEventListener("click",()=>{if(latest&&view(latest,busy).canDetach)action("/api/ceiling-detach");});
-$("stop").addEventListener("click",()=>{if(confirm("确认飞机已落地且电机已停止？将停止控制、MAVROS、雷达和日志。"))action("/api/stop",{grounded_confirmed:true});});
+$("stop").addEventListener("click",()=>{const detail=fresh(latest,"runtime")?.rc_startup_enabled?"将停止控制、雷达和记录，保留遥控启动监听，可直接拨杆重新启动。":"将停止控制、MAVROS、雷达和日志。";if(confirm("确认飞机已落地且电机已停止？"+detail))action("/api/stop",{grounded_confirmed:true});});
 form.addEventListener("submit",event=>event.preventDefault());
 async function poll(){
   if(polling)return;polling=true;
