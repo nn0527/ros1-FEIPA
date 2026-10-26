@@ -27,3 +27,7 @@ for(const mutate of [s=>s.ssh.connected=false,s=>s.session.feedback_live=false,s
 s=state({state_name:'NORMAL_FLIGHT'});s.status.owner.value=2;s.status.operator.value.mode=3;
 for(const phase of ['PRESTREAM','ENTERING','RETURNING','LOCKED']){s.status.phase.value=phase;assert.equal(view(s).stage,'顶吸待命');}
 console.log('Ceiling progress, stale feedback and task isolation checks passed');
+
+s=state({state_name:'DETACH',height_source:'px4_fused_hold_relative',height_feedback_valid:true,height_reference_ready:true,descended_height_m:.51,detach_height_ready:true,baro_fresh:false,baro_reference_ready:false});
+assert.match(ceilingDetailView(s).descent,/PX4融合下降 0.510/);assert.match(ceilingDetailView(s).descent,/下降准入已达标/);assert.match(ceilingDetailView(s).descent,/气压对照 未就绪/);
+s.status.ceiling_status.value.height_feedback_valid=false;assert.match(ceilingDetailView(s).descent,/不回退气压/);

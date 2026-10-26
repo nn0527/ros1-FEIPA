@@ -73,6 +73,7 @@ class CeilingMotionLifecycleTests(unittest.TestCase):
             '~contact_distance_m': .056, '~target_compression_m': .006,
             '~attach_thrust_multiplier': 1.11, '~detach_drop_m': .50,
             '~detach_timeout_s': 20.}
+        params.update(getattr(self, "extra_params", {}))
         with mock.patch.object(rospy, 'get_param', side_effect=lambda k, d=None: params.get(k, d)), \
              mock.patch.object(rospy, 'Publisher'), mock.patch.object(rospy, 'Subscriber'), mock.patch.object(rospy, 'Timer'):
             self.n = CeilingDecision()
@@ -84,10 +85,11 @@ class CeilingMotionLifecycleTests(unittest.TestCase):
         self.n._on_operator(OperatorCommand(mode=OperatorCommand.MODE_CEILING, enable_control=True))
 
     def feed(self, dt=.10, distance=.5, x=0., y=0., vx=0., vz=0., drop=0., thrust=.53,
-             flow=True, state=True, tilt=0., rate=0., estimator=True):
+             flow=True, state=True, tilt=0., rate=0., estimator=True,
+             pressure_drop=None, baro=True, vertical_position=True, flow_distance=2., frame="map"):
         self.clock += dt
         now = rospy.Time.now()
-        odom = Odometry(); odom.header.stamp = now
+        odom = Odometry(); odom.header.stamp = now; odom.header.frame_id = frame
         odom.pose.pose.orientation = Quaternion(*attitude_from_axis_yaw((math.sin(tilt), 0., math.cos(tilt)), 0.))
         odom.pose.pose.position.x = x; odom.pose.pose.position.y = y
         odom.pose.pose.position.z = 2.-drop
@@ -96,10 +98,10 @@ class CeilingMotionLifecycleTests(unittest.TestCase):
         self.n._on_odom(odom)
         if estimator:
             e = EstimatorStatus(attitude_status_flag=True, velocity_horiz_status_flag=True,
-                velocity_vert_status_flag=True, pos_horiz_rel_status_flag=True)
+                velocity_vert_status_flag=True, pos_horiz_rel_status_flag=True, pos_vert_abs_status_flag=vertical_position)
             e.header.stamp = now; self.n._on_ceiling_estimator(e)
         if flow:
-            f = OpticalFlowRad(quality=100, integration_time_us=100000, distance=2.)
+            f = OpticalFlowRad(quality=100, integration_time_us=100000, distance=flow_distance)
             f.header.stamp = now; self.n._on_ceiling_flow(f)
         if self.mode == 'POSCTL':
             target = AttitudeTarget(thrust=thrust, orientation=Quaternion(w=1.))
@@ -109,9 +111,10 @@ class CeilingMotionLifecycleTests(unittest.TestCase):
             self.n._on_state(st)
         self.n._on_range(Range(range=distance, min_range=.03, max_range=40.))
         self.n._on_operator(OperatorCommand(mode=OperatorCommand.MODE_CEILING, enable_control=True))
-        pressure = self.reference_pressure*(1.+drop/44330.)**(1./.190294957)
-        baro = FluidPressure(fluid_pressure=pressure); baro.header.stamp=now
-        self.n._on_pressure(baro)
+        pressure = self.reference_pressure*(1.+(drop if pressure_drop is None else pressure_drop)/44330.)**(1./.190294957)
+        if baro:
+            message = FluidPressure(fluid_pressure=pressure); message.header.stamp=now
+            self.n._on_pressure(message)
         self.n._on_timer(None)
         return self.n.status_publisher.publish.call_args.args[0]
 

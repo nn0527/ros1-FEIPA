@@ -205,6 +205,7 @@ class ConsoleState:
                 and ceiling.get("state_name") == "SURFACE_HOLD" and not ceiling.get("fault_detected")
                 and ceiling.get("odom_fresh")
                 and (ceiling.get("height_source") != "barometer_hold_relative" or (ceiling.get("baro_fresh") and ceiling.get("baro_reference_ready")))
+                and (ceiling.get("height_source") != "px4_fused_hold_relative" or (ceiling.get("height_feedback_valid") and ceiling.get("height_reference_ready")))
                 and val("phase") == "ACTIVE" and val("owner") == 1
                 and val("operator", {}).get("mode") == 2 and val("operator", {}).get("enabled")
                 and status["setpoint"]["fresh"]

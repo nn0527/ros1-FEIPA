@@ -60,8 +60,9 @@
   <param if="$(eval arg('detach_range_min_distance_m') != '')" name="/wall_perch_decision_node/detach_range_min_distance_m" value="$(arg detach_range_min_distance_m)" />
   <param if="$(eval arg('detach_range_max_distance_m') != '')" name="/wall_perch_decision_node/detach_range_max_distance_m" value="$(arg detach_range_max_distance_m)" />
   <param if="$(eval arg('detach_range_geometry_confirmed') != '')" name="/wall_perch_decision_node/detach_range_geometry_confirmed" value="$(arg detach_range_geometry_confirmed)" />
-  <param name="/ceiling_attachment_decision_node/detach_baro_height_enabled" value="true" />
-  <param name="/flight_mode_manager_node/ceiling_baro_handover_enabled" value="true" />
+  <param name="/ceiling_attachment_decision_node/detach_fused_height_enabled" value="true" />
+  <param name="/ceiling_attachment_decision_node/detach_baro_height_enabled" value="false" />
+  <param name="/flight_mode_manager_node/ceiling_height_handover_enabled" value="true" />
   <param name="/attachment/front_sensor_masked" value="false" />
   <param name="/flight_mode_manager_node/ceiling_distance_gate_enabled" value="true" />
   <param name="/flight_mode_manager_node/wall_pilot_mode" value="POSCTL" />

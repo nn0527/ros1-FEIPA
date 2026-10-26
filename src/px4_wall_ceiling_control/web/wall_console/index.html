@@ -14,7 +14,7 @@
 <div class="actions"><button id="ceilingAction" class="wall" disabled><strong>一键贴顶</strong></button><button id="ceilingDetach" class="wall" disabled><strong>一键离顶</strong></button></div>
 <p id="ceilingRequestState" role="status">吸顶请求：尚未发送</p>
 <p id="ceilingBlockReason" class="errorText" role="status"></p><p id="ceilingStage" role="status">吸顶：等待反馈</p>
-<p class="configHelp">飞手先在 POSCTL 下稳定飞行，再点击吸顶。一帧有效顶距≤1 m、光流和融合位置速度有效、平衡基准稳定后申请OFFBOARD；冻结位置、航向及悬停支撑推力，以0.15 m/s向上接近并小幅修正水平漂移。收到一帧有效顶距≤6.7 cm直接进入保持，推力0.50。离顶按保持时气压基准先确认下降≥0.50 m，再进入恢复悬停，下降量允许在0.45～0.55 m内波动；高度、速度和姿态持续稳定0.50秒后锁定姿态，维持高度闭环；第三次CH12确认后再请求POSCTL，以实际模式反馈确认交接。顶部雷达异常时接近暂停、保持维持0.50推力；水平反馈丢失或姿态运动超限时暂停竖直运动，持续异常锁存故障。从点击吸顶起屏蔽前部雷达控制输入，确认交回POSCTL后恢复；期间禁止侧吸。目标限制不保证实际漂移或姿态绝不超限。</p>
+<p class="configHelp">飞手先在 POSCTL 下稳定飞行，再点击吸顶。一帧有效顶距≤1 m、光流和融合位置速度有效、平衡基准稳定后申请OFFBOARD；冻结位置、航向及悬停支撑推力，以0.15 m/s向上接近并小幅修正水平漂移。收到一帧有效顶距≤6.7 cm直接进入保持，推力0.50。离顶按保持时的PX4融合高度基准先确认下降≥0.50 m，再进入恢复悬停，下降量允许在0.45～0.55 m内波动；高度、速度和姿态持续稳定0.50秒后锁定姿态，维持高度闭环；第三次CH12确认后再请求POSCTL，以实际模式反馈确认交接。顶部雷达异常时接近暂停、保持维持0.50推力；水平反馈丢失或姿态运动超限时暂停竖直运动，持续异常锁存故障。从点击吸顶起屏蔽前部雷达控制输入，确认交回POSCTL后恢复；期间禁止侧吸。目标限制不保证实际漂移或姿态绝不超限。</p>
 
 <button id="rcTakeover" class="wall" disabled>一键遥控器接管</button><p id="rcTakeoverStatus" role="status"></p><p class="configHelp">支持 ABORT：从当前姿态平滑跟随摇杆，完成后交回原 ALTCTL / POSCTL。接管接受后不恢复旧吸附任务。</p>
 <button id="stop" class="stopProcess" disabled>终止现有进程</button><p class="configHelp">停止试验控制、MAVROS、雷达与日志记录后可重新启动。请先落地并停止电机；此按钮不代替遥控器急停。</p>

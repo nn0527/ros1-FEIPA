@@ -46,11 +46,16 @@ class ConsoleTests(unittest.TestCase):
         message.rc_manual_feedback_ready = True
         message.rc_manual_active = True
         message.rc_position_weight = .25
+        message.height_feedback_valid = message.height_reference_ready = True
+        message.fused_height_m = 1.5
+        message.baro_descended_height_m = .3
         runtime.callback(message, "ceiling_status")
         item = self.state.snapshot()["status"]["ceiling_status"]
         self.assertTrue(item["fresh"])
         self.assertTrue(item["value"]["rc_manual_active"])
         self.assertEqual(item["value"]["rc_position_weight"], .25)
+        self.assertTrue(item["value"]["height_feedback_valid"])
+        self.assertEqual(item["value"]["fused_height_m"], 1.5)
         self.now += .51
         self.assertFalse(self.state.snapshot()["status"]["ceiling_status"]["fresh"])
 
@@ -582,6 +587,22 @@ class ConsoleTests(unittest.TestCase):
         self.publisher.assert_called_once_with("detach")
         self.state.update("owner", 2)
         self.assertFalse(self.state.snapshot()["can_ceiling_detach"])
+
+    def test_fused_detach_requires_selected_height_but_not_auxiliary_pressure(self):
+        self.ceiling_ready()
+        self.state.update("setpoint", {"thrust":.5})
+        self.state.update("state", {"connected":True,"armed":True,"mode":"OFFBOARD"})
+        self.state.update("phase","ACTIVE");self.state.update("owner",1)
+        self.state.update("operator",{"mode":2,"enabled":True})
+        value={"state_name":"SURFACE_HOLD","reason":"hold","odom_fresh":True,
+            "height_source":"px4_fused_hold_relative","height_feedback_valid":True,"height_reference_ready":True,
+            "baro_fresh":False,"baro_reference_ready":False}
+        self.state.update("ceiling_status",value)
+        self.assertTrue(self.state.snapshot()["can_ceiling_detach"])
+        for key in ('height_feedback_valid','height_reference_ready'):
+            value[key]=False;self.state.update("ceiling_status",value)
+            self.assertFalse(self.state.snapshot()["can_ceiling_detach"])
+            value[key]=True
 
     def test_baro_detach_requires_fresh_pressure_reference_without_top_range(self):
         self.ceiling_ready()

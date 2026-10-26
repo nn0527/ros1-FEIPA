@@ -31,10 +31,12 @@ function view(s,busy=false){
   if(!live)detachReason="实时反馈未连接";
   else if(!control)detachReason="请先申请控制权";
   else if(!complete)detachReason="脱离所需反馈缺失或过期";
+  else if(ceiling?.height_source==="px4_fused_hold_relative" && (!ceiling.height_feedback_valid||!ceiling.height_reference_ready))detachReason="融合高度、测距有效性或保持参考未就绪";
   else if(ceiling?.height_source==="barometer_hold_relative" && (!ceiling.baro_fresh||!ceiling.baro_reference_ready))detachReason="气压数据或保持高度参考未就绪";
   else if(s.can_ceiling_detach)detachReason="脱离入口已就绪";
   const canAttach=control && complete && !busy && !!s.can_ceiling;
-  const canDetach=control && complete && !!fresh(s,"setpoint") && !busy && !!s.can_ceiling_detach;
+  const selectedHeightReady=ceiling?.height_source==="px4_fused_hold_relative"?ceiling.height_feedback_valid&&ceiling.height_reference_ready:ceiling?.height_source==="barometer_hold_relative"?ceiling.baro_fresh&&ceiling.baro_reference_ready:true;
+  const canDetach=control && complete && selectedHeightReady && !!fresh(s,"setpoint") && !busy && !!s.can_ceiling_detach;
   const canRepair=maintenanceView(s,busy).canRepair;
   return {live,control,runtime,state,ceiling,phase,owner,kill,ceilingSelected,enabled,editable,canStart:editable,canRepair,canAttach,canDetach,reasons,detachReason,stage,reason,step};
 }
@@ -51,7 +53,10 @@ function ceilingDetailView(s){
   if(c.abort_land_requested)hold=state?.mode==="AUTO.LAND"?"飞控已确认 AUTO.LAND":"保持超时中止；正在请求 AUTO.LAND，尚未确认";
   let descent="尚未进入脱离下降";
   if(["DETACH","RECOVERY_HOVER"].includes(c.state_name)){
-    descent=c.baro_fresh&&c.baro_reference_ready?"气压下降 "+number(c.descended_height_m,3)+" m / 0.50 m；"+(c.detach_height_ready?"下降准入已达标":"等待下降达标"):"气压或保持参考无效，无法确认下降达标";
+    const fused=c.height_source==="px4_fused_hold_relative";
+    const valid=fused?c.height_feedback_valid&&c.height_reference_ready:c.baro_fresh&&c.baro_reference_ready;
+    descent=valid?(fused?"PX4融合下降 ":"气压下降 ")+number(c.descended_height_m,3)+" m / 0.50 m；"+(c.detach_height_ready?"下降准入已达标":"等待下降达标"):(fused?"融合高度/测距或保持参考无效，不回退气压判定":"气压或保持参考无效，无法确认下降达标");
+    if(fused)descent+="；气压对照 "+(c.baro_fresh&&c.baro_reference_ready?number(c.baro_descended_height_m,3)+" m":"未就绪");
   }
   let manual="等待协调字段；需同版本节点及反馈链路";
   if(c.rc_manual_coordination_enabled===false)manual="当前节点未启用人工/自动协调";
@@ -189,7 +194,7 @@ function paint(s){
   const detail=ceilingDetailView(s);
   text("ceilingHold",detail.hold);text("ceilingDescent",detail.descent);text("ceilingManual",detail.manual);text("ceilingRecovery",detail.recovery);
   const cm=v.live?v.ceiling:null;
-  text("ceilingMotion",cm?.motion_control_enabled?"水平漂移 "+n(cm.horizontal_drift_m)+" m；水平速度 "+n(cm.horizontal_speed_mps)+" m/s；实测倾角 "+n(cm.actual_tilt_deg)+"°；角速度 "+n(cm.actual_body_rate_deg_s)+"°/s；"+(cm.motion_paused?"竖直运动暂停；":"")+(cm.motion_reason||""):"水平稳定控制：等待反馈");
+  text("ceilingMotion",cm?.motion_control_enabled?"水平漂移 "+n(cm.horizontal_drift_m)+" m；水平速度 "+n(cm.horizontal_speed_mps)+" m/s；实测倾角 "+n(cm.actual_tilt_deg)+"°；角速度 "+n(cm.actual_body_rate_deg_s)+"°/s；"+(cm.motion_paused?"竖直运动暂停；":"")+(cm.motion_reason||"")+(cm.height_source==="px4_fused_hold_relative"?"；融合高度 "+n(cm.fused_height_m)+" m；融合竖速 "+n(cm.fused_vertical_speed_mps)+" m/s；气压仅辅助对照":""):"水平稳定控制：等待反馈");
   text("receipt","顶吸回执："+(s.ceiling_request?.reason||"尚未发送")+(!v.live?"（历史回执）":""));
   document.querySelectorAll("#ceilingSteps li").forEach((el,i)=>el.classList.toggle("current",v.live&&i===(stage==="已交还遥控"?6:v.step)));
   const hw=w.wall;
@@ -227,7 +232,7 @@ function paint(s){
   text("pitch",n(angles?.[1],1));text("roll",n(angles?.[0],1));text("yaw",n(angles?.[2],1));
   text("mode",state?.mode||"—");text("armed",state?(state.armed?"已解锁":"未解锁"):"—");
   text("battery",v.live?n(fresh(s,"battery")?.voltage,1):"—");text("owner",v.live?({0:"无",1:"顶吸",2:"侧吸"}[v.owner]||"—"):"—");
-  text("baro",!c?"—":c.baro_fresh&&c.baro_reference_ready?"有效":c.height_source==="barometer_hold_relative"?"未就绪":"当前未使用");
+  text("baro",!c?"—":c.height_source==="px4_fused_hold_relative"?"PX4融合 · "+(c.height_feedback_valid&&c.height_reference_ready?"有效":"等待有效反馈/保持基准"):c.baro_fresh&&c.baro_reference_ready?"气压 · 有效":"气压 · 未就绪");
   text("kill",!v.live||!v.kill?.valid?"急停配置或反馈无效／过期":v.kill.active?"急停已触发 · 第 "+v.kill.channel+" 通道":v.kill.channel?"急停未触发 · 第 "+v.kill.channel+" 通道":"飞控未配置遥控急停通道");
   text("recording",v.live&&v.runtime?v.runtime.logger?"日志录制中":"日志未录制":"日志状态未知");
   const reasons=v.canAttach?["顶吸入口已就绪"]:v.reasons.length?v.reasons:["等待顶吸入口条件满足"];

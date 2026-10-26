@@ -10,6 +10,7 @@ from px4_wall_ceiling_control.domain.recovery_attitude_limits import (
 
 @dataclass(frozen=True)
 class CeilingMotionSettings:
+    odom_vertical_jump_m: float = .25
     horizontal_position_deadband_m: float = .10
     horizontal_position_kp: float = .30
     rc_manual_position_weight: float = .25

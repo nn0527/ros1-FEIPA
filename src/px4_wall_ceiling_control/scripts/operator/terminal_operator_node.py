@@ -322,7 +322,9 @@ class TerminalOperatorNode:
         if not (self.mode == OperatorCommand.MODE_CEILING and c is not None
                 and c.state == CeilingAttachmentStatus.STATE_RECOVERY_HOVER
                 and c.recovery_attitude_locked and c.recovery_ready and c.keep_ownership
-                and c.odom_fresh and c.baro_fresh and c.baro_reference_ready and c.detach_height_ready
+                and c.odom_fresh and c.detach_height_ready
+                and ((c.height_feedback_valid and c.height_reference_ready)
+                     if c.height_source == 'px4_fused_hold_relative' else c.baro_fresh and c.baro_reference_ready)
                 and not c.fault_detected and not c.detach_failed
                 and self.flight_connected and self.flight_armed and self.flight_mode == 'OFFBOARD'
                 and fresh(self.flight_at, 1.5) and fresh(getattr(self, 'ceiling_status_at', None), .5)

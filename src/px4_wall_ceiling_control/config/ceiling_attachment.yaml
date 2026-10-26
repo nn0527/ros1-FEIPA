@@ -121,6 +121,8 @@ ceiling_attachment_decision_node:
 
   # POSCTL capture and free-flight stabilization (ENU). Limits are initial values.
   motion_control_enabled: true
+  detach_fused_height_enabled: true
+  odom_vertical_jump_m: 0.25
   rc_manual_coordination_enabled: true
   rc_manual_position_weight: 0.25
   rc_manual_blend_s: 0.50

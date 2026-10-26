@@ -86,3 +86,11 @@ float32 rc_position_weight
 # Stable recovery attitude is held until a later CH12 handover confirmation.
 bool recovery_attitude_locked
 time recovery_lock_time
+
+# Selected fused height feedback and independent pressure comparison.
+bool height_feedback_valid
+bool height_reference_ready
+float32 fused_height_m
+float32 hold_fused_height_m
+float32 fused_vertical_speed_mps
+float32 baro_descended_height_m

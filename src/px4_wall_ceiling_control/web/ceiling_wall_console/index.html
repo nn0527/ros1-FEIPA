@@ -14,7 +14,7 @@
 <div><label>俯仰 · Pitch</label><strong id="pitch">—</strong><small>°</small></div>
 <div><label>翻滚 · Roll</label><strong id="roll">—</strong><small>°</small></div>
 <div><label>偏航 · Yaw</label><strong id="yaw">—</strong><small>°</small></div>
-</div><p class="muted">实时测量姿态 · 单位为度，反馈过期时显示 —</p><div class="metrics"><span>飞控模式 <b id="mode">—</b></span><span>解锁状态 <b id="armed">—</b></span><span>电池 <b id="battery">—</b> V</span><span>输出归属 <b id="owner">—</b></span><span>气压参考 <b id="baro">—</b></span></div><p id="kill" class="muted">急停反馈未知</p></section>
+</div><p class="muted">实时测量姿态 · 单位为度，反馈过期时显示 —</p><div class="metrics"><span>飞控模式 <b id="mode">—</b></span><span>解锁状态 <b id="armed">—</b></span><span>电池 <b id="battery">—</b> V</span><span>输出归属 <b id="owner">—</b></span><span>高度反馈 <b id="baro">—</b></span></div><p id="kill" class="muted">急停反馈未知</p></section>
 </div>
 
 </section>
@@ -32,12 +32,12 @@
 </section>
 <div class="taskStatusGrid" aria-label="顶吸实时进度">
 <div><label>吸附保持</label><strong id="ceilingHold">等待保持反馈</strong></div>
-<div><label>脱离高度</label><strong id="ceilingDescent">等待气压反馈</strong></div>
+<div><label>脱离高度</label><strong id="ceilingDescent">等待融合高度反馈</strong></div>
 <div><label>控制反馈</label><strong id="ceilingManual">等待协调反馈</strong></div>
 <div><label>恢复与交回</label><strong id="ceilingRecovery">等待恢复反馈</strong></div>
 </div>
 <p id="ceilingMotion" class="muted taskDiagnostic" role="status">水平稳定控制：等待反馈</p>
-<details class="taskDetails"><summary>顶吸流程与遥控操作说明</summary><p>CH8 上拨选顶吸，CH12 第一次启动、保持时第二次请求脱离，也可使用上方按钮。有效原始顶距单帧≤1.00 m满足距离准入，单帧≤6.7 cm进入保持；还须满足估计器、平衡基准和控制权检查。保持推力目标0.50，超过5秒未开始脱离则请求 AUTO.LAND，以飞控实际模式确认。</p><p>脱离先请求机构释放，以保持气压为基准确认下降≥0.50 m，再在下降量0.45～0.55 m等恢复条件内稳定。允许阶段摇杆可微调横滚/俯仰：人工修正时减弱位置回拉、暂停积分；回中后平滑恢复。恢复交回还需本轮遥控反馈有效、微调消退和位置权重恢复。恢复稳定后锁定姿态、高度闭环继续；第三次 CH12 确认后才请求交回，最终以飞控 POSCTL 及控制权释放确认完成。</p></details>
+<details class="taskDetails"><summary>顶吸流程与遥控操作说明</summary><p>CH8 上拨选顶吸，CH12 第一次启动、保持时第二次请求脱离，也可使用上方按钮。有效原始顶距单帧≤1.00 m满足距离准入，单帧≤6.7 cm进入保持；还须满足估计器、平衡基准和控制权检查。保持推力目标0.50，超过5秒未开始脱离则请求 AUTO.LAND，以飞控实际模式确认。</p><p>脱离先请求机构释放，以保持时的PX4融合高度为基准确认下降≥0.50 m，再在下降量0.45～0.55 m等恢复条件内稳定。高度与竖直速度采用 PX4 融合里程计，测距参与有效性检查，气压仅作辅助对照，不作为正常达标门槛。允许阶段摇杆可微调横滚/俯仰：人工修正时减弱位置回拉、暂停积分；回中后平滑恢复。恢复交回还需本轮遥控反馈有效、微调消退和位置权重恢复。恢复稳定后锁定姿态、高度闭环继续；第三次 CH12 确认后才请求交回，最终以飞控 POSCTL 及控制权释放确认完成。</p></details>
 </section>
 <section class="panel wallOperations taskPanel" aria-label="侧吸吸附与脱离操作">
 <div class="sectionHeading taskHeading"><h2>侧吸 / 吸附与脱离</h2><span class="badge">POSCTL 入口与交回</span></div>

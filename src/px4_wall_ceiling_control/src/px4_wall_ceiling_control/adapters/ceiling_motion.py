@@ -201,6 +201,9 @@ class CeilingMotionMixin:
             old_yaw = euler_from_quaternion(tuple(getattr(previous.pose.pose.orientation, k) for k in "xyzw"))[2]
             yaw = euler_from_quaternion(tuple(getattr(message.pose.pose.orientation, k) for k in "xyzw"))[2]
             yaw_jump = abs(math.atan2(math.sin(yaw-old_yaw), math.cos(yaw-old_yaw)))
+            if (self._fused_height_enabled()
+                    and abs(b.z-a.z) > self.motion_settings.odom_vertical_jump_m + abs(velocity[2])*max(0., interval)):
+                self.motion_fatal = '融合高度跳变：本轮锁存故障，禁止将估计重置视为离顶下降'
             if (jump > self.motion_settings.odom_position_jump_m + math.hypot(*velocity[:2])*max(0., interval)
                     or yaw_jump > math.radians(self.motion_settings.odom_yaw_jump_deg)):
                 self.motion_fatal = '位置或航向估计跳变：本轮锁存故障，禁止追赶旧参考点'
@@ -258,6 +261,12 @@ class CeilingMotionMixin:
             return '估计器反馈无效或过期'
         if self.motion_estimator_error:
             return self.motion_estimator_error
+        if self._fused_height_enabled():
+            frame = self.odom.header.frame_id.strip('/').rsplit('/', 1)[-1].lower()
+            if frame not in ('map', 'odom', 'world', 'local_origin', 'map_enu', 'odom_enu', 'enu'):
+                return '融合高度坐标系不是已知ENU本地坐标系'
+            if not e.pos_vert_abs_status_flag:
+                return '本地竖直位置估计未有效'
         if not (e.attitude_status_flag and e.velocity_horiz_status_flag and e.velocity_vert_status_flag
                 and (e.pos_horiz_rel_status_flag or e.pos_horiz_abs_status_flag)) or e.const_pos_mode_status_flag:
             return '位置或速度估计未有效'
@@ -304,6 +313,8 @@ class CeilingMotionMixin:
         if self.motion_controller.xy is not None:
             self._update_ceiling_pause(now)
         self._update_ceiling_manual(now)
+        if self.state == S.STATE_SURFACE_HOLD:
+            self._capture_fused_height_reference(now)
 
     def _update_ceiling_pause(self, now):
         s = self.motion_settings
@@ -363,10 +374,11 @@ class CeilingMotionMixin:
         self.motion_recovery_lock_time = rospy.Time(0)
         self.motion_recovery_since = self.motion_recovery_last = None
         if new_state == S.STATE_DETACH:
+            self._capture_fused_height_reference(now)
             self.motion_contact_released = False
             self.motion_release_since = self.motion_release_last = self.motion_release_stamp = None
             # A failed attachment has no HOLD reference: establish a separate abort-descent reference.
-            if self._baro_enabled() and self.hold_pressure_pa is None and self._baro_fresh(now):
+            if self._height_handover_enabled() and self.hold_pressure_pa is None and self._baro_fresh(now):
                 self.hold_pressure_pa = self.baro_pressure_pa
         elif new_state == S.STATE_RECOVERY_HOVER:
             self.motion_recovery_height = (self.detach_start_height_m-self.detach_drop_m

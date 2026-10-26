@@ -70,7 +70,7 @@ class FlightModeManagerNode(RCTakeoverManager):
         self.operator_timeout_s = float(rospy.get_param("~operator_timeout_s", 0.5))
         self.sensor_timeout_s = float(rospy.get_param("~sensor_timeout_s", 0.5))
         self.wall_manual_approach = bool(rospy.get_param("~wall_manual_approach", False))
-        self.ceiling_baro_handover_enabled = bool(rospy.get_param("~ceiling_baro_handover_enabled", False))
+        self.ceiling_baro_handover_enabled = bool(rospy.get_param("~ceiling_height_handover_enabled", rospy.get_param("~ceiling_baro_handover_enabled", False)))
         self.ceiling_motion_enabled = bool(rospy.get_param("/ceiling_attachment_decision_node/motion_control_enabled", False))
         self.ceiling_distance_gate_enabled = bool(rospy.get_param("~ceiling_distance_gate_enabled", False))
         self.wall_pilot_mode = str(rospy.get_param("~wall_pilot_mode", "ALTCTL")).upper()
@@ -873,8 +873,12 @@ class FlightModeManagerNode(RCTakeoverManager):
                     and (not getattr(self, "ceiling_motion_enabled", False) or (
                         status.motion_control_enabled and status.motion_ready and not status.motion_paused
                         and is_fresh_source(status.header.stamp, self.status_timeout_s, now, future_tolerance_s=0.)))
-                    and status.detach_height_ready and status.baro_fresh
-                    and status.baro_reference_ready and not status.detach_failed
+                    and status.detach_height_ready
+                    and ((status.height_feedback_valid and status.height_reference_ready
+                          and self.estimator is not None and self.estimator.pos_vert_abs_status_flag)
+                         if status.height_source == 'px4_fused_hold_relative'
+                         else status.baro_fresh and status.baro_reference_ready)
+                    and not status.detach_failed
                     and not status.fault_detected)
 
     def _ceiling_approach_timeout_requested(self, now):
