@@ -82,3 +82,7 @@ bool rc_manual_coordination_enabled
 bool rc_manual_feedback_ready
 bool rc_manual_active
 float32 rc_position_weight
+
+# Stable recovery attitude is held until a later CH12 handover confirmation.
+bool recovery_attitude_locked
+time recovery_lock_time

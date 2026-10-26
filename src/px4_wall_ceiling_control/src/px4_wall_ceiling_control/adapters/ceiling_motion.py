@@ -53,6 +53,8 @@ class CeilingMotionMixin:
         self.motion_fatal = ''
         self.motion_contact_unsafe = False
         self.motion_recovery_ready = False
+        self.motion_recovery_attitude = None
+        self.motion_recovery_lock_time = rospy.Time(0)
         self.motion_recovery_since = self.motion_recovery_last = None
         self.motion_processed_recovery = self.motion_processed_pause = None
         self.motion_control_sample = None
@@ -357,6 +359,8 @@ class CeilingMotionMixin:
         self.motion_control_sample = None
         self.motion_integrated_output = None
         self.motion_recovery_ready = False
+        self.motion_recovery_attitude = None
+        self.motion_recovery_lock_time = rospy.Time(0)
         self.motion_recovery_since = self.motion_recovery_last = None
         if new_state == S.STATE_DETACH:
             self.motion_contact_released = False
@@ -420,6 +424,10 @@ class CeilingMotionMixin:
             self.motion_recovery_since, self.motion_recovery_last = record_hold_sample(good, sample, self.motion_recovery_since)
         self.motion_recovery_ready = held_samples(True, self.motion_recovery_since,
             self.motion_recovery_last, s.recovery_stable_time_s)
+        if self.motion_recovery_ready and self.motion_recovery_attitude is None:
+            self.motion_recovery_attitude = tuple(getattr(self.odom.pose.pose.orientation, k) for k in 'xyzw')
+            self.motion_recovery_lock_time = now
+            self.motion_controller.horizontal.reset()
         return self.motion_recovery_ready
 
     def _apply_ceiling_motion_status(self, status, now, dt):
@@ -442,6 +450,9 @@ class CeilingMotionMixin:
         status.yaw_reference_rad = controller.yaw if frozen else math.nan
         status.recovery_target_height_m = self.motion_recovery_height if self.motion_recovery_height is not None else math.nan
         status.recovery_ready = self.state == S.STATE_RECOVERY_HOVER and self._ceiling_recovery_ready(now)
+        locked = self.state == S.STATE_RECOVERY_HOVER and self.motion_recovery_attitude is not None
+        status.recovery_attitude_locked = locked
+        status.recovery_lock_time = self.motion_recovery_lock_time if locked else rospy.Time(0)
         if not frozen or self.odom is None or not odometry_is_finite(self.odom):
             return
         free = self.state in (S.STATE_CEILING_ARMED, S.STATE_APPROACH, S.STATE_RECOVERY_HOVER, S.STATE_ABORT) and not (self.state == S.STATE_ABORT and getattr(self, "hold_timed_out", False))
@@ -449,7 +460,10 @@ class CeilingMotionMixin:
             free = self._motion_release_ready(now)
         q = tuple(getattr(self.q_hover, k) for k in 'xyzw')
         velocity = linear_velocity_parent_frame(self.odom, self.odom_twist_in_child_frame)
-        if free and self.motion_ready and not self.motion_fatal:
+        if locked:
+            controller.horizontal.reset()
+            q = self.motion_recovery_attitude
+        elif free and self.motion_ready and not self.motion_fatal:
             p = self.odom.pose.pose.position
             sample = self.odom.header.stamp
             integral_dt = min(.05, max(0., (sample-self.motion_control_sample).to_sec())) if self.motion_control_sample is not None else 0.
@@ -501,7 +515,9 @@ class CeilingMotionMixin:
                 status.thrust_body_z_normalized = -clamp(thrust, self.detach_min_thrust, min(self.max_thrust, support+.12))
                 status.attitude_setpoint = Quaternion(*q)
                 status.attitude_setpoint_valid = True
-        if self.rc_manual_coordination_enabled:
+        if locked:
+            status.reason += '; 姿态已锁定，高度闭环继续；等待第三次CH12确认交回POSCTL'
+        elif self.rc_manual_coordination_enabled:
             status.reason += ('; 遥控修正中：暂停水平积分，位置回拉权重%.2f' % self.motion_rc_weight
                               if self.motion_rc_active else '; 位置回拉平滑恢复中'
                               if self.motion_rc_weight < 1.-1e-9 else '; 等待本轮遥控修正反馈'

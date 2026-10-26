@@ -276,6 +276,8 @@ class TerminalOperatorNode:
         self.ceiling_status, self.ceiling_status_at = message, rospy.Time.now()
 
     def _on_wall_toggle(self):
+        if self._request_ceiling_handover(rospy.Time.now()):
+            return
         if getattr(self, "rc_mode_selector_enabled", False):
             return self._on_attachment_toggle()
         now = rospy.Time.now()
@@ -313,6 +315,29 @@ class TerminalOperatorNode:
             return
         rospy.loginfo("CH12 requested %s through shared terminal/web operator", command)
         self._apply_command(String(data=command))
+
+    def _request_ceiling_handover(self, now):
+        c = getattr(self, 'ceiling_status', None)
+        fresh = lambda stamp, limit: stamp is not None and 0 <= (now-stamp).to_sec() <= limit
+        if not (self.mode == OperatorCommand.MODE_CEILING and c is not None
+                and c.state == CeilingAttachmentStatus.STATE_RECOVERY_HOVER
+                and c.recovery_attitude_locked and c.recovery_ready and c.keep_ownership
+                and c.odom_fresh and c.baro_fresh and c.baro_reference_ready and c.detach_height_ready
+                and not c.fault_detected and not c.detach_failed
+                and self.flight_connected and self.flight_armed and self.flight_mode == 'OFFBOARD'
+                and fresh(self.flight_at, 1.5) and fresh(getattr(self, 'ceiling_status_at', None), .5)
+                and fresh(c.header.stamp, .5) and c.recovery_lock_time.to_sec() > 0
+                and c.recovery_lock_time <= c.header.stamp <= now and c.recovery_lock_time < now):
+            return False
+        safety = self._kill_report() if self.kill_guard_enabled else {'valid': True, 'active': False}
+        if not safety['valid'] or safety['active']:
+            rospy.logwarn('CH12 ceiling handover rejected: kill switch active or unavailable')
+            return True
+        if getattr(self, 'pilot_handover_request_time', rospy.Time(0)).to_sec() == 0:
+            self.pilot_handover_request_time = now
+            self._publish_intent()
+            rospy.loginfo('CH12 ceiling handover confirmed; hold attitude until live POSCTL feedback')
+        return True
 
     def _request_captured_handover(self, now, wall):
         if (self.mode == OperatorCommand.MODE_WALL and self.flight_mode == "OFFBOARD"

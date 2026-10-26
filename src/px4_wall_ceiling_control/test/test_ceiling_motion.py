@@ -390,6 +390,10 @@ class CeilingPositionGateTests(unittest.TestCase):
         m.ceiling = S(state=S.STATE_DETACH, detach_height_ready=True, baro_fresh=True, baro_reference_ready=True)
         self.assertFalse(m._ceiling_baro_handover_ready(now))
         m.ceiling.state=S.STATE_RECOVERY_HOVER; m.ceiling.recovery_ready=True
+        m.ceiling.header.stamp=now;m.ceiling.recovery_attitude_locked=True;m.ceiling.recovery_lock_time=now-rospy.Duration(.2)
+        m.operator=OperatorCommand(mode=OperatorCommand.MODE_CEILING,enable_control=True,source='terminal')
+        m.operator.header.stamp=now;m.operator.pilot_handover_request_time=now-rospy.Duration(.1)
+        m.operator_at=now;m.operator_timeout_s=.5
         self.assertTrue(m._ceiling_baro_handover_ready(now))
         m.estimator.pos_horiz_rel_status_flag=False
         self.assertFalse(m._ceiling_baro_handover_ready(now))

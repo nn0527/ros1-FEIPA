@@ -63,7 +63,7 @@ function paint(s){
   $("ceilingDetach").disabled=requestBusy || !s.session?.feedback_live || !s.session?.control || !s.can_ceiling_detach;
   text("ceilingBlockReason",s.can_ceiling?"吸顶入口条件已满足":(s.ceiling_blockers || ["等待吸顶服务升级"]).join("；"));
   const ceilingNames={NORMAL_FLIGHT:"待命",CEILING_ARMED:"吸顶准备",APPROACH:"向上接近",ATTACH_CONTROL:"接触控制",SURFACE_HOLD:"吸顶保持",DETACH:"脱离顶部",RECOVERY_HOVER:"恢复悬停",ABORT:"中止"};
-  text("ceilingStage",ceilingStatus?"吸顶："+(ceilingNames[ceilingStatus.state_name]||ceilingStatus.state_name)+" · "+ceilingStatus.reason+" · 顶距 "+n(ceilingStatus.ceiling_distance_filtered_m,3)+" m"+(fresh(s,"runtime")?.front_sensor_masked?" · 前部雷达已屏蔽（POSCTL接管后恢复）":"")+(typeof ceilingStatus.descended_height_m === "number"?" · 已下降 "+n(ceilingStatus.descended_height_m*100,1)+" / 50 cm":""):"吸顶：无新鲜状态反馈");
+  text("ceilingStage",ceilingStatus?"吸顶："+(ceilingStatus.recovery_attitude_locked?"姿态已锁定，等待第三次CH12确认":ceilingNames[ceilingStatus.state_name]||ceilingStatus.state_name)+" · "+ceilingStatus.reason+" · 顶距 "+n(ceilingStatus.ceiling_distance_filtered_m,3)+" m"+(fresh(s,"runtime")?.front_sensor_masked?" · 前部雷达已屏蔽（POSCTL接管后恢复）":"")+(typeof ceilingStatus.descended_height_m === "number"?" · 已下降 "+n(ceilingStatus.descended_height_m*100,1)+" / 50 cm":""):"吸顶：无新鲜状态反馈");
   if(!loaded || fresh(s,"runtime")?.enabled){for(const input of form.elements) if(input.name in s.config) input.value=s.config[input.name];loaded=true;}
   const ssh=s.ssh.connected, session=s.session || {}, live=!!session.feedback_live, control=!!session.control, state=fresh(s,"state"), runtime=fresh(s,"runtime"), phase=fresh(s,"phase"), wall=fresh(s,"wall"), health=fresh(s,"health"), odom=fresh(s,"odom");
   text("rcTakeoverStatus",fresh(s,"rc_takeover") || "");

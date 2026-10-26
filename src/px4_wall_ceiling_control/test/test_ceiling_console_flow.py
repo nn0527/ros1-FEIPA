@@ -99,6 +99,17 @@ class CeilingConsoleFlowTests(unittest.TestCase):
         self.n._on_pressure(FluidPressure(fluid_pressure=100100.))
         self.n._enter_state(S.STATE_SURFACE_HOLD,rospy.Time.now(),"second hold")
         self.assertEqual(self.n.hold_pressure_pa,100100.)
+    def confirm_ceiling(self, manager):
+        now = rospy.Time.now()
+        manager.ceiling.header.stamp = now
+        manager.ceiling.recovery_attitude_locked = True
+        manager.ceiling.recovery_lock_time = now-rospy.Duration(.2)
+        manager.operator = OperatorCommand(mode=OperatorCommand.MODE_CEILING,enable_control=True,source='terminal')
+        manager.operator.header.stamp = now
+        manager.operator.pilot_handover_request_time = now-rospy.Duration(.1)
+        manager.operator_at = now
+        manager.operator_timeout_s = .5
+
     def test_baro_manager_bypasses_speed_gate_but_never_stale_pressure(self):
         m=Manager.__new__(Manager);m.ceiling_baro_handover_enabled=True
         m.selected_mode=OperatorCommand.MODE_CEILING;m.status_timeout_s=.5
@@ -107,6 +118,7 @@ class CeilingConsoleFlowTests(unittest.TestCase):
         m.estimator=type('Estimate',(),{'attitude_status_flag':True,'velocity_vert_status_flag':True,'velocity_horiz_status_flag':True,'pos_horiz_rel_status_flag':True,'const_pos_mode_status_flag':False})()
         m.odom=self.n.odom;m.odom.twist.twist.linear.z=-2.;m.odom.twist.twist.angular.y=2.
         m.ceiling=S(state=S.STATE_RECOVERY_HOVER,recovery_ready=True,detach_height_ready=True,baro_fresh=True,baro_reference_ready=True)
+        self.confirm_ceiling(m)
         self.assertTrue(m._handover_ready(rospy.Time.now()))
         m.ceiling.baro_fresh=False;self.assertFalse(m._handover_ready(rospy.Time.now()))
         m.ceiling.baro_fresh=True;self.clock=11.;self.assertFalse(m._handover_ready(rospy.Time.now()))
@@ -114,7 +126,7 @@ class CeilingConsoleFlowTests(unittest.TestCase):
         self.baro_hold();self.n._enter_state(S.STATE_DETACH,rospy.Time.now(),"detach")
         self.pressure_drop(.499);self.odom(10.,0.)
         self.assertLess(-self.n._detach_thrust(.02),self.n.hover_thrust)
-    def test_baro_timer_requests_posctl_after_recovery_without_owner_release(self):
+    def test_baro_timer_waits_for_ch12_before_requesting_posctl_without_owner_release(self):
         with mock.patch.object(rospy,"get_param",side_effect=lambda k,d=None:d), mock.patch.object(rospy,"Publisher"), mock.patch.object(rospy,"Subscriber"), mock.patch.object(rospy,"ServiceProxy"), mock.patch.object(rospy,"Timer"):
             m=Manager()
         m.ceiling_baro_handover_enabled=True;m.phase=Manager.ACTIVE
@@ -127,6 +139,13 @@ class CeilingConsoleFlowTests(unittest.TestCase):
         m.ceiling=S(state=S.STATE_RECOVERY_HOVER,recovery_ready=True,detach_height_ready=True,baro_fresh=True,baro_reference_ready=True,reason='reached')
         m._requested_mode=lambda now:OperatorCommand.MODE_CEILING
         m._request_mode=mock.Mock()
+        m.ceiling.header.stamp=rospy.Time.now();m.ceiling.recovery_attitude_locked=True
+        m.ceiling.recovery_lock_time=rospy.Time.now()-rospy.Duration(.2)
+        with mock.patch.dict(Manager._on_timer.__globals__,kill_clear=lambda *a:True):
+            m._on_timer(None)
+        self.assertEqual(m.phase,Manager.ACTIVE)
+        m._request_mode.assert_not_called()
+        self.confirm_ceiling(m)
         with mock.patch.dict(Manager._on_timer.__globals__,kill_clear=lambda *a:True):
             m._on_timer(None)
         self.assertEqual(m.phase,Manager.RETURNING)

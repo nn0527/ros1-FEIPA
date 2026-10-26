@@ -14,6 +14,7 @@ SCENARIOS = {
     'ceiling_approach': '顶吸：向上接近',
     'ceiling_hold': '顶吸：保持',
     'ceiling_detach': '顶吸：气压下降脱离',
+    'ceiling_recovery_locked': '顶吸：姿态锁定 / 等待第三次 CH12',
     'ceiling_returned': '顶吸：POSCTL 已确认',
     'wall_ready': '侧吸：POSCTL 入口',
     'wall_wait': '侧吸：手动接近等待',
@@ -98,7 +99,7 @@ class MockRuntime:
                     detach_range_handover_ready=task == 'HANDOVER_READY', detach_range_block_reason=reason,
                     detach_range_target_revision=0,
                     detach_range_target_source='range_first_qualified_message')
-        cstate = {'ceiling_approach': 'APPROACH', 'ceiling_hold': 'SURFACE_HOLD', 'ceiling_detach': 'DETACH'}.get(name, 'NORMAL_FLIGHT')
+        cstate = {'ceiling_approach': 'APPROACH', 'ceiling_hold': 'SURFACE_HOLD', 'ceiling_detach': 'DETACH', 'ceiling_recovery_locked': 'RECOVERY_HOVER'}.get(name, 'NORMAL_FLIGHT')
         fusion_phase = 'SUSPENDED' if name == 'wall_hold' else 'RESTORING' if name in ('range_rotating', 'fusion_restore') else 'READY'
         values = dict(runtime=dict(enabled=self.running, ceiling_enabled=True, wall_pilot_mode='POSCTL',
                                    ceiling_distance_gate_enabled=True, wall_range_faults_diagnostic_only=True, logger=self.running),
@@ -111,10 +112,10 @@ class MockRuntime:
                       health=dict(ceiling_valid=True, front_valid=True), ceiling=dict(range_m=.4), front=dict(range_m=1.0),
                       kill=dict(valid=True, active=name == 'kill', channel=7), setpoint=dict(thrust=.49),
                       battery=dict(voltage=15.8), rc=dict(channels=[1500]*8),
-                      ceiling_status=dict(rc_manual_coordination_enabled=True, rc_manual_feedback_ready=True, rc_manual_active=False, rc_position_weight=1., hold_elapsed_s=1.5, hold_timeout_s=5., recovery_ready=False, motion_control_enabled=True, motion_ready=True, motion_paused=False, horizontal_drift_m=.04, horizontal_speed_mps=.02, actual_tilt_deg=2., actual_body_rate_deg_s=3., motion_reason="离线模拟：水平稳定", state_name=cstate, reason=reason, fault_detected=False, odom_fresh=True,
+                      ceiling_status=dict(rc_manual_coordination_enabled=True, rc_manual_feedback_ready=True, rc_manual_active=False, rc_position_weight=1., hold_elapsed_s=1.5, hold_timeout_s=5., recovery_ready=name == 'ceiling_recovery_locked', recovery_attitude_locked=name == 'ceiling_recovery_locked', recovery_lock_time=now-.5 if name == 'ceiling_recovery_locked' else 0., motion_control_enabled=True, motion_ready=True, motion_paused=False, horizontal_drift_m=.04, horizontal_speed_mps=.02, actual_tilt_deg=2., actual_body_rate_deg_s=3., motion_reason="离线模拟：水平稳定", state_name=cstate, reason=reason, fault_detected=False, odom_fresh=True,
                                           height_source='barometer_hold_relative', baro_fresh=True, baro_reference_ready=True,
                                           range_fresh=True, ceiling_distance_filtered_m=.056 if cstate == 'SURFACE_HOLD' else .4,
-                                          descended_height_m=.3 if cstate == 'DETACH' else .5 if name == 'ceiling_returned' else 0.),
+                                          descended_height_m=.3 if cstate == 'DETACH' else .5 if name in ('ceiling_returned','ceiling_recovery_locked') else 0., detach_height_ready=name == 'ceiling_recovery_locked'),
                       wall_sensor_fusion=dict(enabled=True, phase=fusion_phase, measured_tilt_deg=2.66,
                                               control_ready=fusion_phase == 'READY', parameters_restored=fusion_phase == 'READY',
                                               original_flow=1, original_range=1, target_flow=0 if fusion_phase == 'SUSPENDED' else 1,

@@ -850,13 +850,25 @@ class FlightModeManagerNode(RCTakeoverManager):
                     and all(0 <= index < len(channels) for index in indices)
                     and all(800 <= channels[index] <= 2200 for index in indices))
 
+    def _ceiling_handover_confirmed(self, now):
+        status, operator = getattr(self, 'ceiling', None), getattr(self, 'operator', None)
+        if status is None or operator is None or not status.recovery_attitude_locked:
+            return False
+        event, locked = operator.pilot_handover_request_time, status.recovery_lock_time
+        return bool(operator.mode == OperatorCommand.MODE_CEILING and operator.enable_control
+            and operator.source == 'terminal' and locked.to_sec() > 0
+            and locked < event <= operator.header.stamp <= now
+            and locked <= status.header.stamp <= now
+            and is_fresh(getattr(self, 'operator_at', None), self.operator_timeout_s, now)
+            and is_fresh_source(operator.header.stamp, self.operator_timeout_s, now, future_tolerance_s=0.))
+
     def _ceiling_baro_handover_ready(self, now):
         status = getattr(self, "ceiling", None)
         return bool(getattr(self, "ceiling_baro_handover_enabled", False)
                     and self.selected_mode == OperatorCommand.MODE_CEILING
                     and status is not None and is_fresh(self.ceiling_at, self.status_timeout_s, now)
                     and status.state == CeilingAttachmentStatus.STATE_RECOVERY_HOVER
-                    and status.recovery_ready
+                    and status.recovery_ready and self._ceiling_handover_confirmed(now)
                     and self._ceiling_position_ready(now)
                     and (not getattr(self, "ceiling_motion_enabled", False) or (
                         status.motion_control_enabled and status.motion_ready and not status.motion_paused
@@ -1722,6 +1734,10 @@ class FlightModeManagerNode(RCTakeoverManager):
                     self._set_phase(self.RETURNING, reason="吸顶故障退出：FAULT锁存，等待POSCTL确认后交回遥控器")
                     if self._handover_ready(now):
                         self._request_mode(self._pilot_mode())
+                elif (self.selected_mode == OperatorCommand.MODE_CEILING
+                        and getattr(self, "ceiling", None) is not None and is_fresh(self.ceiling_at, self.status_timeout_s, now)
+                        and self.ceiling.recovery_attitude_locked and not self._ceiling_handover_confirmed(now)):
+                    self.phase_reason = "顶吸恢复姿态已锁定，高度闭环继续；等待第三次CH12确认交回POSCTL"
                 elif self._ceiling_baro_handover_ready(now):
                     self._set_phase(self.RETURNING, reason=self.ceiling.reason)
                     if self._handover_ready(now):
