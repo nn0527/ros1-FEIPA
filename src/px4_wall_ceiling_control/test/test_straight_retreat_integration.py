@@ -55,18 +55,17 @@ class StraightRetreatIntegrationTests(unittest.TestCase):
             q = n._simple_recovery_attitude(at(13.+i*.02))
         return q
 
-    def test_sideways_speed_keeps_existing_roll_damping_with_zero_forward_target(self):
+    def test_sideways_speed_does_not_change_captured_target(self):
         for yaw in (0., 1.3, -2.7):
             with self.subTest(yaw=yaw):
+                self.n.recover_entry_attitude = attitude_from_axis_yaw((0., 0., 1.), yaw)
                 neutral = self.retreat(0., yaw)
                 disturbed = self.retreat(.4, yaw)
-                r, p, y = euler_from_quaternion(disturbed)
-                self.assertAlmostEqual(p, euler_from_quaternion(neutral)[1])
-                self.assertAlmostEqual(y, yaw)
-                self.assertGreater(r, 0.)
-                self.assertLessEqual(r, math.radians(2.)+1e-9)
-                target = self.n.recovery_horizontal_controller.target
-                self.assertEqual(target, (0., 0.))
+                self.assertEqual(disturbed, neutral)
+                self.assertEqual(disturbed, self.n.recover_entry_attitude)
+                self.assertAlmostEqual(euler_from_quaternion(disturbed)[2], yaw)
+                self.assertEqual(self.n.recovery_horizontal_controller.target, (0., 0.))
+                self.assertFalse(self.n.horizontal_velocity_active)
 
     def test_feedback_loss_does_not_reset_roll_or_catch_up_elapsed_time(self):
         q = self.retreat(.4)

@@ -36,6 +36,7 @@ class TerminalOperatorNode:
             raise ValueError("rc_wall_channel_index must be nonnegative")
         self.wall_status, self.wall_status_at = None, None
         self.wall_switch = MomentarySwitch()
+        self.pilot_handover_request_time = rospy.Time(0)
         self.front_sensor_masked = False
         self.front_mask_seen_offboard = False
         rospy.set_param("/attachment/front_sensor_masked", False)
@@ -133,6 +134,7 @@ class TerminalOperatorNode:
                 else OperatorCommand.MODE_WALL
             )
             self.was_offboard = False
+            self.pilot_handover_request_time = rospy.Time(0)
             if command == "ceiling":
                 self.front_sensor_masked = True
                 self.front_mask_seen_offboard = False
@@ -146,6 +148,7 @@ class TerminalOperatorNode:
             ):
                 rospy.logwarn("terminal operator: no attachment to detach")
                 return
+            self.pilot_handover_request_time = rospy.Time(0)
             self.detaching = True
             self.detach_pulse = True
             rospy.loginfo("terminal operator: detach requested")
@@ -155,6 +158,7 @@ class TerminalOperatorNode:
             self.mode = OperatorCommand.MODE_STANDBY
             self.detaching = False
             self.detach_pulse = False
+            self.pilot_handover_request_time = rospy.Time(0)
             rospy.logwarn("terminal operator: behavior cancel requested")
         else:
             rospy.logwarn("terminal operator: use ceiling, wall, detach or cancel")
@@ -187,10 +191,12 @@ class TerminalOperatorNode:
             self.detaching = False
             self.detach_pulse = False
             self.was_offboard = False
+            self.pilot_handover_request_time = rospy.Time(0)
 
     def _release_intent(self):
         self.mode = OperatorCommand.MODE_STANDBY
         self.detaching = self.detach_pulse = self.was_offboard = False
+        self.pilot_handover_request_time = rospy.Time(0)
 
     def _load_kill_config(self):
         try:
@@ -239,6 +245,21 @@ class TerminalOperatorNode:
                 or not fresh(self.wall_status_at, 0.5)
                 or not fresh(wall.header.stamp, 0.5)):
             rospy.logwarn("CH12 ignored: FCU must be armed and flight/wall feedback fresh")
+            return
+        if (self.mode == OperatorCommand.MODE_WALL and self.flight_mode == "OFFBOARD"
+                and wall.state in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT)
+                and wall.recover_attitude_locked and wall.keep_ownership
+                and wall.odom_fresh and not wall.fault_detected):
+            # A new edge after rotation is consent to hand over, not another
+            # detach pulse. The manager independently checks all live gates.
+            safety = self._kill_report() if self.kill_guard_enabled else {"valid": True, "active": False}
+            if not safety["valid"] or safety["active"]:
+                rospy.logwarn("CH12 handover rejected: kill switch active or unavailable")
+                return
+            if getattr(self, "pilot_handover_request_time", rospy.Time(0)).to_sec() == 0:
+                self.pilot_handover_request_time = now
+                self._publish_intent()
+                rospy.loginfo("CH12 pilot handover requested; hold captured attitude until live POSCTL confirmation")
             return
         if (self.mode == OperatorCommand.MODE_STANDBY and not self.detaching
                 and wall.state == WallPerchStatus.STATE_IDLE
@@ -295,8 +316,10 @@ class TerminalOperatorNode:
             OperatorCommand.MODE_CEILING,
             OperatorCommand.MODE_WALL,
         )
+        command.pilot_handover_request_time = getattr(self, "pilot_handover_request_time", rospy.Time(0))
         command.source = "terminal"
-        command.reason = "detach pending" if self.detaching else "terminal request"
+        command.reason = ("CH12 pilot handover requested" if command.pilot_handover_request_time.to_sec() > 0
+                          else "detach pending" if self.detaching else "terminal request")
         self.command_pub.publish(command)
 
 

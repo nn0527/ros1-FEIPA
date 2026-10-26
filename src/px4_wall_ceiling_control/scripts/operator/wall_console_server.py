@@ -373,7 +373,8 @@ class RemoteRuntime:
                     self.state.config = validate_config(migrate_legacy_ports(running))
                 except (ValueError, TypeError):
                     enabled = False
-        return {"wall_range_faults_diagnostic_only": bool(
+        return {"rc_startup_enabled": bool(getattr(self, "rc_startup_enabled", False)),
+                "rc_stop_ch12_enabled": bool(getattr(self, "rc_stop_ch12_enabled", False)), "wall_range_faults_diagnostic_only": bool(
                     self.ros.get_param("/wall_perch_decision_node/auto_approach", False)
                     and self.ros.get_param("/flight_mode_manager_node/wall_auto_approach", False)
                     and self.ros.get_param("/wall_perch_decision_node/ignore_range_loss_during_attachment", False)
@@ -465,7 +466,8 @@ class RemoteRuntime:
             self.state.config = config
             self.state.starting = True
             self.state.launch_error = ""
-        threading.Thread(target=self.start_worker, daemon=True).start()
+        self.startup_thread = threading.Thread(target=self.start_worker, daemon=True)
+        self.startup_thread.start()
         return {"message": "开始启动 MAVROS 与贴墙基础程序"}
 
     def require_mavros_task_isolation(self):
@@ -526,6 +528,8 @@ class RemoteRuntime:
             self.spawn("wall_flight", launch_arguments(self.state.config))
             deadline = time.monotonic() + 45
             while not (self.state.snapshot()["status"]["runtime"]["value"] or {}).get("enabled", False):
+                if self.stop_requested:
+                    raise ValueError("启动已取消：已请求终止现有进程")
                 child = self.children["wall_flight"]
                 if child.poll() is not None:
                     raise ValueError("贴墙链路启动失败，查看 " + str(self.log_dir / "wall_flight.log"))
@@ -788,10 +792,11 @@ class RemoteRuntime:
 
     def stop_processes(self):
         """Take a fresh inventory, including alternate paths and launch children."""
+        keep_telemetry = bool(getattr(self, "stop_keep_telemetry", False))
         scripts = {p.name for p in (PACKAGE / "scripts").rglob("*.py")}
         scripts -= {"wall_console_server.py", "ceiling_wall_console.py", "wall_console.py"}
         launches = {p.name for p in (PACKAGE / "launch").rglob("*.launch")}
-        processes, targets = {}, {}
+        processes, targets, telemetry = {}, {}, set()
         for item in Path("/proc").glob("[0-9]*/cmdline"):
             try:
                 original = item.read_bytes()
@@ -804,6 +809,11 @@ class RemoteRuntime:
                 processes[pid] = (original, parent)
                 names = {Path(a).name for a in args}
                 if names & {"wall_console_server.py", "ceiling_wall_console.py"}:
+                    continue
+                if keep_telemetry and ("mavros_node" in names or
+                        ("roslaunch" in names and ("wall_console_mavros.launch" in names or
+                         ("mavros" in args and "px4.launch" in names)))):
+                    telemetry.add(pid)
                     continue
                 if (names & scripts or "mavros_node" in names
                         or ("roslaunch" in names and (names & launches or
@@ -818,14 +828,21 @@ class RemoteRuntime:
         changed = True
         while changed:
             changed = False
+            for pid, (_, parent) in processes.items():
+                if parent in telemetry and pid not in telemetry:
+                    telemetry.add(pid)
+                    changed = True
+        changed = True
+        while changed:
+            changed = False
             for pid, (original, parent) in processes.items():
-                if parent in targets and pid not in targets:
+                if parent in targets and pid not in targets and pid not in telemetry:
                     targets[pid] = original
                     changed = True
-        return targets
+        return {pid: original for pid, original in targets.items() if pid not in telemetry}
 
     @staticmethod
-    def stop_ros_residuals():
+    def stop_ros_residuals(keep_telemetry=False):
         """Independent graph check catches nodes missed by the process matcher."""
         class TimeoutTransport(xmlrpc.client.Transport):
             def make_connection(self, host):
@@ -856,6 +873,8 @@ class RemoteRuntime:
                          "flight_mode_manager_node", "attachment_output_mux_node",
                          "terminal_operator_node", "mavros", "attachment_flight_logger",
                          "ceiling_flight_logger", "wall_sensor_fusion_manager_node"})
+        if keep_telemetry:
+            names.discard("/mavros")
         remaining = []
         for name in sorted(names):
             code, _, uri = master.lookupNode(caller, name)
@@ -874,24 +893,31 @@ class RemoteRuntime:
         return remaining
 
     def verify_stopped(self):
+        keep_telemetry = bool(getattr(self, "stop_keep_telemetry", False))
         remaining = self.stop_processes()
         failures = ["残留 PID: " + str(sorted(remaining))] if remaining else []
-        nodes = self.stop_ros_residuals()
+        nodes = self.stop_ros_residuals(keep_telemetry=keep_telemetry)
         if nodes:
             failures.append("仍存活 ROS 节点: " + ", ".join(nodes))
         for key in ("fcu_port", "ceiling_port", "front_port"):
+            if key == "fcu_port" and keep_telemetry:
+                continue
             owners = self.port_owners(self.state.config[key])
             if owners:
                 failures.append(self.state.config[key] + " 仍被 PID " + str(owners) + " 占用")
         for name, child in self.children.items():
             # stop() deliberately preserves the shared ROS master.
-            if name != "roscore" and child.poll() is None:
+            if name not in ({"roscore", "mavros"} if keep_telemetry else {"roscore"}) and child.poll() is None:
                 failures.append("启动进程仍存活: " + name)
         if failures:
             raise ValueError("停止未完成；" + "；".join(failures))
 
     def stop(self, config=None, _repair=False):
         """Stop this console's test pipeline, preserving ROS master and SSH."""
+        resume_rc = bool(getattr(self, "rc_startup_enabled", False) and not _repair)
+        # A dead/unresponsive transport must be cleaned up as well; preserving
+        # its launcher would prevent telemetry bootstrap after a verified Stop.
+        keep_transport = resume_rc and self.mavros_alive()
         with self.state.lock:
             if getattr(self, "repairing", False) and not _repair:
                 raise ValueError("正在执行地面恢复，请等待 MAVROS 重启结果")
@@ -908,6 +934,10 @@ class RemoteRuntime:
                 raise ValueError("飞控反馈过期；需明确确认飞机已落地且电机停止，才可清理异常进程")
             self.stopping = True
             self.stop_requested = True
+            # Normal Stop retains only transport when RC startup is installed.
+            # Ground connection recovery must still stop and replace MAVROS.
+            self.stop_keep_telemetry = keep_transport
+            keep_telemetry = self.stop_keep_telemetry
         try:
             targets = self.stop_processes()
             def alive(pid, original):
@@ -928,26 +958,49 @@ class RemoteRuntime:
             remaining = [pid for pid, original in targets.items() if alive(pid, original)]
             if remaining:
                 raise ValueError("停止未完成；残留 PID: " + str(remaining))
+            worker = getattr(self, "startup_thread", None)
+            if worker is not None and worker is not threading.current_thread():
+                worker.join(timeout=3)
+                if worker.is_alive():
+                    raise ValueError("启动线程尚未退出，请等待后再次停止基础链路")
             self.verify_stopped()
             time.sleep(.3)
             self.verify_stopped()
             for name in ("wall_flight", "mavros"):
-                self.children.pop(name, None)
+                if name != "mavros" or not keep_telemetry:
+                    self.children.pop(name, None)
             with self.state.lock:
                 self.state.pending_since = self.state.detach_pending_since = None
+                self.state.ceiling_request = {"state": "NOT_SENT", "reason": "基础链路已停止；等待新的吸附请求"}
+                self.state.ceiling_request_seen = False
                 self.state.starting = bool(getattr(self, "repairing", False))
                 self.state.launch_error = ""
             with self.state.lock:
-                self.state.samples.clear()  # Removed producers must not leave stale action state.
+                if keep_telemetry:
+                    # Keep live FCU/RC feedback; remove every stopped business
+                    # producer so old task/kill/sensor samples cannot authorize actions.
+                    telemetry_samples = {"state", "rc", "odom", "estimator", "battery"}
+                    self.state.samples = {k: v for k, v in self.state.samples.items() if k in telemetry_samples}
+                else:
+                    self.state.samples.clear()  # Removed producers must not leave stale action state.
             self.state.update("runtime", self.inspect_runtime() if self.ros else {"enabled": False, "nodes": [], "missing": []})
+            if resume_rc:
+                self.stop_requested = False
+                if keep_telemetry:
+                    self.state.event("基础链路已停止：控制、雷达及记录进程已终止；遥控启动监听保持运行")
+                    return {"message": "基础链路已停止，遥控启动待命；可直接用组合动作重新启动"}
+                self.state.event("基础链路及异常 MAVROS 已停止并通过核验；正在恢复最小遥控通信")
+                return {"message": "基础链路已停止；正在恢复遥控通信，待飞控状态有效后可拨杆启动"}
             self.state.event("已终止试验控制、MAVROS、雷达及记录进程；可以重新启动")
             return {"message": "现有试验进程已终止，可以重新启动基础程序"}
         except Exception as error:
             with self.state.lock:
+                self.stop_requested = True
                 self.state.launch_error = "停止核验失败：" + str(error)
             raise ValueError(self.state.launch_error) from error
         finally:
             self.stopping = False
+            self.stop_keep_telemetry = False
 
 
 def bridge_main():

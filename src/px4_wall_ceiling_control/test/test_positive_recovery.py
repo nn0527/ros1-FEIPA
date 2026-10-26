@@ -197,26 +197,18 @@ class PositiveRecoveryTests(unittest.TestCase):
         n._prepare_simple_recovery_velocity(at(13.))
         self.assertFalse(n.horizontal_velocity_ready)
 
-    def test_zero_speed_uses_frozen_heading_and_bounded_hover_correction(self):
+    def test_rotation_end_target_is_fixed_despite_velocity_and_baseline_changes(self):
         self.finish(4.9)
         n = self.n
         n.recover_height_captured = True
-        n._prepare_simple_recovery_velocity = lambda now: None
-        n.horizontal_velocity_ready = True
-        n.horizontal_measured = (0., 0.)
-        n.departure_feedback_valid = True
-        n.departure_clear_confirmed = False
-        n.departure_retreat_speed = .05
-        n.departure_clearance_reason = ''
-        n.recovery_horizontal_controller.attitude = mock.Mock(return_value=n.recover_entry_attitude)
-        self.assertEqual(n._simple_recovery_attitude(at(13.)), quaternion(4.9))
-        args = n.recovery_horizontal_controller.attitude.call_args
-        self.assertEqual(args.args[0], (0., 0.))
-        self.assertFalse(args.kwargs['integrate'])
-        self.assertAlmostEqual(math.degrees(args.kwargs['max_tilt']), 5.)
-        n.departure_clear_confirmed = True
-        n._simple_recovery_attitude(at(13.02))
-        self.assertEqual(n.recovery_horizontal_controller.attitude.call_args.args[0], (0., 0.))
+        n.recovery_horizontal_controller.attitude = mock.Mock(side_effect=AssertionError('attitude changed'))
+        expected = n.recover_entry_attitude
+        for t, velocity in ((13., (0., 0.)), (14., (2., -.5)), (120., (-1., 1.))):
+            n.horizontal_measured = velocity
+            n.horizontal_equilibrium.frozen = False
+            self.assertEqual(n._simple_recovery_attitude(at(t)), expected)
+            self.assertFalse(n.horizontal_velocity_active)
+            self.assertEqual(n.recovery_horizontal_controller.target, (0., 0.))
 
     def test_complete_recovery_without_retreat_or_clearance_reaches_exit(self):
         from sensor_msgs.msg import Range
@@ -400,6 +392,13 @@ class RecoveryMarginTests(unittest.TestCase):
         fx.setUp(); self.addCleanup(fx.doCleanups)
         n = fx.n
         n.wall.recover_attitude_locked = n.wall.recover_stable = True
+        from px4_wall_ceiling_control.msg import OperatorCommand as Op
+        n.operator_timeout_s = .5
+        n.operator_at = at(10.)
+        n.wall.detach_rotation_start_time = at(9.)
+        n.operator = Op(mode=Op.MODE_WALL, enable_control=True, source='terminal',
+                        pilot_handover_request_time=at(9.9))
+        n.operator.header.stamp = at(10.)
         n.odom.header.stamp = at(10.)
         n.wall.detach_range_fast_velocity_valid = True
         n.wall.detach_range_fast_velocity_mps = .23
@@ -429,6 +428,13 @@ class RecoveryMarginTests(unittest.TestCase):
         fx.setUp(); self.addCleanup(fx.doCleanups)
         n = fx.n
         n.wall.recover_attitude_locked = n.wall.recover_stable = True
+        from px4_wall_ceiling_control.msg import OperatorCommand as Op
+        n.operator_timeout_s = .5
+        n.operator_at = at(10.)
+        n.wall.detach_rotation_start_time = at(9.)
+        n.operator = Op(mode=Op.MODE_WALL, enable_control=True, source='terminal',
+                        pilot_handover_request_time=at(9.9))
+        n.operator.header.stamp = at(10.)
         n.odom.header.stamp = at(10.)
         self.assertTrue(n._handover_ready(at(10.)))
         n.rc_at = at(9.)

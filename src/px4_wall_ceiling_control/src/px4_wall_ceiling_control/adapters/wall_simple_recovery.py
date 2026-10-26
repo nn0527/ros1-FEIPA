@@ -38,7 +38,7 @@ class WallSimpleRecoveryMixin:
     def _update_simple_departure_clearance(self, now):
         # No automatic retreat or wall-distance admission in captured RECOVER.
         self.departure_feedback_valid = False
-        self.departure_clearance_reason = '已取消自动后退；仅等待姿态稳定后接管'
+        self.departure_clearance_reason = '保持翻转结束姿态，无自动后退；等待CH12确认交回'
 
     def _simple_recovery_baseline(self, now):
         """Level toward verified, frozen POSCTL feedforward even while EKF restores."""
@@ -99,51 +99,15 @@ class WallSimpleRecoveryMixin:
         self._update_departure_clearance(now)
 
     def _simple_recovery_attitude(self, now):
-        baseline, trusted = self._simple_recovery_baseline(now)
-        yaw = self.departure_yaw
-        previous = getattr(self, 'recovery_attitude_at', now)
-        attitude_dt = min(.05, max(0., (now-previous).to_sec()))
-        self.recovery_attitude_at = now
-        height_captured = self._capture_simple_recovery_height(now)
-        self._prepare_simple_recovery_velocity(now)
-        self.horizontal_velocity_active = False
-        if not self.horizontal_velocity_ready or not trusted or not height_captured:
-            self.recovery_horizontal_controller.reset()
-            self.recovery_control_at = now
-            if not trusted:
-                self.horizontal_velocity_reason = '可信悬停基准缺失，禁止猜测恢复姿态'
-            elif not height_captured:
-                self.horizontal_velocity_reason = '恢复等待实际测距高度基准'
-            # Continue the existing smooth roll return even without velocity.
-            return self.departure_attitude_controller.attitude(
-                baseline, attitude_from_axis_yaw(baseline, yaw), 0., yaw,
-                attitude_dt, max(math.radians(5.), math.acos(max(-1., min(1., baseline[2])))), 0.)
-        previous = getattr(self, 'recovery_control_at', None)
-        dt = min(.05, max(0., (now-previous).to_sec())) if previous is not None else 0.
-        self.recovery_control_at = now
-        # Clear any earlier retreat target immediately, not through its ramp.
+        """Keep the measured rotation-end target until FCU confirms handover."""
+        self._capture_simple_recovery_height(now)
+        # Horizontal damping and baseline leveling both alter attitude. Disable
+        # them in this hold; vertical thrust remains closed loop independently.
+        self.recovery_horizontal_controller.reset()
         self.recovery_horizontal_controller.target = (0., 0.)
-        # Five degrees after leveling; preserve a larger entry angle only
-        # while its baseline is smoothly moving inward, never jump its target.
-        tilt_limit = max(math.radians(5.), math.acos(max(-1., min(1., baseline[2]))))
-        heading = (math.cos(yaw), math.sin(yaw))
-        left = (-heading[1], heading[0])
-        measured_forward = sum(a*b for a, b in zip(self.horizontal_measured, heading))
-        measured_left = sum(a*b for a, b in zip(self.horizontal_measured, left))
-        base_forward = sum(a*b for a, b in zip(baseline[:2], heading))
-        forward_baseline = (base_forward*heading[0], base_forward*heading[1], baseline[2])
-        controller = self.recovery_horizontal_controller
-        # Preserve the on-device independent lateral damping and roll slew.
-        forward_attitude = controller.attitude(
-            (0., 0.), (measured_forward*heading[0], measured_forward*heading[1]),
-            yaw, dt, forward_baseline, integrate=False, max_tilt=tilt_limit)
-        remaining = math.sqrt(max(0., controller.max_acceleration**2
-                                  - math.hypot(*controller.acceleration)**2))
-        result = self.departure_attitude_controller.attitude(
-            baseline, forward_attitude, measured_left, yaw, attitude_dt, tilt_limit, remaining)
-        self.horizontal_velocity_active = True
-        self.horizontal_velocity_reason = '可信悬停基准零速修正；已取消自动后退，等待姿态稳定接管'
-        return result
+        self.horizontal_velocity_active = False
+        self.horizontal_velocity_reason = '保持翻转结束姿态；高度闭环继续，等待CH12确认交回'
+        return self.recover_entry_attitude
 
     def _simple_recovery_stability(self, now):
         q = self._current_quaternion()
@@ -177,5 +141,5 @@ class WallSimpleRecoveryMixin:
         self.recover_stable = bool(self.detach_range_stable_samples >= 2
             and source-self.detach_range_stable_since >= STABLE_TIME_S-1.e-9)
         self.horizontal_velocity_stable = self.recover_stable
-        self.detach_range_block_reason = '姿态稳定，等待POSCTL交接' if self.recover_stable else '姿态连续稳定确认中'
+        self.detach_range_block_reason = '姿态稳定，保持结束姿态；等待CH12确认及POSCTL交接' if self.recover_stable else '姿态连续稳定确认中'
         return self.recover_stable

@@ -957,10 +957,24 @@ class FlightModeManagerNode(RCTakeoverManager):
                         and getattr(status, "recovery_completed", False)
                         and not status.fault_detected and not getattr(self, "fault_seen", False)))
 
+    def _captured_handover_confirmed(self, now):
+        operator, wall = getattr(self, 'operator', None), getattr(self, 'wall', None)
+        if operator is None or wall is None:
+            return False
+        event = operator.pilot_handover_request_time
+        start = wall.detach_rotation_start_time
+        return bool(operator.mode == OperatorCommand.MODE_WALL and operator.enable_control
+                    and operator.source == 'terminal'
+                    and is_fresh(getattr(self, 'operator_at', None), self.operator_timeout_s, now)
+                    and is_fresh_source(operator.header.stamp, self.operator_timeout_s, now, future_tolerance_s=0.)
+                    and start.to_sec() > 0 and start < event <= operator.header.stamp <= now
+                    and event.to_sec() > 0)
+
     def _captured_recovery_handover_ready(self, now):
         from px4_wall_ceiling_control.domain.geometry import rotate_vector
         from px4_wall_ceiling_control.domain.simple_recovery import attitude_within_margins
-        if (not self._wall_return_exit_ready(now) or not getattr(self.wall, 'recover_stable', False)
+        if (not self._captured_handover_confirmed(now)
+                or not self._wall_return_exit_ready(now) or not getattr(self.wall, 'recover_stable', False)
                 or self._range_px4_rc_failure(now) or not self._wall_fusion_handover_ready(now)
                 or self.output_mode != 2 or not is_fresh(self.output_at, self.output_timeout_s, now)
                 or self.odom is None or not is_fresh(self.odom_at, self.odom_timeout_s, now)
@@ -1582,6 +1596,8 @@ class FlightModeManagerNode(RCTakeoverManager):
                     self.phase_reason="接近超时：受控交回" + self._pilot_mode() + "；" + detail
                 elif getattr(self, "ceiling_approach_timeout_returning", False):
                     self.phase_reason = "吸顶接近超时：保持FAULT，等待有效遥控输入、飞控估计和连续输出后请求ALTCTL"
+                elif self._captured_recovery() and not self._captured_handover_confirmed(now):
+                    self.phase_reason = "保持翻转结束姿态及高度控制，等待再次拨动CH12确认交回；尚未申请POSCTL"
                 elif self._wall_return_requires_exit() and not self._wall_return_exit_ready(now):
                     self.phase_reason = (('姿态稳定条件重新确认中：保持受控输出，等待有效EXIT后交回'
                         if self._captured_recovery() else '离墙条件重新确认中：保持受控输出，等待新的有效EXIT后交回')

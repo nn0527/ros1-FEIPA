@@ -10,7 +10,7 @@
 需要关闭时，在上述入口追加 `rc_wall_toggle_enabled:=false`。
 
 - 飞控已连接、已解锁，飞控和墙面状态反馈新鲜，里程计有效，墙面为IDLE且操作意图待命时，拨动请求wall。原有飞控模式、测距、权限和进入条件继续由现有链路检查。
-- 达到WALL_HOLD后再拨动，请求detach。靠墙、翻转、脱离、恢复、吸顶等其他动作中不接受CH12事件。
+- 达到WALL_HOLD后第二次拨动请求detach；正常侧吸翻转结束后保持记录的姿态及高度控制，第三次拨动确认交回。靠墙、翻转、吸顶阶段不接受此交回事件。详见 `ch12_recovery_hold.md`。
 - 遥控器、网页、终端共用TerminalOperatorNode的操作意图及命令处理。支持遥控器启动后网页脱离，或网页启动后遥控器脱离。
 - 回弹只允许下一次触发，不撤销动作。低位<=1200、高位>=1800，两端各连续至少0.05秒；每次拨动仅触发一次。
 - 启动时拨杆在高位、通道缺失、非法输入、RC消息间断超过0.5秒或时间倒退，都必须重新稳定回低位，才允许后续高位触发。
@@ -57,3 +57,7 @@ test_attachment_flight_logger共127项测试通过。两个launch展开后的参
 `On test1024: Preserve test1024 tracked changes before CH12 test1019 integration`。
 另有补丁 `/home/pi/codex_backups/ch12-before-test1019/test1024-working.patch` 和状态清单。
 原未跟踪备份文件保留在原处。
+
+## 2026-10-26 接管操作变更
+
+上文历史测试及操作记录对应旧版。当前正常侧吸流程为：第一次CH12启动、第二次CH12脱离、翻转结束后第三次CH12确认交回；没有第三次确认就保持结束姿态及高度控制，不自动申请POSCTL。详见 `ch12_recovery_hold.md`。
