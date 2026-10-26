@@ -21,6 +21,7 @@ add_message_files(
   AttachmentMechanismCommand.msg
   AttachmentMechanismStatus.msg
   CeilingAttachmentStatus.msg
+  CeilingRcAssist.msg
   OperatorCommand.msg
   SensorHealth.msg
   WallPerchStatus.msg
@@ -135,6 +136,7 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_ceiling_state_monitor.py)
   catkin_add_nosetests(test/test_flight_handover.py)
   catkin_add_nosetests(test/test_ceiling_rc_assist.py)
+  catkin_add_nosetests(test/test_ceiling_rc_coordination.py)
   catkin_add_nosetests(test/test_auto_wall_approach.py)
   catkin_add_nosetests(test/test_single_frame_wall_flip.py)
   catkin_add_nosetests(test/test_front_only_late_top.py)

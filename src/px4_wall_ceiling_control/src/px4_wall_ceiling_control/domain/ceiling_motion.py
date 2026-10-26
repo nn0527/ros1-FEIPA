@@ -12,6 +12,10 @@ from px4_wall_ceiling_control.domain.recovery_attitude_limits import (
 class CeilingMotionSettings:
     horizontal_position_deadband_m: float = .10
     horizontal_position_kp: float = .30
+    rc_manual_position_weight: float = .25
+    rc_manual_blend_s: float = .50
+    rc_manual_feedback_timeout_s: float = .20
+    rc_manual_zero_deg: float = .05
     horizontal_max_speed_mps: float = .20
     horizontal_velocity_kp: float = 1.5
     horizontal_velocity_ki: float = .30
@@ -67,7 +71,8 @@ class CeilingMotionSettings:
         if any(not math.isfinite(getattr(self, f.name)) or getattr(self, f.name) <= 0
                for f in fields(self) if f.name != 'motion_flow_future_tolerance_s'):
             raise ValueError('ceiling motion parameters must be finite and positive')
-        if (not 0 <= self.motion_flow_future_tolerance_s <= .10
+        if (not 0 < self.rc_manual_position_weight <= 1.
+                or not 0 <= self.motion_flow_future_tolerance_s <= .10
                 or not 1 <= self.motion_flow_quality_min <= 255
                 or not self.horizontal_position_deadband_m < self.horizontal_drift_warn_m < self.horizontal_drift_pause_m
                 or not self.horizontal_position_deadband_m < self.horizontal_drift_resume_m < self.horizontal_drift_pause_m
@@ -105,12 +110,13 @@ class CeilingMotionController:
     def drift(self, xy):
         return math.hypot(*(a-b for a, b in zip(self.xy, xy))) if self.xy is not None else math.inf
 
-    def attitude(self, xy, velocity, dt, integrate=False, integral_dt=0., applied_axis=None):
+    def attitude(self, xy, velocity, dt, integrate=False, integral_dt=0., applied_axis=None, position_weight=1.):
         s = self.settings
         error = tuple(a-b for a, b in zip(self.xy, xy))
         distance = math.hypot(*error)
         speed = min(s.horizontal_max_speed_mps,
                     s.horizontal_position_kp * max(0., distance-s.horizontal_position_deadband_m))
+        speed *= max(0., min(1., position_weight))
         desired = tuple(v*speed/distance for v in error) if distance > 0 else (0., 0.)
         return self.horizontal.attitude(desired, velocity, self.yaw, dt, self.axis,
             integrate=integrate, integral_dt=integral_dt,

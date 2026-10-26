@@ -121,6 +121,11 @@ ceiling_attachment_decision_node:
 
   # POSCTL capture and free-flight stabilization (ENU). Limits are initial values.
   motion_control_enabled: true
+  rc_manual_coordination_enabled: true
+  rc_manual_position_weight: 0.25
+  rc_manual_blend_s: 0.50
+  rc_manual_feedback_timeout_s: 0.20
+  rc_manual_zero_deg: 0.05
   horizontal_position_deadband_m: 0.1
   horizontal_position_kp: 0.3
   horizontal_max_speed_mps: 0.2

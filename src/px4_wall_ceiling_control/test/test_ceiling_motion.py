@@ -384,7 +384,7 @@ class CeilingPositionGateTests(unittest.TestCase):
         m = Manager.__new__(Manager)
         m.ceiling_baro_handover_enabled = True; m.selected_mode=OperatorCommand.MODE_CEILING
         m.status_timeout_s=.5; m.estimator_timeout_s=1.5
-        now = rospy.Time.now(); m.ceiling_at=m.estimator_at=now
+        now = rospy.Time.from_sec(10.); m.ceiling_at=m.estimator_at=now
         m.estimator = EstimatorStatus(attitude_status_flag=True, velocity_horiz_status_flag=True,
             velocity_vert_status_flag=True, pos_horiz_rel_status_flag=True)
         m.ceiling = S(state=S.STATE_DETACH, detach_height_ready=True, baro_fresh=True, baro_reference_ready=True)

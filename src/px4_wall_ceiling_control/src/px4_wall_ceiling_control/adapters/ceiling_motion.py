@@ -16,7 +16,7 @@ from px4_wall_ceiling_control.domain.horizontal_equilibrium import HorizontalEqu
 from px4_wall_ceiling_control.domain.recovery_attitude_limits import attitude_from_axis_yaw
 from px4_wall_ceiling_control.domain.sample_hold import held_samples, record_hold_sample
 from px4_wall_ceiling_control.freshness import is_fresh_receipt, is_fresh_source, clamp
-from px4_wall_ceiling_control.msg import CeilingAttachmentStatus as S
+from px4_wall_ceiling_control.msg import CeilingAttachmentStatus as S, CeilingRcAssist
 
 
 def locked_ceiling_callback(callback):
@@ -67,7 +67,14 @@ class CeilingMotionMixin:
         self.motion_output = self.motion_output_at = None
         self.motion_owner = self.motion_owner_at = None
         self.motion_integrated_output = None
+        self.rc_manual_coordination_enabled = bool(rospy.get_param('~rc_manual_coordination_enabled', False))
+        self.motion_rc_feedback = self.motion_rc_feedback_at = None
+        self.motion_rc_tick = None
+        self.motion_rc_weight = 1.
+        self.motion_rc_active = False
+        self.motion_rc_ready = False
         if self.motion_enabled:
+            rospy.Subscriber('/attachment/ceiling_rc_assist', CeilingRcAssist, self._on_ceiling_rc_assist, queue_size=1)
             rospy.Subscriber('/attachment/flight_phase', String, self._on_ceiling_manager_phase, queue_size=1)
             rospy.Subscriber('/attachment/output_owner', UInt8, self._on_ceiling_owner, queue_size=1)
             rospy.Subscriber('/mavros/setpoint_raw/attitude', AttitudeTarget, self._on_ceiling_output, queue_size=1)
@@ -77,6 +84,58 @@ class CeilingMotionMixin:
                              self._on_ceiling_estimator, queue_size=10)
             rospy.Subscriber('/mavros/setpoint_raw/target_attitude', AttitudeTarget,
                              self._on_ceiling_fcu_target, queue_size=10)
+
+    @locked_ceiling_callback
+    def _on_ceiling_rc_assist(self, message):
+        now = rospy.Time.now()
+        if not self._ceiling_rc_feedback_valid(message, now):
+            return
+        previous = self.motion_rc_feedback
+        if (previous is not None and previous.maneuver_id == message.maneuver_id
+                and (message.header.stamp <= previous.header.stamp
+                     or message.control_sequence < previous.control_sequence)):
+            return
+        self.motion_rc_feedback, self.motion_rc_feedback_at = message, now
+
+    def _ceiling_rc_feedback_valid(self, message, now):
+        timeout = self.motion_settings.rc_manual_feedback_timeout_s
+        return bool(message is not None and message.maneuver_id
+            and message.maneuver_id == self.motion_id and message.control_phase == self.state
+            and 0 < message.control_sequence <= self.motion_sequence
+            and is_fresh_source(message.header.stamp, timeout, now, future_tolerance_s=0.)
+            and is_fresh_source(message.candidate_stamp, timeout, now, future_tolerance_s=0.)
+            and message.candidate_stamp <= message.header.stamp
+            and all(math.isfinite(v) for v in (message.roll_trim_rad, message.pitch_trim_rad)))
+
+    def _update_ceiling_manual(self, now):
+        previous = self.motion_rc_tick
+        self.motion_rc_tick = now
+        dt = min(.05, max(0., (now-previous).to_sec())) if previous is not None else 0.
+        if not self.rc_manual_coordination_enabled:
+            self.motion_rc_weight, self.motion_rc_active, self.motion_rc_ready = 1., False, True
+            return
+        message = self.motion_rc_feedback
+        self.motion_rc_ready = bool(self._ceiling_rc_feedback_valid(message, now)
+            and is_fresh_receipt(self.motion_rc_feedback_at, self.motion_settings.rc_manual_feedback_timeout_s, now)
+            and message.input_valid)
+        self.motion_rc_active = bool(self.motion_rc_ready and (message.stick_active
+            or max(abs(message.roll_trim_rad), abs(message.pitch_trim_rad))
+               > math.radians(self.motion_settings.rc_manual_zero_deg)))
+        # Keep the original position reference. Manual input only reduces its
+        # pull; velocity damping and the drift/tilt/rate guards remain active.
+        allowed = self.state in (S.STATE_APPROACH, S.STATE_RECOVERY_HOVER) or (
+            self.state == S.STATE_DETACH and self.motion_contact_released)
+        target = (self.motion_settings.rc_manual_position_weight
+                  if allowed and self.motion_rc_active and not self.motion_paused
+                  and self.motion_drift < self.motion_settings.horizontal_drift_warn_m else 1.)
+        step = (1.-self.motion_settings.rc_manual_position_weight)*dt/self.motion_settings.rc_manual_blend_s
+        self.motion_rc_weight += max(-step, min(step, target-self.motion_rc_weight))
+        if self.motion_rc_active and allowed:
+            self.motion_controller.horizontal.clear_integral()
+
+    def _ceiling_manual_settled(self):
+        return (not self.rc_manual_coordination_enabled or (
+            self.motion_rc_ready and not self.motion_rc_active and self.motion_rc_weight >= 1.-1e-9))
 
     @locked_ceiling_callback
     def _on_ceiling_manager_phase(self, message):
@@ -242,6 +301,7 @@ class CeilingMotionMixin:
                 tuple(getattr(self.motion_fcu.orientation, k) for k in 'xyzw') if self.motion_fcu is not None else (0., 0., 0., 1.), eligible)
         if self.motion_controller.xy is not None:
             self._update_ceiling_pause(now)
+        self._update_ceiling_manual(now)
 
     def _update_ceiling_pause(self, now):
         s = self.motion_settings
@@ -289,6 +349,9 @@ class CeilingMotionMixin:
         if not getattr(self, 'motion_enabled', False):
             return
         self.motion_controller.horizontal.clear_integral()
+        self.motion_rc_feedback = self.motion_rc_feedback_at = None
+        self.motion_rc_weight, self.motion_rc_active, self.motion_rc_ready = 1., False, False
+        self.motion_rc_tick = now
         self.motion_bad_since = None
         self.motion_contact_unsafe = False
         self.motion_control_sample = None
@@ -335,7 +398,7 @@ class CeilingMotionMixin:
             return self.motion_recovery_ready
         s = self.motion_settings
         z = self._height_feedback(now)
-        feedback = (self.motion_ready and not self.motion_paused and not self.motion_fatal and z is not None
+        feedback = (self._ceiling_manual_settled() and self.motion_ready and not self.motion_paused and not self.motion_fatal and z is not None
                     and self.motion_recovery_height is not None and self._flight_ready(now))
         if not feedback:
             self.motion_recovery_since = self.motion_recovery_last = None
@@ -365,6 +428,10 @@ class CeilingMotionMixin:
             return
         s, controller = self.motion_settings, self.motion_controller
         frozen = controller.xy is not None
+        status.rc_manual_coordination_enabled = self.rc_manual_coordination_enabled
+        status.rc_manual_feedback_ready = self.motion_rc_ready
+        status.rc_manual_active = self.motion_rc_active
+        status.rc_position_weight = self.motion_rc_weight
         status.motion_control_enabled = True
         status.motion_ready = self.motion_ready
         status.baseline_ready = frozen or (self.motion_equilibrium.ready and self._motion_target_fresh(now))
@@ -401,8 +468,9 @@ class CeilingMotionMixin:
             if output_ready:
                 self.motion_integrated_output = output.header.stamp
             q = controller.attitude((p.x, p.y), velocity[:2], dt,
-                integrate=integral_dt > 0 and not self.motion_paused and self.state != S.STATE_ABORT,
-                integral_dt=integral_dt, applied_axis=applied_axis)
+                integrate=integral_dt > 0 and not self.motion_paused and self.state != S.STATE_ABORT
+                    and self._ceiling_manual_settled(),
+                integral_dt=integral_dt, applied_axis=applied_axis, position_weight=self.motion_rc_weight)
         else:
             controller.horizontal.reset()
         desired_vz = 0.
@@ -433,6 +501,11 @@ class CeilingMotionMixin:
                 status.thrust_body_z_normalized = -clamp(thrust, self.detach_min_thrust, min(self.max_thrust, support+.12))
                 status.attitude_setpoint = Quaternion(*q)
                 status.attitude_setpoint_valid = True
+        if self.rc_manual_coordination_enabled:
+            status.reason += ('; 遥控修正中：暂停水平积分，位置回拉权重%.2f' % self.motion_rc_weight
+                              if self.motion_rc_active else '; 位置回拉平滑恢复中'
+                              if self.motion_rc_weight < 1.-1e-9 else '; 等待本轮遥控修正反馈'
+                              if not self.motion_rc_ready else '; 自动水平稳定')
         status.reason += '; ' + status.motion_reason
         if self.motion_paused:
             status.reason += '; 暂停竖直运动，等待恢复阈值持续满足'

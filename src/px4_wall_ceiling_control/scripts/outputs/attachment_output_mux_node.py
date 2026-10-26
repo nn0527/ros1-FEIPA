@@ -44,6 +44,7 @@ from px4_wall_ceiling_control.freshness import is_fresh_receipt as is_fresh, is_
 from px4_wall_ceiling_control.msg import (
     AttachmentControlCandidate,
     CeilingAttachmentStatus,
+    CeilingRcAssist,
     OperatorCommand,
     WallPerchStatus,
 )
@@ -164,6 +165,7 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
         self.preflip_bias_publisher = rospy.Publisher("/attachment/preflip_roll_bias_deg", Float32, queue_size=10)
         self.rc_yaw_rad = 0.0
         self.rc_calibration = {}
+        self.ceiling_rc_feedback_publisher = rospy.Publisher('/attachment/ceiling_rc_assist', CeilingRcAssist, queue_size=1)
         if self.rc_roll_yaw_enabled or self.rc_ceiling_roll_pitch_enabled:
             if not self.rc_assist_enabled:
                 raise ValueError("Calibrated RC correction requires rc_assist_enabled")
@@ -990,6 +992,11 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
         return free, free
 
     def _assisted_attitude(self, now, quaternion, source, candidate=None):
+        if (source == AttachmentControlCandidate.SOURCE_CEILING and candidate is not None
+                and candidate.ceiling_rc_assist_blocked):
+            self.rc_roll_rad = self.rc_pitch_rad = self.rc_yaw_rad = 0.
+            self.rc_trim_at = now
+            return quaternion
         control = self._wall_control(now, candidate) if source == AttachmentControlCandidate.SOURCE_WALL else None
         if (control is not None and control.recover_attitude_locked
                 and control.control_phase in (WallPerchStatus.STATE_RECOVER, WallPerchStatus.STATE_EXIT)):
@@ -1656,10 +1663,38 @@ class AttachmentOutputMuxNode(RCTakeoverOutput):
             }
         self.attitude_publisher.publish(target)
         self._remember_publication(target, candidate.source, published_at if wall else now)
+        if not wall and getattr(self, 'ceiling_motion_enabled', False):
+            self._publish_ceiling_rc_feedback(candidate, target)
         if wall:
             self.last_wall_command = command_diagnostic
             self._publish_recovery_preview(published_at, target, candidate)
         return self.OUTPUT_ATTITUDE_THRUST
+
+    def _publish_ceiling_rc_feedback(self, candidate, target):
+        publisher = getattr(self, 'ceiling_rc_feedback_publisher', None)
+        if publisher is None or not candidate.phase_valid:
+            return
+        feedback = CeilingRcAssist()
+        feedback.header.stamp = target.header.stamp
+        feedback.candidate_stamp = candidate.header.stamp
+        feedback.maneuver_id = candidate.maneuver_id
+        feedback.control_sequence = candidate.control_sequence
+        feedback.control_phase = candidate.control_phase
+        calibrated = self._calibrated_rc_axes(target.header.stamp, candidate.source) == ('roll', 'pitch')
+        enabled = getattr(self, 'rc_assist_enabled', False)
+        ready = not enabled or self._rc_ready(target.header.stamp, candidate.source)
+        feedback.input_valid = ready
+        if enabled and ready and not candidate.ceiling_rc_assist_blocked:
+            fractions = ([self._calibrated_rc_fraction(axis) for axis in ('roll', 'pitch')] if calibrated
+                else [stick_fraction(self.rc_channels, index, self.rc_pwm_low, self.rc_pwm_center,
+                    self.rc_pwm_high, self.rc_deadzone, reverse) for index, reverse in (
+                        (self.rc_roll_channel_index, self.rc_roll_reverse), (self.rc_pitch_channel_index, self.rc_pitch_reverse))])
+            # An RC callback may replace the channel frame after _rc_ready.
+            feedback.input_valid = all(value is not None for value in fractions)
+            feedback.stick_active = feedback.input_valid and any(abs(value) > 0. for value in fractions)
+        feedback.roll_trim_rad = self.rc_roll_rad if enabled and not candidate.ceiling_rc_assist_blocked else 0.
+        feedback.pitch_trim_rad = self.rc_pitch_rad if enabled and not candidate.ceiling_rc_assist_blocked else 0.
+        publisher.publish(feedback)
 
     def _publish_output_health(self, now, output_mode, reason, checks):
         publisher = getattr(self, "output_health_publisher", None)

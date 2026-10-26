@@ -60,3 +60,6 @@ bool ceiling_abort_land_requested
 
 # Incline has its own state machine, sharing the wall transport/arbiter owner.
 bool incline_active
+
+# Atomic ceiling phase/feedback gate; leaves wall assistance unchanged.
+bool ceiling_rc_assist_blocked

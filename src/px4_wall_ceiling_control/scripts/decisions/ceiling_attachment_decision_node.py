@@ -1205,6 +1205,13 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
         candidate.acquire_request = status.acquire_request
         candidate.keep_ownership = status.keep_ownership
         candidate.ceiling_abort_land_requested = status.abort_land_requested
+        candidate.ceiling_rc_assist_blocked = bool(
+            status.state in (CeilingAttachmentStatus.STATE_NORMAL_FLIGHT, CeilingAttachmentStatus.STATE_CEILING_ARMED,
+                             CeilingAttachmentStatus.STATE_ABORT)
+            or (getattr(self, 'motion_enabled', False) and (not self.motion_ready or self.motion_fatal))
+            or (status.state == CeilingAttachmentStatus.STATE_DETACH and (
+                not self._mechanism_release_confirmed(status.header.stamp)
+                or (getattr(self, 'motion_enabled', False) and not self.motion_contact_released))))
         candidate.reason = status.reason
         candidate.velocity_z_enu_mps = math.nan
         candidate.thrust_normalized = math.nan

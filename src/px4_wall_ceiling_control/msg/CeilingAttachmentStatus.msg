@@ -76,3 +76,9 @@ bool hold_timed_out
 string abort_maneuver_id
 float32 hold_elapsed_s
 float32 hold_timeout_s
+
+# Ceiling manual/automatic horizontal coordination.
+bool rc_manual_coordination_enabled
+bool rc_manual_feedback_ready
+bool rc_manual_active
+float32 rc_position_weight
