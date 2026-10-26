@@ -24,7 +24,7 @@ check(view(initial).canStart);initial.status.state.value.armed=true;check(!view(
 initial.status.state.value.armed=false;initial.starting=true;check(!view(initial).canStart);
 check(!view(snapshot()).editable);
 const bootstrap=snapshot();bootstrap.status.runtime={fresh:false,value:null};bootstrap.status.state={fresh:false,value:null};check(view(bootstrap).canStart);
-const returning=snapshot();returning.status.phase.value='RETURNING';check(view(returning).stage==='等待遥控接管');
+const returning=snapshot();returning.status.phase.value='RETURNING';returning.status.operator.value={mode:2};check(view(returning).stage==='等待遥控接管');
 const abort=snapshot();abort.status.ceiling_status.value={state_name:'ABORT',fault_detected:true,abort_land_requested:false,reason:'ordinary fault'};
 check(view(abort).stage==='顶吸中止');
 abort.status.ceiling_status.value.abort_land_requested=true;

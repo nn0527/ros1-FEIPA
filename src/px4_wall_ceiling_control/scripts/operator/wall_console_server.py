@@ -282,6 +282,7 @@ class RemoteRuntime:
                      "ceiling_age_s": msg.ceiling_age_s, "front_age_s": msg.front_age_s}
         elif name == "ceiling_status":
             value = {key: getattr(msg, key) for key in ("state_name", "reason", "fault_detected", "attach_confirmed", "distance_stable", "range_fresh", "odom_fresh", "candidate_valid", "ceiling_distance_filtered_m", "compression_m", "target_distance_m", "detach_failed", "activation_ready", "detach_start_height_m", "descended_height_m", "detach_height_ready", "height_source", "baro_fresh", "baro_reference_ready", "baro_pressure_pa", "hold_pressure_pa", "motion_control_enabled", "motion_ready", "baseline_ready", "motion_paused", "recovery_ready", "horizontal_drift_m", "horizontal_speed_mps", "actual_tilt_deg", "actual_body_rate_deg_s", "yaw_reference_rad", "recovery_target_height_m", "target_vertical_speed_mps", "motion_reason", "abort_land_requested", "hold_timed_out", "abort_maneuver_id", "hold_elapsed_s", "hold_timeout_s")}
+            value.update({key: getattr(msg, key, None) for key in ("rc_manual_coordination_enabled", "rc_manual_feedback_ready", "rc_manual_active", "rc_position_weight")})
         elif name == "wall_sensor_fusion":
             # Parameter ACKs are not proof that the EKF fused a measurement.
             value = {key: getattr(msg, key) for key in (

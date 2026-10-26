@@ -43,6 +43,27 @@ class ConsoleTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_config(dict(DEFAULT_CONFIG, detach_range_manual_target_m=target))
 
+    def test_ceiling_manual_coordination_reaches_browser_snapshot(self):
+        runtime = object.__new__(server.RemoteRuntime)
+        runtime.state = self.state
+        class Message:
+            def __getattr__(self, key):
+                return False
+        message = Message()
+        message.state_name = "APPROACH"
+        message.reason = "test coordination"
+        message.rc_manual_coordination_enabled = True
+        message.rc_manual_feedback_ready = True
+        message.rc_manual_active = True
+        message.rc_position_weight = .25
+        runtime.callback(message, "ceiling_status")
+        item = self.state.snapshot()["status"]["ceiling_status"]
+        self.assertTrue(item["fresh"])
+        self.assertTrue(item["value"]["rc_manual_active"])
+        self.assertEqual(item["value"]["rc_position_weight"], .25)
+        self.now += .51
+        self.assertFalse(self.state.snapshot()["status"]["ceiling_status"]["fresh"])
+
     def test_fusion_status_serializes_ros_times_and_expires(self):
         runtime = object.__new__(server.RemoteRuntime)
         runtime.state = self.state
