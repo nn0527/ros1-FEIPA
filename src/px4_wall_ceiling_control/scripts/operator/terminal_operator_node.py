@@ -10,10 +10,10 @@ from mavros_msgs.msg import State, RCIn
 from mavros_msgs.srv import ParamGet
 from std_msgs.msg import Bool, String
 
-from px4_wall_ceiling_control.msg import OperatorCommand, WallPerchStatus
+from px4_wall_ceiling_control.msg import OperatorCommand, WallPerchStatus, CeilingAttachmentStatus
 from px4_wall_ceiling_control.adapters.kill_switch import KillSwitchConfig
 
-from px4_wall_ceiling_control.domain.momentary_switch import MomentarySwitch
+from px4_wall_ceiling_control.domain.momentary_switch import MomentarySwitch, AttachmentModeSelector
 
 
 def serialized(callback):
@@ -34,6 +34,15 @@ class TerminalOperatorNode:
         self.rc_wall_channel_index = int(rospy.get_param("~rc_wall_channel_index", 11))
         if self.rc_wall_channel_index < 0:
             raise ValueError("rc_wall_channel_index must be nonnegative")
+        self.rc_mode_selector_enabled = bool(rospy.get_param("~rc_mode_selector_enabled", True))
+        self.rc_mode_channel_index = int(rospy.get_param("~rc_mode_channel_index", 7))
+        if self.rc_mode_channel_index < 0 or self.rc_mode_channel_index == self.rc_wall_channel_index:
+            raise ValueError("mode selection and trigger channels must be distinct and nonnegative")
+        # Calibrated on this transmitter: CH8 up=999, down=1999.
+        self.mode_selector = AttachmentModeSelector(
+            up_is_high=bool(rospy.get_param("~rc_mode_up_is_high", False)))
+        self.rc_selected_mode = None
+        self.ceiling_status, self.ceiling_status_at = None, None
         self.wall_status, self.wall_status_at = None, None
         self.wall_switch = MomentarySwitch()
         self.front_sensor_masked = False
@@ -54,6 +63,9 @@ class TerminalOperatorNode:
         self.request_acks = {}
         self.command_ack_pub = rospy.Publisher("/attachment/terminal_ack", String, queue_size=10)
         self.kill_pub = rospy.Publisher("/attachment/kill_switch", String, queue_size=1)
+        self.selected_mode_pub = rospy.Publisher(
+            "/attachment/rc_selected_mode", String, queue_size=1, latch=True)
+        self.selected_mode_pub.publish(String(data="unavailable"))
         self.command_pub = rospy.Publisher(
             "/operator/command", OperatorCommand, queue_size=10
         )
@@ -64,6 +76,8 @@ class TerminalOperatorNode:
             "/wall_perch/detach", Bool, queue_size=10
         )
         rospy.Subscriber("/wall_perch/status", WallPerchStatus, self._on_wall_status, queue_size=1)
+        rospy.Subscriber("/ceiling_attachment/status", CeilingAttachmentStatus,
+                         self._on_ceiling_status, queue_size=1)
         rospy.Subscriber("/mavros/rc/in", RCIn, self._on_rc, queue_size=1)
         rospy.Subscriber(
             "/attachment/terminal_command", String, self._on_command, queue_size=10
@@ -76,11 +90,12 @@ class TerminalOperatorNode:
         if not message.data.lstrip().startswith("{"):
             return self._apply_command(message)  # Preserve existing terminal commands.
         request_id = ""
+        command = "ceiling"
         try:
             request = json.loads(message.data)
             request_id = request.get("id", "")
             command = request.get("command", "")
-            if not isinstance(request_id, str) or not 1 <= len(request_id) <= 64 or command != "ceiling":
+            if not isinstance(request_id, str) or not 1 <= len(request_id) <= 64 or command not in ("ceiling", "incline"):
                 raise ValueError("请求格式无效")
             if request_id in self.request_acks:
                 self.command_ack_pub.publish(String(data=json.dumps(self.request_acks[request_id],ensure_ascii=False)))
@@ -89,60 +104,71 @@ class TerminalOperatorNode:
             safety = self._kill_report() if self.kill_guard_enabled else {"valid":True,"active":False}
             reason = ("急停开关已生效或反馈无效" if not safety['valid'] or safety['active'] else
                       "飞控未连接、心跳过期或尚未解锁" if not (self.flight_connected and self.flight_armed and 0 <= age <= 1.5) else
-                      "吸顶请求需从ALTCTL发起" if self.flight_mode != "ALTCTL" else
+                      "吸顶请求需从POSCTL发起" if self.flight_mode != "POSCTL" else
                       "已有动作请求，不能重复启动" if self.mode != OperatorCommand.MODE_STANDBY or self.detaching else "")
             if reason:
                 accepted = False
             else:
-                self._apply_command(String(data="ceiling"))
-                accepted = self.mode == OperatorCommand.MODE_CEILING
-                reason = "吸顶节点已接收：等待顶距≤1m连续0.30秒及接管条件" if accepted else "节点安全条件变化，请检查急停和飞控反馈"
+                self._apply_command(String(data=command))
+                accepted = self.mode == (OperatorCommand.MODE_CEILING if command == "ceiling" else OperatorCommand.MODE_INCLINE)
+                reason = (("斜墙请求已接收：等待50cm接近准入" if command == "incline" else "吸顶节点已接收：等待单帧有效顶距≤1m及接管条件") if accepted else "节点安全条件或斜墙配置不满足")
                 if accepted:
                     self._publish_intent()  # Confirmed intent is sent immediately, not on the next timer tick.
-            reply = {"id":request_id,"command":"ceiling","accepted":accepted,"reason":reason,
-                     "mode":self.mode,"enable_control":self.mode==OperatorCommand.MODE_CEILING,
+            reply = {"id":request_id,"command":command,"accepted":accepted,"reason":reason,
+                     "mode":self.mode,"enable_control":accepted,
                      "ros_time":rospy.Time.now().to_sec()}
             if len(self.request_acks) >= 32:self.request_acks.pop(next(iter(self.request_acks)))
             self.request_acks[request_id] = reply
         except Exception as error:
-            reply = {"id":request_id,"command":"ceiling","accepted":False,"reason":str(error)}
+            reply = {"id":request_id,"command":command,"accepted":False,"reason":str(error)}
         self.command_ack_pub.publish(String(data=json.dumps(reply,ensure_ascii=False)))
         rospy.logwarn("ceiling request acknowledgement: %s",json.dumps(reply,ensure_ascii=False))
 
     def _apply_command(self, message):
         command = message.data.strip().lower()
-        if command in ("ceiling", "wall", "detach") and getattr(self, "kill_guard_enabled", False):
+        if command in ("ceiling", "wall", "incline", "detach") and getattr(self, "kill_guard_enabled", False):
             safety = self._kill_report()
             if not safety["valid"] or safety["active"]:
                 rospy.logwarn("terminal operator: kill switch active or unavailable; command rejected")
                 return
-        if command == "wall" and getattr(self, "front_sensor_masked", False):
-            rospy.logwarn("front sensor masked during ceiling cycle; wait for confirmed ALTCTL handover before wall testing")
+        if command in ("wall", "incline") and getattr(self, "front_sensor_masked", False):
+            rospy.logwarn("front sensor masked during ceiling cycle; wait for confirmed POSCTL handover before wall testing")
             return
-        if command in ("ceiling", "wall"):
+        if command in ("ceiling", "wall", "incline"):
             if self.mode != OperatorCommand.MODE_STANDBY or self.detaching:
                 rospy.logwarn("terminal operator: finish current cycle before %s", command)
                 return
-            pilot_mode = (str(rospy.get_param("/flight_mode_manager_node/wall_pilot_mode","ALTCTL")).upper() if command == "wall" else "ALTCTL")
+            pilot_mode = (str(rospy.get_param("/flight_mode_manager_node/wall_pilot_mode","ALTCTL")).upper() if command == "wall" else "POSCTL")
             if self.flight_mode != pilot_mode:
                 rospy.logwarn("terminal operator: start only from PX4 %s",pilot_mode)
                 return
-            self.mode = (
-                OperatorCommand.MODE_CEILING
-                if command == "ceiling"
-                else OperatorCommand.MODE_WALL
-            )
+            if command == "incline":
+                age = ((rospy.Time.now()-self.flight_at).to_sec()
+                       if self.flight_at is not None else float('inf'))
+                if not (self.flight_connected and self.flight_armed and 0 <= age <= 1.5):
+                    rospy.logwarn('incline start rejected: flight state stale, disconnected or disarmed')
+                    return
+                from px4_wall_ceiling_control.domain.incline_attachment import InclineSettings
+                settings = InclineSettings.read(lambda key, default: rospy.get_param('/incline_attachment/' + key, default))
+                error = settings.error(float(rospy.get_param('/attachment_output_mux_node/max_thrust', .85)))
+                if error:
+                    rospy.logwarn('incline start rejected: %s', error)
+                    return
+            self.mode = {"ceiling": OperatorCommand.MODE_CEILING,
+                         "wall": OperatorCommand.MODE_WALL,
+                         "incline": OperatorCommand.MODE_INCLINE}[command]
             self.was_offboard = False
             if command == "ceiling":
                 self.front_sensor_masked = True
                 self.front_mask_seen_offboard = False
                 rospy.set_param("/attachment/front_sensor_masked", True)
-                rospy.logwarn("ceiling requested: front sensor excluded from control until confirmed ALTCTL handover")
+                rospy.logwarn("ceiling requested: front sensor excluded from control until confirmed POSCTL handover")
             rospy.loginfo("terminal operator: %s requested", command)
         elif command == "detach":
             if self.mode not in (
                 OperatorCommand.MODE_CEILING,
                 OperatorCommand.MODE_WALL,
+                OperatorCommand.MODE_INCLINE,
             ):
                 rospy.logwarn("terminal operator: no attachment to detach")
                 return
@@ -157,7 +183,7 @@ class TerminalOperatorNode:
             self.detach_pulse = False
             rospy.logwarn("terminal operator: behavior cancel requested")
         else:
-            rospy.logwarn("terminal operator: use ceiling, wall, detach or cancel")
+            rospy.logwarn("terminal operator: use ceiling, wall, incline, detach or cancel")
 
     @serialized
     def _on_state(self, message):
@@ -175,14 +201,14 @@ class TerminalOperatorNode:
         if message.connected and getattr(self, "front_sensor_masked", False):
             if self.flight_mode == "OFFBOARD":
                 self.front_mask_seen_offboard = True
-            elif self.flight_mode == "ALTCTL" and (getattr(self, "front_mask_seen_offboard", False) or self.mode == OperatorCommand.MODE_STANDBY):
+            elif self.flight_mode == "POSCTL" and (getattr(self, "front_mask_seen_offboard", False) or self.mode == OperatorCommand.MODE_STANDBY):
                 self.front_sensor_masked = False
                 self.front_mask_seen_offboard = False
                 rospy.set_param("/attachment/front_sensor_masked", False)
-                rospy.loginfo("confirmed ALTCTL handover: front sensor control input restored")
+                rospy.loginfo("confirmed POSCTL handover: front sensor control input restored")
         if self.flight_mode == "OFFBOARD":
             self.was_offboard = True
-        elif self.was_offboard and message.connected and self.flight_mode == (str(rospy.get_param("/flight_mode_manager_node/wall_pilot_mode","ALTCTL")).upper() if self.mode == OperatorCommand.MODE_WALL else "ALTCTL"):
+        elif self.was_offboard and message.connected and self.flight_mode == (str(rospy.get_param("/flight_mode_manager_node/wall_pilot_mode","ALTCTL")).upper() if self.mode == OperatorCommand.MODE_WALL else "POSCTL"):
             self.mode = OperatorCommand.MODE_STANDBY
             self.detaching = False
             self.detach_pulse = False
@@ -214,6 +240,15 @@ class TerminalOperatorNode:
         self.rc_channels, self.rc_at = tuple(message.channels), rospy.Time.now()
         if getattr(self, "rc_wall_toggle_enabled", False):
             now = time.monotonic()
+            if getattr(self, "rc_mode_selector_enabled", False):
+                pwm_mode = (self.rc_channels[self.rc_mode_channel_index]
+                            if len(self.rc_channels) > self.rc_mode_channel_index else None)
+                selected = self.mode_selector.update(pwm_mode, now)
+                if selected != self.rc_selected_mode:
+                    self.rc_selected_mode = selected
+                    self.selected_mode_pub.publish(String(data=selected or "unavailable"))
+                    rospy.loginfo("CH8 selection=%s; current operator_mode=%s (active cycle unchanged)",
+                                  selected or "unavailable", self.mode)
             pwm = (self.rc_channels[self.rc_wall_channel_index]
                    if len(self.rc_channels) > self.rc_wall_channel_index else None)
             if self.wall_switch.update(pwm, now):
@@ -225,12 +260,18 @@ class TerminalOperatorNode:
     def _on_wall_status(self, message):
         self.wall_status, self.wall_status_at = message, rospy.Time.now()
         # A rejected/timed-out request can be retried by either operator input.
-        if (self.mode == OperatorCommand.MODE_WALL
+        if (self.mode in (OperatorCommand.MODE_WALL, OperatorCommand.MODE_INCLINE)
                 and message.state == WallPerchStatus.STATE_WALL_HOLD
                 and not message.detach_pending and not self.detach_pulse):
             self.detaching = False
 
+    @serialized
+    def _on_ceiling_status(self, message):
+        self.ceiling_status, self.ceiling_status_at = message, rospy.Time.now()
+
     def _on_wall_toggle(self):
+        if getattr(self, "rc_mode_selector_enabled", False):
+            return self._on_attachment_toggle()
         now = rospy.Time.now()
         fresh = lambda stamp, limit: stamp is not None and 0 <= (now-stamp).to_sec() <= limit
         wall = self.wall_status
@@ -250,7 +291,7 @@ class TerminalOperatorNode:
                 rospy.logwarn("CH12 wall rejected: wall odometry unavailable or stale")
                 return
             command = "wall"
-        elif (self.mode == OperatorCommand.MODE_WALL
+        elif (self.mode in (OperatorCommand.MODE_WALL, OperatorCommand.MODE_INCLINE)
                 and wall.state == WallPerchStatus.STATE_WALL_HOLD
                 and not self.detaching and not self.detach_pulse
                 and not wall.detach_pending and not wall.fault_detected):
@@ -263,6 +304,53 @@ class TerminalOperatorNode:
                 wall.keep_ownership, wall.fault_detected, wall.reason)
             return
         rospy.loginfo("CH12 requested %s through shared terminal/web operator", command)
+        self._apply_command(String(data=command))
+
+    def _on_attachment_toggle(self):
+        now = rospy.Time.now()
+        fresh = lambda stamp, limit: stamp is not None and 0 <= (now-stamp).to_sec() <= limit
+        if not (self.flight_connected and self.flight_armed and fresh(self.flight_at, 1.5)):
+            rospy.logwarn("CH12 ignored: FCU must be connected, armed and fresh")
+            return
+        wall, ceiling = self.wall_status, self.ceiling_status
+        wall_fresh = (wall is not None and fresh(self.wall_status_at, .5)
+                      and fresh(wall.header.stamp, .5))
+        ceiling_fresh = (ceiling is not None and fresh(self.ceiling_status_at, .5)
+                         and fresh(ceiling.header.stamp, .5))
+        command = None
+        if self.mode == OperatorCommand.MODE_STANDBY and not self.detaching:
+            if not (fresh(self.rc_at, .25) and self.mode_selector.selected is not None):
+                rospy.logwarn("CH12 start rejected: CH8 missing, middle position or not stable")
+                return
+            if not (wall_fresh and ceiling_fresh
+                    and wall.state == WallPerchStatus.STATE_IDLE and not wall.keep_ownership
+                    and ceiling.state == CeilingAttachmentStatus.STATE_NORMAL_FLIGHT
+                    and not ceiling.keep_ownership):
+                rospy.logwarn("CH12 start rejected: both attachment nodes must be fresh and idle; wall=%s ceiling=%s",
+                              wall.state if wall is not None else None,
+                              ceiling.state if ceiling is not None else None)
+                return
+            command = self.mode_selector.selected
+            selected_status = ceiling if command == "ceiling" else wall
+            # IDLE aggregate faults include the expected absence of OFFBOARD.
+            # Actual FCU, kill, odometry and manager preflight gates remain active.
+            if not selected_status.odom_fresh:
+                rospy.logwarn("CH12 %s rejected: odometry unavailable or stale", command)
+                return
+        elif not self.detaching and not self.detach_pulse and self.flight_mode == "OFFBOARD":
+            if (self.mode in (OperatorCommand.MODE_WALL, OperatorCommand.MODE_INCLINE) and wall_fresh
+                    and wall.state == WallPerchStatus.STATE_WALL_HOLD
+                    and not wall.detach_pending and not wall.fault_detected):
+                command = "detach"
+            elif (self.mode == OperatorCommand.MODE_CEILING and ceiling_fresh
+                    and ceiling.state == CeilingAttachmentStatus.STATE_SURFACE_HOLD
+                    and not ceiling.fault_detected and not ceiling.detach_failed):
+                command = "detach"
+        if command is None:
+            rospy.loginfo("CH12 ignored during transition, fault or pending detach: operator_mode=%s",
+                          self.mode)
+            return
+        rospy.loginfo("CH12 requested %s; CH8 selects the next cycle, active mode=%s", command, self.mode)
         self._apply_command(String(data=command))
 
     def _kill_report(self):
@@ -283,7 +371,7 @@ class TerminalOperatorNode:
         if self.detach_pulse:
             if self.mode == OperatorCommand.MODE_CEILING:
                 self.ceiling_detach_pub.publish(Bool(data=True))
-            elif self.mode == OperatorCommand.MODE_WALL:
+            elif self.mode in (OperatorCommand.MODE_WALL, OperatorCommand.MODE_INCLINE):
                 self.wall_detach_pub.publish(Bool(data=True))
             self.detach_pulse = False
 
@@ -294,6 +382,7 @@ class TerminalOperatorNode:
         command.enable_control = self.mode in (
             OperatorCommand.MODE_CEILING,
             OperatorCommand.MODE_WALL,
+            OperatorCommand.MODE_INCLINE,
         )
         command.source = "terminal"
         command.reason = "detach pending" if self.detaching else "terminal request"

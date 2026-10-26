@@ -272,7 +272,7 @@ class AttachmentSafetyTest(unittest.TestCase):
         )
         status.attitude_setpoint.w = 1.0
 
-        candidate = CeilingDecision._build_control_candidate(status)
+        candidate = CeilingDecision._build_control_candidate(CeilingDecision.__new__(CeilingDecision), status)
 
         self.assertEqual(
             candidate.kind,
@@ -376,7 +376,7 @@ class AttachmentSafetyTest(unittest.TestCase):
 
         node._update_state_machine(rospy.Time.from_sec(10.0))
 
-        self.assertEqual(node.state, CeilingAttachmentStatus.STATE_FAULT)
+        self.assertEqual(node.state, CeilingAttachmentStatus.STATE_ABORT)
 
     def test_ceiling_detach_reduces_thrust_and_uses_safe_distance(self):
         node = CeilingDecision.__new__(CeilingDecision)

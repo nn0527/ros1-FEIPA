@@ -160,10 +160,10 @@ class PilotModeTests(unittest.TestCase):
         timer=mock.patch.object(rospy.Time,'now',return_value=rospy.Time.from_sec(10.))
         timer.start();self.addCleanup(timer.stop)
 
-    def test_wall_posctl_ceiling_altctl_and_rpc_does_not_accept_old_return_mode(self):
+    def test_wall_and_ceiling_posctl_and_rpc_does_not_accept_old_return_mode(self):
         manager=Manager.__new__(Manager);manager.wall_pilot_mode='POSCTL';manager.selected_mode=OperatorCommand.MODE_WALL
         self.assertEqual(manager._pilot_mode(),'POSCTL')
-        self.assertEqual(manager._pilot_mode(OperatorCommand.MODE_CEILING),'ALTCTL')
+        self.assertEqual(manager._pilot_mode(OperatorCommand.MODE_CEILING),'POSCTL')
         manager.phase=Manager.RETURNING;manager.set_mode=mock.Mock();manager.request_in_flight=True
         manager.flight=State(connected=True,armed=True,mode='OFFBOARD')
         manager.flight_at=rospy.Time.now();manager.state_timeout_s=1.5
@@ -187,7 +187,7 @@ class PilotModeTests(unittest.TestCase):
         manager.estimator.pos_horiz_rel_status_flag=True;manager.wall_at=rospy.Time.from_sec(8.)
         self.assertFalse(manager._wall_horizontal_ready(rospy.Time.now(),stable=True))
 
-    def test_terminal_wall_posctl_return_clears_request_but_ceiling_keeps_altctl(self):
+    def test_terminal_wall_and_ceiling_use_posctl(self):
         with mock.patch.object(rospy,'get_param',side_effect=lambda k,d=None:'POSCTL' if k=='/flight_mode_manager_node/wall_pilot_mode' else d),mock.patch.object(rospy,'Publisher'),mock.patch.object(rospy,'Subscriber'),mock.patch.object(rospy,'Timer'),mock.patch.object(rospy,'set_param'):
             terminal=Terminal();terminal._on_state(State(connected=True,armed=True,mode='POSCTL'))
             terminal._apply_command(String(data='wall'))
@@ -196,6 +196,9 @@ class PilotModeTests(unittest.TestCase):
             terminal._on_state(State(connected=True,armed=True,mode='POSCTL'))
             self.assertEqual(terminal.mode,OperatorCommand.MODE_STANDBY)
             terminal._apply_command(String(data='ceiling'))
+            self.assertEqual(terminal.mode,OperatorCommand.MODE_CEILING)
+            terminal._on_state(State(connected=True,armed=True,mode='OFFBOARD'))
+            terminal._on_state(State(connected=True,armed=True,mode='POSCTL'))
             self.assertEqual(terminal.mode,OperatorCommand.MODE_STANDBY)
 
 

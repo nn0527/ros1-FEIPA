@@ -518,6 +518,7 @@ class ConsoleTests(unittest.TestCase):
 
     def ceiling_ready(self):
         self.ready()
+        self.state.update("state", {"connected": True, "armed": True, "mode": "POSCTL"})
         self.state.update("runtime", {"enabled": True, "ceiling_enabled": True})
         self.state.update("ceiling_status", {"state_name": "NORMAL_FLIGHT", "reason": "idle"})
         self.state.update("ceiling", {"range_m": .4})

@@ -57,9 +57,8 @@ ceiling_attachment_decision_node:
   # ===========================================================================
   # 5. 靠近阶段
   # 进入 APPROACH 后先等待 approach_settle_time_s，再以固定速度向上靠近。
-  # 超过 approach_timeout_s 未接触则锁存 FAULT，由模式管理器交回 ALTCTL。
-  # 控制台分支的吸附控制入口，与后续贴顶接触确认距离独立。
-  approach_contact_distance_m: 0.07
+  # 超过 approach_timeout_s 未接触则锁存 FAULT，由模式管理器交回 POSCTL。
+  # 控制台分支单帧顶距达到 wall_contact_distance_m 后直接进入保持。
   # ===========================================================================
   approach_settle_time_s: 0.50
   approach_speed_mps: 0.15
@@ -67,12 +66,10 @@ ceiling_attachment_decision_node:
 
   # ===========================================================================
   # 6. 接触确认与稳定判定
-  # 控制台分支：原始顶距和最近3点中位数均 <= 0.067m，连续1秒，
-  # 从 ATTACH_CONTROL 进入 SURFACE_HOLD。
+  # 控制台分支：单帧有效原始顶距 <= 0.067m，直接进入 SURFACE_HOLD。
   # 普通分支：压缩量 >= attach_confirm_compression_m，并持续 attach_confirm_time_s。
   # ===========================================================================
   wall_contact_distance_m: 0.067
-  wall_contact_hold_s: 1.0
   attach_control_time_s: 0.50
   # 接触后若距离仍未进入稳定区间，最多尝试该时长，然后受控脱离。
   attach_control_timeout_s: 5.00
@@ -91,6 +88,8 @@ ceiling_attachment_decision_node:
   # 所有推力最终仍受 max_thrust 限制。
   # ===========================================================================
   # 2026-10-13 根据机载日志复核，用户指定悬停基值 0.49；仍需悬停验证。
+  # HOLD超过该时长仍未开始DETACH，进入ABORT并请求PX4 AUTO.LAND。
+  hold_timeout_s: 5.0
   hover_thrust: 0.49
   attach_thrust_multiplier: 1.11
   surface_thrust_multiplier: 1.07
@@ -119,3 +118,54 @@ ceiling_attachment_decision_node:
   mechanism_status_topic: /attachment/mechanism_status
   require_mechanism_ack: true
   mechanism_timeout_s: 1.0
+
+  # POSCTL capture and free-flight stabilization (ENU). Limits are initial values.
+  motion_control_enabled: true
+  horizontal_position_deadband_m: 0.1
+  horizontal_position_kp: 0.3
+  horizontal_max_speed_mps: 0.2
+  horizontal_velocity_kp: 1.5
+  horizontal_velocity_ki: 0.3
+  horizontal_integral_limit_mps2: 0.2
+  horizontal_max_acceleration_mps2: 0.4
+  horizontal_target_acceleration_mps2: 0.1
+  horizontal_drift_warn_m: 0.3
+  horizontal_drift_pause_m: 0.5
+  horizontal_drift_resume_m: 0.3
+  attitude_max_tilt_deg: 10.0
+  contact_max_tilt_deg: 5.0
+  yaw_max_offset_deg: 10.0
+  attitude_tilt_slew_deg_s: 15.0
+  attitude_yaw_slew_deg_s: 15.0
+  actual_tilt_pause_deg: 15.0
+  actual_tilt_resume_deg: 12.0
+  actual_body_rate_pause_deg_s: 30.0
+  actual_body_rate_resume_deg_s: 20.0
+  motion_limit_confirm_s: 0.2
+  motion_resume_hold_s: 0.5
+  motion_feedback_timeout_s: 2.0
+  motion_pause_timeout_s: 8.0
+  motion_flow_timeout_s: 0.6
+  motion_flow_future_tolerance_s: 0.1
+  motion_flow_quality_min: 1.0
+  motion_estimator_timeout_s: 1.5
+  motion_reacquire_time_s: 0.3
+  motion_equilibrium_window_s: 0.5
+  motion_equilibrium_speed_mps: 0.2
+  motion_fcu_target_timeout_s: 0.35
+  motion_capture_timeout_s: 2.0
+  vertical_speed_kp: 0.3
+  vertical_target_acceleration_mps2: 0.15
+  detach_min_down_speed_mps: 0.05
+  recovery_height_kp: 0.5
+  recovery_height_tolerance_m: 0.05
+  recovery_vertical_speed_mps: 0.15
+  recovery_horizontal_speed_mps: 0.15
+  recovery_max_tilt_deg: 10.0
+  recovery_max_rate_deg_s: 20.0
+  recovery_stable_time_s: 0.5
+  recovery_timeout_s: 15.0
+  contact_release_distance_m: 0.1
+  contact_release_hold_s: 0.2
+  odom_position_jump_m: 0.75
+  odom_yaw_jump_deg: 20.0

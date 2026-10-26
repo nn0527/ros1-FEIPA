@@ -7,7 +7,7 @@ uint8 STATE_ATTACH_CONTROL=3
 uint8 STATE_SURFACE_HOLD=4
 uint8 STATE_DETACH=5
 uint8 STATE_RECOVERY_HOVER=6
-uint8 STATE_FAULT=7
+uint8 STATE_ABORT=7
 
 uint8 state
 string state_name
@@ -22,7 +22,7 @@ bool attach_confirmed
 bool distance_stable
 bool fault_detected
 bool detach_failed
-# Latched APPROACH timeout: keep FAULT output until actual ALTCTL handover.
+# Latched APPROACH timeout: keep FAULT output until actual POSCTL handover.
 bool approach_timed_out
 bool integral_reset_request
 bool wheel_stop_request
@@ -54,3 +54,25 @@ bool baro_fresh
 bool baro_reference_ready
 float32 baro_pressure_pa
 float32 hold_pressure_pa
+
+# Ceiling POSCTL capture, free-flight motion envelope and recovery diagnostics.
+bool motion_control_enabled
+bool motion_ready
+bool baseline_ready
+bool motion_paused
+bool recovery_ready
+float32 horizontal_drift_m
+float32 horizontal_speed_mps
+float32 actual_tilt_deg
+float32 actual_body_rate_deg_s
+float32 yaw_reference_rad
+float32 recovery_target_height_m
+float32 target_vertical_speed_mps
+string motion_reason
+
+# HOLD watchdog: explicit abort requests PX4 AUTO.LAND through the mode manager.
+bool abort_land_requested
+bool hold_timed_out
+string abort_maneuver_id
+float32 hold_elapsed_s
+float32 hold_timeout_s

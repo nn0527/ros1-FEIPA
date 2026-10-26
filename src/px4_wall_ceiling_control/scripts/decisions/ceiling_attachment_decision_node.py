@@ -6,7 +6,6 @@ The shared two-sensor range arbiter feeds this decision. MAVROS translation belo
 """
 
 import math
-from statistics import median
 
 import rospy
 from geometry_msgs.msg import Quaternion
@@ -29,7 +28,10 @@ from px4_wall_ceiling_control.msg import (
 )
 
 
-class CeilingAttachmentDecisionNode:
+from px4_wall_ceiling_control.adapters.ceiling_motion import CeilingMotionMixin, locked_ceiling_callback
+
+
+class CeilingAttachmentDecisionNode(CeilingMotionMixin):
     STATE_NAMES = {
         CeilingAttachmentStatus.STATE_NORMAL_FLIGHT: "NORMAL_FLIGHT",
         CeilingAttachmentStatus.STATE_CEILING_ARMED: "CEILING_ARMED",
@@ -38,7 +40,7 @@ class CeilingAttachmentDecisionNode:
         CeilingAttachmentStatus.STATE_SURFACE_HOLD: "SURFACE_HOLD",
         CeilingAttachmentStatus.STATE_DETACH: "DETACH",
         CeilingAttachmentStatus.STATE_RECOVERY_HOVER: "RECOVERY_HOVER",
-        CeilingAttachmentStatus.STATE_FAULT: "FAULT",
+        CeilingAttachmentStatus.STATE_ABORT: "ABORT",
     }
 
     def __init__(self):
@@ -153,14 +155,14 @@ class CeilingAttachmentDecisionNode:
         )
 
         self.console_contact_profile = bool(rospy.get_param("~console_contact_profile", False))
-        self.activation_hold_s = float(rospy.get_param("~activation_hold_s", 0.30))
         self.wall_contact_distance_m = float(rospy.get_param("~wall_contact_distance_m", 0.067))
-        self.approach_contact_distance_m = float(rospy.get_param("~approach_contact_distance_m", 0.07))
-        if not math.isfinite(self.approach_contact_distance_m) or self.approach_contact_distance_m <= 0:
-            raise ValueError("approach_contact_distance_m must be finite and positive")
-        self.wall_contact_hold_s = float(rospy.get_param("~wall_contact_hold_s", 1.0))
-        self.wall_contact_window_samples = max(3, int(rospy.get_param("~wall_contact_window_samples", 3)))
         self.surface_hold_thrust = float(rospy.get_param("~surface_hold_thrust", 0.50))
+        self.hold_timeout_s = float(rospy.get_param("~hold_timeout_s", 5.0))
+        if not math.isfinite(self.hold_timeout_s) or self.hold_timeout_s <= 0:
+            raise ValueError("hold_timeout_s must be finite and positive")
+        self.hold_timed_out = False
+        self.abort_maneuver_id = ''
+        self.hold_elapsed_at_abort = 0.
         self.detach_baro_height_enabled = bool(rospy.get_param("~detach_baro_height_enabled", False))
         self.baro_timeout_s = float(rospy.get_param("~baro_timeout_s", 1.0))
         if not math.isfinite(self.baro_timeout_s) or self.baro_timeout_s <= 0:
@@ -177,12 +179,10 @@ class CeilingAttachmentDecisionNode:
         self.detach_height_kp = float(rospy.get_param("~detach_height_kp", 0.50))
         self.detach_velocity_kp = float(rospy.get_param("~detach_velocity_kp", 0.30))
         if not (0 < self.surface_hold_thrust <= self.max_thrust and 0 < self.detach_height_tolerance_m < self.detach_drop_m
-                and self.activation_hold_s > 0 and self.wall_contact_hold_s > 0 and self.detach_height_hold_s > 0
+                and self.detach_height_hold_s > 0
                 and self.detach_down_speed_mps > 0 and self.detach_height_kp > 0 and self.detach_velocity_kp > 0):
             raise ValueError("invalid ceiling console profile parameters")
-        self.activation_since = self.activation_last_sample_at = None
-        self.contact_samples = []
-        self.contact_near_samples = 0
+        self.activation_sample_at = self.hold_sample_at = None
         self.detach_start_height_m = None
         self.detach_height_since = self.detach_height_last_sample_at = None
         self.detach_height_processed_at = None
@@ -219,6 +219,8 @@ class CeilingAttachmentDecisionNode:
         self.attach_thrust_command = self._attach_base_thrust()
         self.fault_count = 0
         self.last_reason = "initialized"
+
+        self._init_ceiling_motion()
 
         range_topic = rospy.get_param("~range_topic", "/sensor/ceiling/range")
         odom_topic = rospy.get_param(
@@ -315,13 +317,13 @@ class CeilingAttachmentDecisionNode:
         self.attach_thrust_command = thrust
         return thrust
 
+    @locked_ceiling_callback
     def _on_range(self, message):
         if not is_valid_range(message):
             if getattr(self, "console_contact_profile", False):
                 self.range_received_at = None
-                self.activation_since = self.activation_last_sample_at = None
+                self.activation_sample_at = self.hold_sample_at = None
                 self.attach_detected_at = self.attach_last_sample_at = None
-                self.contact_samples = []; self.contact_near_samples = 0
             return
         now = rospy.Time.now()
         reset_filter = not is_fresh(
@@ -337,17 +339,15 @@ class CeilingAttachmentDecisionNode:
             )
         if getattr(self, "console_contact_profile", False):
             if reset_filter:
-                self.activation_since = self.activation_last_sample_at = None
+                self.activation_sample_at = self.hold_sample_at = None
                 self.attach_detected_at = self.attach_last_sample_at = None
-                self.contact_samples = []; self.contact_near_samples = 0
-            self.activation_since, self.activation_last_sample_at = self._record_hold_sample(
-                message.range <= self.activation_distance_m, now, self.activation_since)
-            if self.state in (CeilingAttachmentStatus.STATE_APPROACH, CeilingAttachmentStatus.STATE_ATTACH_CONTROL):
-                self.contact_samples.append(message.range)
-                self.contact_samples = self.contact_samples[-self.wall_contact_window_samples:]
-                self.distance_filtered_m = median(self.contact_samples)
-                self.contact_near_samples = self.contact_near_samples + 1 if message.range <= self.wall_contact_distance_m + 1.0e-7 else 0
-            condition = message.range <= self.wall_contact_distance_m + 1.0e-7 and self.distance_filtered_m <= self.wall_contact_distance_m + 1.0e-7
+            # Keep a qualifying frame until the decision timer consumes it or it
+            # expires. A later frame in the same callback burst cannot hide it.
+            if message.range <= self.activation_distance_m:
+                self.activation_sample_at = now
+            if message.range <= self.wall_contact_distance_m + 1.0e-7:
+                self.hold_sample_at = now
+            condition = message.range <= self.wall_contact_distance_m + 1.0e-7
         else:
             condition = self.contact_distance_m - self.distance_filtered_m >= self.attach_confirm_compression_m
         compression = self.contact_distance_m - self.distance_filtered_m
@@ -377,12 +377,12 @@ class CeilingAttachmentDecisionNode:
             self.detach_clear_since,
         )
 
+    @locked_ceiling_callback
     def _on_sensor_health(self, message):
         if getattr(self, "console_contact_profile", False) and not message.ceiling_valid:
             self.range_received_at = None
-            self.activation_since = self.activation_last_sample_at = None
+            self.activation_sample_at = self.hold_sample_at = None
             self.attach_detected_at = self.attach_last_sample_at = None
-            self.contact_samples = []; self.contact_near_samples = 0
 
     def _baro_enabled(self):
         return getattr(self, "console_contact_profile", False) and getattr(self, "detach_baro_height_enabled", False)
@@ -391,7 +391,16 @@ class CeilingAttachmentDecisionNode:
         return (is_fresh(self.baro_received_at, self.baro_timeout_s, now)
                 and self.baro_pressure_pa is not None)
 
+    @locked_ceiling_callback
     def _on_pressure(self, message):
+        if getattr(self, "motion_enabled", False):
+            from px4_wall_ceiling_control.freshness import is_fresh_source
+            previous = getattr(self, "motion_pressure_source", None)
+            if (not is_fresh_source(message.header.stamp, self.baro_timeout_s, rospy.Time.now())
+                    or (previous is not None and message.header.stamp <= previous)):
+                self.baro_received_at = None
+                return
+            self.motion_pressure_source = message.header.stamp
         p = message.fluid_pressure
         # ROS1 MAVROS HIGHRES_IMU can publish hPa despite FluidPressure's Pa contract.
         # Disjoint atmospheric bands normalize either representation before ratio calculations.
@@ -408,25 +417,37 @@ class CeilingAttachmentDecisionNode:
             self.hold_pressure_pa = p
             rospy.loginfo("Ceiling hold barometer reference captured: %.3f Pa", p)
 
+    @locked_ceiling_callback
     def _on_odom(self, message):
+        self._motion_observe_odom(message)
         self.odom = message
         self.odom_received_at = rospy.Time.now()
 
+    @locked_ceiling_callback
     def _on_state(self, message):
+        if getattr(self, "motion_enabled", False):
+            from px4_wall_ceiling_control.freshness import is_fresh_source
+            if (not is_fresh_source(message.header.stamp, self.state_timeout_s, rospy.Time.now())
+                    or (self.flight_state is not None and message.header.stamp <= self.flight_state.header.stamp)):
+                return
+        self._motion_observe_state(message)
         self.flight_state = message
         self.flight_state_received_at = rospy.Time.now()
 
+    @locked_ceiling_callback
     def _on_operator(self, message):
         if (getattr(self, "console_contact_profile", False) and message.mode == OperatorCommand.MODE_CEILING
                 and message.enable_control and (self.operator is None or self.operator.mode != message.mode or not self.operator.enable_control)):
-            self.activation_since = self.activation_last_sample_at = None
+            self.activation_sample_at = self.hold_sample_at = None
         self.operator = message
         self.operator_received_at = rospy.Time.now()
 
+    @locked_ceiling_callback
     def _on_detach(self, message):
         if message.data:
             self.detach_requested = True
 
+    @locked_ceiling_callback
     def _on_mechanism_status(self, message):
         self.mechanism_status = message
         self.mechanism_status_received_at = rospy.Time.now()
@@ -517,13 +538,22 @@ class CeilingAttachmentDecisionNode:
             self.STATE_NAMES[new_state],
             reason,
         )
+        self._motion_enter_state(new_state, now)
         self.state = new_state
         self.state_entered_at = now
         self.last_reason = reason
+        if new_state in (CeilingAttachmentStatus.STATE_NORMAL_FLIGHT, CeilingAttachmentStatus.STATE_SURFACE_HOLD):
+            self.hold_timed_out = False
+            self.abort_maneuver_id = ''
+            self.hold_elapsed_at_abort = 0.
+        if new_state == CeilingAttachmentStatus.STATE_ABORT and self._landing_abort():
+            self.rearm_required = True
+            self.detach_requested = False
+            self.mechanism_sequence += 1
+            self.abort_maneuver_id = 'ceiling-abort-%d-%d' % (now.to_nsec(), self.mechanism_sequence)
         if new_state in (CeilingAttachmentStatus.STATE_NORMAL_FLIGHT, CeilingAttachmentStatus.STATE_CEILING_ARMED):
             self.approach_timed_out = False
         if getattr(self, "console_contact_profile", False):
-            self.contact_samples = []; self.contact_near_samples = 0
             if new_state == CeilingAttachmentStatus.STATE_SURFACE_HOLD and self._baro_enabled():
                 self.hold_pressure_pa = self.baro_pressure_pa if self._baro_fresh(now) else None
                 self.baro_handover_reached = False
@@ -531,6 +561,7 @@ class CeilingAttachmentDecisionNode:
                 self.detach_start_height_m = (0.0 if self.hold_pressure_pa is not None else None) if self._baro_enabled() else self._height_feedback(now)
                 self.detach_height_since = self.detach_height_last_sample_at = self.detach_height_processed_at = None
             elif new_state == CeilingAttachmentStatus.STATE_NORMAL_FLIGHT:
+                self.activation_sample_at = self.hold_sample_at = None
                 self.detach_start_height_m = None
                 self.hold_pressure_pa = None
                 self.baro_handover_reached = False
@@ -559,7 +590,7 @@ class CeilingAttachmentDecisionNode:
             self.attach_thrust_command = self._attach_base_thrust()
         elif new_state in (
             CeilingAttachmentStatus.STATE_RECOVERY_HOVER,
-            CeilingAttachmentStatus.STATE_FAULT,
+            CeilingAttachmentStatus.STATE_ABORT,
         ):
             self.rearm_required = True
 
@@ -574,9 +605,13 @@ class CeilingAttachmentDecisionNode:
         return abs(roll) > self.max_roll_rad or abs(pitch) > self.max_pitch_rad
 
     def _contact_lost(self):
+        # The console enters HOLD on one raw frame; pre-contact filter history
+        # must not immediately undo that transition as a false loss of contact.
+        distance = (self.range_message.range if getattr(self, "console_contact_profile", False)
+                    and self.range_message is not None else self.distance_filtered_m)
         return bool(
-            self.distance_filtered_m is not None
-            and self.distance_filtered_m
+            distance is not None
+            and distance
             > self.contact_distance_m + self.lost_contact_margin_m
         )
 
@@ -589,8 +624,8 @@ class CeilingAttachmentDecisionNode:
         return held_samples(fresh, since, last_sample_at, duration)
 
     def _activation_ready(self, now):
-        return self._held_samples(self._range_fresh(now), self.activation_since,
-                                  self.activation_last_sample_at, self.activation_hold_s)
+        return (self._range_fresh(now)
+                and is_fresh(self.activation_sample_at, self.range_timeout_s, now))
 
     def _height_feedback(self, now):
         if self._baro_enabled():
@@ -622,16 +657,16 @@ class CeilingAttachmentDecisionNode:
 
     def _attach_confirmed(self, now):
         fresh = self._range_fresh(now)
+        if getattr(self, "console_contact_profile", False):
+            return fresh and is_fresh(self.hold_sample_at, self.range_timeout_s, now)
         if not fresh:
             self.attach_detected_at = None
             self.attach_last_sample_at = None
-        if getattr(self, "console_contact_profile", False) and self.contact_near_samples < self.wall_contact_window_samples:
-            return False
         return self._held_samples(
             fresh,
             self.attach_detected_at,
             self.attach_last_sample_at,
-            self.wall_contact_hold_s if getattr(self, "console_contact_profile", False) else self.attach_confirm_time_s,
+            self.attach_confirm_time_s,
         )
 
     def _distance_stable(self, now):
@@ -658,7 +693,32 @@ class CeilingAttachmentDecisionNode:
             self.detach_clear_hold_s,
         )
 
+    def _landing_abort(self):
+        return (self.state == CeilingAttachmentStatus.STATE_ABORT
+                and getattr(self, "hold_timed_out", False))
+
     def _update_state_machine(self, now):
+        # Latch landing ABORT through flight-mode handoff; ordinary recovery must
+        # not turn an automatic landing request into a POSCTL return.
+        if self._landing_abort():
+            flight = self.flight_state
+            if (flight is not None and flight.connected and not flight.armed
+                    and is_fresh(self.flight_state_received_at, self.state_timeout_s, now)
+                    and not self._mode_requested(now)):
+                self._enter_state(CeilingAttachmentStatus.STATE_NORMAL_FLIGHT, now,
+                                  "ceiling abort finished after disarm and request release")
+            return
+        # A normal detach/cancel accepted on this tick has priority. Once DETACH
+        # starts its own timeout/recovery applies, never the HOLD watchdog.
+        if (self.state == CeilingAttachmentStatus.STATE_SURFACE_HOLD
+                and self._state_age_s(now) > self.hold_timeout_s
+                and not self.detach_requested and self._mode_requested(now)):
+            self.hold_elapsed_at_abort = self._state_age_s(now)
+            self.hold_timed_out = True
+            self.fault_count += 1
+            self._enter_state(CeilingAttachmentStatus.STATE_ABORT, now,
+                              "HOLD超过%.2fs未启动脱离：ABORT，请求PX4 AUTO.LAND" % self.hold_timeout_s)
+            return
         profile = getattr(self, "console_contact_profile", False)
         previous_tick = getattr(self, "range_wait_tick", now)
         previous_wait = getattr(self, "range_wait_active", False)
@@ -671,13 +731,20 @@ class CeilingAttachmentDecisionNode:
         ):
             self.state_entered_at += rospy.Duration(max(0.0, (now-previous_tick).to_sec()))
         if (self._baro_enabled() and self.baro_handover_reached
-                and self.state == CeilingAttachmentStatus.STATE_DETACH
+                and self.state == CeilingAttachmentStatus.STATE_RECOVERY_HOVER
+                and getattr(self, "motion_recovery_ready", False)
                 and is_fresh(self.flight_state_received_at, self.state_timeout_s, now)
                 and self.flight_state is not None and self.flight_state.connected
-                and self.flight_state.mode.upper() == "ALTCTL"):
+                and self.flight_state.mode.upper() == "POSCTL"):
             self._enter_state(CeilingAttachmentStatus.STATE_NORMAL_FLIGHT, now,
-                              "barometer descent complete; PX4 ALTCTL handover confirmed")
+                              "barometer descent complete; PX4 POSCTL handover confirmed")
             return
+        if (getattr(self, "motion_enabled", False) and self.motion_fatal
+                and self.state != CeilingAttachmentStatus.STATE_ABORT
+                and self._flight_ready(now)
+                and (self._mode_requested(now) or self.motion_controller.xy is not None)):
+            self.detach_failed = self.state in (CeilingAttachmentStatus.STATE_DETACH, CeilingAttachmentStatus.STATE_RECOVERY_HOVER)
+            self._enter_state(CeilingAttachmentStatus.STATE_ABORT, now, self.motion_fatal)
         mode_requested = self._mode_requested(now)
         arm_requested = self._arm_requested(now)
         range_fresh = self._range_fresh(now)
@@ -698,13 +765,14 @@ class CeilingAttachmentDecisionNode:
             (not range_fresh and not profile)
             or not odom_fresh
             or self._tilt_fault(now)
+            or getattr(self, "motion_contact_unsafe", False)
             or (range_fresh and self._contact_lost())
         ):
             self.fault_count += 1
             target = (
                 CeilingAttachmentStatus.STATE_DETACH
                 if flight_ready
-                else CeilingAttachmentStatus.STATE_FAULT
+                else CeilingAttachmentStatus.STATE_ABORT
             )
             self._enter_state(target, now, "attached input or contact safety lost")
 
@@ -725,8 +793,10 @@ class CeilingAttachmentDecisionNode:
                 and flight_ready
                 and range_fresh
                 and odom_fresh
+                and (not getattr(self, "motion_enabled", False) or self.motion_controller.xy is not None)
             ):
-                self._capture_hover_attitude()
+                if not getattr(self, "motion_enabled", False):
+                    self._capture_hover_attitude()
                 self._enter_state(
                     CeilingAttachmentStatus.STATE_CEILING_ARMED,
                     now,
@@ -748,7 +818,7 @@ class CeilingAttachmentDecisionNode:
             ):
                 self.fault_count += 1
                 self._enter_state(
-                    CeilingAttachmentStatus.STATE_FAULT,
+                    CeilingAttachmentStatus.STATE_ABORT,
                     now,
                     "armed input or flight state lost",
                 )
@@ -760,6 +830,7 @@ class CeilingAttachmentDecisionNode:
                 if (
                     (self._activation_ready(now) if getattr(self, "console_contact_profile", False) else self.distance_filtered_m < self.activation_distance_m)
                     and math.isfinite(vertical_speed)
+                    and (not getattr(self, "motion_enabled", False) or (self.motion_ready and not self.motion_paused))
                 ):
                     self._enter_state(
                         CeilingAttachmentStatus.STATE_APPROACH,
@@ -770,7 +841,7 @@ class CeilingAttachmentDecisionNode:
         elif self.state == CeilingAttachmentStatus.STATE_APPROACH:
             if not mode_requested:
                 self._enter_state(
-                    CeilingAttachmentStatus.STATE_FAULT,
+                    CeilingAttachmentStatus.STATE_ABORT,
                     now,
                     "ceiling mode released during approach",
                 )
@@ -782,7 +853,7 @@ class CeilingAttachmentDecisionNode:
             ):
                 self.fault_count += 1
                 self._enter_state(
-                    CeilingAttachmentStatus.STATE_FAULT,
+                    CeilingAttachmentStatus.STATE_ABORT,
                     now,
                     "approach input timeout",
                 )
@@ -790,15 +861,22 @@ class CeilingAttachmentDecisionNode:
                 self.fault_count += 1
                 self.approach_timed_out = True
                 self._enter_state(
-                    CeilingAttachmentStatus.STATE_FAULT,
+                    CeilingAttachmentStatus.STATE_ABORT,
                     now,
-                    "approach timeout; waiting for confirmed ALTCTL handover",
+                    "approach timeout; waiting for confirmed POSCTL handover",
+                )
+            elif (profile and self._attach_confirmed(now)
+                  and (not getattr(self, "motion_enabled", False) or (self.motion_ready and not self.motion_paused))):
+                self._enter_state(
+                    CeilingAttachmentStatus.STATE_SURFACE_HOLD, now,
+                    "single ceiling range frame at or below hold threshold",
                 )
             elif (
-                self._state_age_s(now) >= self.approach_settle_time_s
-                and (not profile or len(self.contact_samples) >= self.wall_contact_window_samples)
+                not profile
+                and self._state_age_s(now) >= self.approach_settle_time_s
+                and (not getattr(self, "motion_enabled", False) or (self.motion_ready and not self.motion_paused))
                 and self.distance_filtered_m
-                <= (self.approach_contact_distance_m + 1.0e-7 if getattr(self, "console_contact_profile", False) else self.contact_distance_m + self.contact_margin_m)
+                <= self.contact_distance_m + self.contact_margin_m
             ):
                 self._enter_state(
                     CeilingAttachmentStatus.STATE_ATTACH_CONTROL,
@@ -836,7 +914,7 @@ class CeilingAttachmentDecisionNode:
                 self.detach_failed = True
                 self.fault_count += 1
                 self._enter_state(
-                    CeilingAttachmentStatus.STATE_FAULT,
+                    CeilingAttachmentStatus.STATE_ABORT,
                     now,
                     "detach input or flight state lost",
                 )
@@ -848,14 +926,11 @@ class CeilingAttachmentDecisionNode:
                 self.detach_failed = True
                 self.fault_count += 1
                 self._enter_state(
-                    CeilingAttachmentStatus.STATE_FAULT,
+                    CeilingAttachmentStatus.STATE_ABORT,
                     now,
                     "attachment mechanism release timeout",
                 )
             elif self._mechanism_release_confirmed(now) and (self._detach_height_ready(now) if profile else self._detach_clear(now)):
-                if self._baro_enabled():
-                    self.last_reason = "气压相对吸顶保持高度下降0.50m已达到；立即请求ALTCTL，无速度稳定等待"
-                    return  # Keep continuous attitude output until actual ALTCTL confirmation.
                 self._enter_state(
                     CeilingAttachmentStatus.STATE_RECOVERY_HOVER,
                     now,
@@ -865,33 +940,40 @@ class CeilingAttachmentDecisionNode:
                 self.detach_failed = True
                 self.fault_count += 1
                 self._enter_state(
-                    CeilingAttachmentStatus.STATE_FAULT,
+                    CeilingAttachmentStatus.STATE_ABORT,
                     now,
                     "detach failed: safe separation timeout",
                 )
 
         elif self.state == CeilingAttachmentStatus.STATE_RECOVERY_HOVER:
-            if self._state_age_s(now) >= self.recovery_hover_time_s:
-                self._enter_state(
-                    CeilingAttachmentStatus.STATE_NORMAL_FLIGHT,
-                    now,
-                    "recovery hover complete",
-                )
+            timeout = self.motion_settings.recovery_timeout_s if getattr(self, "motion_enabled", False) else 15.0
+            if self._baro_enabled():
+                if not flight_ready or not odom_fresh or self._height_feedback(now) is None:
+                    self.detach_failed = True
+                    self._enter_state(CeilingAttachmentStatus.STATE_ABORT, now, "recovery feedback or flight state lost")
+                elif self._ceiling_recovery_ready(now):
+                    self.motion_recovery_ready = True
+                    self.last_reason = "离顶恢复已稳定，等待飞控确认POSCTL；持续高度及水平闭环"
+                elif self._state_age_s(now) >= timeout:
+                    self.detach_failed = True
+                    self._enter_state(CeilingAttachmentStatus.STATE_ABORT, now, "recovery did not stabilize before timeout")
+            elif self._ceiling_recovery_ready(now):
+                self._enter_state(CeilingAttachmentStatus.STATE_NORMAL_FLIGHT, now, "recovery hover complete")
 
-        elif self.state == CeilingAttachmentStatus.STATE_FAULT:
+        elif self.state == CeilingAttachmentStatus.STATE_ABORT:
             # Never resume a maneuver from a recovered input stream. The pilot
             # must first release the ceiling switch and take over/re-arm.
-            timeout_handover_confirmed = not getattr(self, "approach_timed_out", False) or bool(
+            timeout_handover_confirmed = (not getattr(self, "approach_timed_out", False) and not getattr(self, "motion_enabled", False)) or bool(
                 self.flight_state is not None
                 and is_fresh(self.flight_state_received_at, self.state_timeout_s, now)
                 and self.flight_state.connected
-                and self.flight_state.mode.upper() == "ALTCTL"
+                and self.flight_state.mode.upper() == "POSCTL"
             )
-            if not mode_requested and timeout_handover_confirmed:
+            if timeout_handover_confirmed and (not mode_requested or getattr(self, "motion_enabled", False)):
                 self._enter_state(
                     CeilingAttachmentStatus.STATE_NORMAL_FLIGHT,
                     now,
-                    "fault acknowledged by switch release",
+                    "abort acknowledged by switch release",
                 )
 
     def _detach_thrust(self, dt):
@@ -938,9 +1020,9 @@ class CeilingAttachmentDecisionNode:
         command.header.stamp = now
         command.source = AttachmentMechanismCommand.SOURCE_CEILING
         command.sequence = self.mechanism_sequence
-        if self.state == CeilingAttachmentStatus.STATE_DETACH:
+        if self.state == CeilingAttachmentStatus.STATE_DETACH or self._landing_abort():
             command.action = AttachmentMechanismCommand.ACTION_RELEASE
-            command.reason = "ceiling detach"
+            command.reason = "ceiling abort landing" if self.state == CeilingAttachmentStatus.STATE_ABORT else "ceiling detach"
         elif self.state in (
             CeilingAttachmentStatus.STATE_ATTACH_CONTROL,
             CeilingAttachmentStatus.STATE_SURFACE_HOLD,
@@ -956,6 +1038,11 @@ class CeilingAttachmentDecisionNode:
         status = CeilingAttachmentStatus()
         status.header.stamp = now
         status.approach_timed_out = self.approach_timed_out
+        status.abort_land_requested = self._landing_abort()
+        status.hold_timed_out = self.hold_timed_out
+        status.abort_maneuver_id = self.abort_maneuver_id
+        status.hold_elapsed_s = self._state_age_s(now) if self.state == CeilingAttachmentStatus.STATE_SURFACE_HOLD else self.hold_elapsed_at_abort
+        status.hold_timeout_s = self.hold_timeout_s
         status.height_source = "barometer_hold_relative" if self._baro_enabled() else "px4_odom"
         status.baro_fresh = self._baro_fresh(now)
         status.baro_reference_ready = self.hold_pressure_pa is not None
@@ -965,7 +1052,7 @@ class CeilingAttachmentDecisionNode:
         z = self._height_feedback(now) if getattr(self, "console_contact_profile", False) else None
         status.detach_start_height_m = self.detach_start_height_m if getattr(self, "detach_start_height_m", None) is not None else math.nan
         status.descended_height_m = self.detach_start_height_m-z if z is not None and self.detach_start_height_m is not None else math.nan
-        status.detach_height_ready = self._detach_height_ready(now) if self.state == CeilingAttachmentStatus.STATE_DETACH and getattr(self, "console_contact_profile", False) else False
+        status.detach_height_ready = self._detach_height_ready(now) if self.state in (CeilingAttachmentStatus.STATE_DETACH, CeilingAttachmentStatus.STATE_RECOVERY_HOVER) and getattr(self, "console_contact_profile", False) else False
         status.state = self.state
         status.state_name = self.STATE_NAMES[self.state]
         # Keep ownership through controlled detach/recovery even if the
@@ -978,7 +1065,7 @@ class CeilingAttachmentDecisionNode:
             CeilingAttachmentStatus.STATE_SURFACE_HOLD,
             CeilingAttachmentStatus.STATE_DETACH,
             CeilingAttachmentStatus.STATE_RECOVERY_HOVER,
-            CeilingAttachmentStatus.STATE_FAULT,
+            CeilingAttachmentStatus.STATE_ABORT,
         )
         status.acquire_request = bool(
             self.state == CeilingAttachmentStatus.STATE_CEILING_ARMED
@@ -986,6 +1073,11 @@ class CeilingAttachmentDecisionNode:
             and self._flight_ready(now)
         )
         status.keep_ownership = status.enabled
+        if (status.abort_land_requested and self.flight_state is not None
+                and self.flight_state.connected
+                and is_fresh(self.flight_state_received_at, self.state_timeout_s, now)
+                and self.flight_state.mode.upper() != 'OFFBOARD'):
+            status.keep_ownership = False
         status.range_fresh = self._range_fresh(now)
         status.odom_fresh = self._odom_fresh(now)
         status.flight_state_fresh = self._flight_ready(now)
@@ -1011,7 +1103,7 @@ class CeilingAttachmentDecisionNode:
             or not status.odom_fresh
             or self._tilt_fault(now)
             or not status.flight_state_fresh
-            or self.state == CeilingAttachmentStatus.STATE_FAULT
+            or self.state == CeilingAttachmentStatus.STATE_ABORT
             or (
                 self.state
                 in (
@@ -1032,9 +1124,7 @@ class CeilingAttachmentDecisionNode:
             self.state == CeilingAttachmentStatus.STATE_DETACH
             or status.fault_detected
         )
-        status.mechanism_release_requested = bool(
-            self.state == CeilingAttachmentStatus.STATE_DETACH
-        )
+        status.mechanism_release_requested = self.state == CeilingAttachmentStatus.STATE_DETACH or status.abort_land_requested
         status.mechanism_release_confirmed = self._mechanism_release_confirmed(now)
         status.approach_velocity_z_enu_mps = math.nan
         status.thrust_body_z_normalized = math.nan
@@ -1064,7 +1154,13 @@ class CeilingAttachmentDecisionNode:
                 status.thrust_body_z_normalized = -self._surface_hold_thrust()
             status.attitude_setpoint_valid = True
             status.attitude_setpoint = self.q_hover
-        elif self.state == CeilingAttachmentStatus.STATE_FAULT:
+        elif status.abort_land_requested:
+            # Continue bounded contact support only until PX4 actually leaves
+            # OFFBOARD; AUTO.LAND owns descent and does not wait for baro/flow.
+            status.thrust_body_z_normalized = -self._surface_hold_thrust()
+            status.attitude_setpoint_valid = True
+            status.attitude_setpoint = self.q_hover
+        elif self.state == CeilingAttachmentStatus.STATE_ABORT:
             status.thrust_body_z_normalized = -self.hover_thrust
             status.attitude_setpoint_valid = True
             status.attitude_setpoint = self.q_hover
@@ -1089,7 +1185,9 @@ class CeilingAttachmentDecisionNode:
         status.fault_count = self.fault_count
         status.reason = self.last_reason
         if getattr(self, "console_contact_profile", False) and not status.range_fresh:
-            action = (("按气压高度下降0.50m并交回ALTCTL" if self._baro_enabled() else "按PX4高度下降20cm并交回ALTCTL") if self.state == CeilingAttachmentStatus.STATE_DETACH
+            action = (("按气压高度下降0.50m，恢复稳定后交回POSCTL" if self._baro_enabled() else "按PX4高度下降20cm并交回POSCTL") if self.state == CeilingAttachmentStatus.STATE_DETACH
+                      else "ABORT等待PX4 AUTO.LAND确认" if status.abort_land_requested
+                      else "ABORT受限支撑，等待POSCTL接管" if self.state == CeilingAttachmentStatus.STATE_ABORT
                       else "保持推力0.50" if self.state == CeilingAttachmentStatus.STATE_SURFACE_HOLD
                       else "暂停接近，等待有效数据")
             status.reason += "; 顶部雷达无效或过期：" + action
@@ -1097,20 +1195,25 @@ class CeilingAttachmentDecisionNode:
             status.reason += "; 气压数据缺失、无效或过期，禁止据此确认离顶完成"
         elif self._baro_enabled() and self.state == CeilingAttachmentStatus.STATE_SURFACE_HOLD and not status.baro_reference_ready:
             status.reason += "; 等待气压数据建立吸顶保持高度基准"
+        self._apply_ceiling_motion_status(status, now, dt)
         return status
 
-    @staticmethod
-    def _build_control_candidate(status):
+    def _build_control_candidate(self, status):
         candidate = AttachmentControlCandidate()
         candidate.header = status.header
         candidate.source = AttachmentControlCandidate.SOURCE_CEILING
         candidate.acquire_request = status.acquire_request
         candidate.keep_ownership = status.keep_ownership
+        candidate.ceiling_abort_land_requested = status.abort_land_requested
         candidate.reason = status.reason
         candidate.velocity_z_enu_mps = math.nan
         candidate.thrust_normalized = math.nan
 
-        if status.state == CeilingAttachmentStatus.STATE_APPROACH and math.isfinite(
+        if getattr(self, "motion_enabled", False) and status.attitude_setpoint_valid and math.isfinite(status.thrust_body_z_normalized):
+            candidate.kind = AttachmentControlCandidate.KIND_ATTITUDE_THRUST
+            candidate.attitude_setpoint = status.attitude_setpoint
+            candidate.thrust_normalized = -status.thrust_body_z_normalized
+        elif status.state == CeilingAttachmentStatus.STATE_APPROACH and math.isfinite(
             status.approach_velocity_z_enu_mps
         ):
             candidate.kind = AttachmentControlCandidate.KIND_VERTICAL_VELOCITY
@@ -1132,12 +1235,23 @@ class CeilingAttachmentDecisionNode:
         else:
             candidate.kind = AttachmentControlCandidate.KIND_NONE
 
+        if getattr(self, "motion_enabled", False):
+            self.motion_sequence += 1
+            candidate.ceiling_yaw_reference_rad = self.motion_controller.yaw
+            candidate.phase_valid = True
+            candidate.control_phase = status.state
+            candidate.maneuver_id = self.motion_id
+            candidate.control_sequence = self.motion_sequence
+            candidate.horizontal_velocity_enabled = True
+            candidate.horizontal_velocity_active = self.motion_ready
+            candidate.approach_paused = self.motion_paused
         candidate.valid = bool(
             status.candidate_valid
             and candidate.kind != AttachmentControlCandidate.KIND_NONE
         )
         return candidate
 
+    @locked_ceiling_callback
     def _on_timer(self, _event):
         now = rospy.Time.now()
         if self.previous_update_at is None:
@@ -1146,6 +1260,7 @@ class CeilingAttachmentDecisionNode:
             dt = clamp((now - self.previous_update_at).to_sec(), 0.001, 0.05)
         self.previous_update_at = now
 
+        self._prepare_ceiling_motion(now)
         self._update_state_machine(now)
         status = self._build_status(now, dt)
         self.status_publisher.publish(status)

@@ -151,7 +151,7 @@ class ConsoleState:
                 ("idle", "待命状态", val("phase") == "IDLE" and val("owner") == 0 and
                  val("operator", {}).get("mode") == 1 and not val("operator", {}).get("enabled", True), "已有动作请求，等待当前流程结束"),
             ]
-            checks.append(("front_mask", "前部雷达控制输入", not runtime.get("front_sensor_masked", False), "前部雷达已屏蔽；确认交回 ALTCTL 后恢复侧吸"))
+            checks.append(("front_mask", "前部雷达控制输入", not runtime.get("front_sensor_masked", False), "前部雷达已屏蔽；确认交回 POSCTL 后恢复侧吸"))
             pending = self.pending_since is not None and now - self.pending_since < 5
             blockers = [reason for _, _, ok, reason in checks if not ok]
             if wall.get("horizontal_velocity_enabled") and not (wall.get("horizontal_velocity_ready") and estimator.get("horizontal_velocity")):
@@ -175,7 +175,7 @@ class ConsoleState:
                 (range_diagnostic_only or bool(health.get("ceiling_valid")), "顶部雷达反馈无效／过期"),
                 (bool(wall.get("state_name") == "WALL_HOLD" and not wall.get("fault_detected")), "仅当前贴墙保持阶段允许离墙"),
                 (bool(val("phase") == "ACTIVE" and val("owner") == 2 and status["setpoint"]["fresh"] and
-                    val("operator", {}).get("mode") == 3 and val("operator", {}).get("enabled")), "贴墙控制链路未就绪"),
+                    val("operator", {}).get("mode") in (3, 5) and val("operator", {}).get("enabled")), "贴墙控制链路未就绪"),
             ]
             detach_blockers = [reason for ok, reason in detach_checks if not ok]
             manual_height_blockers = []
@@ -193,12 +193,17 @@ class ConsoleState:
             ceiling = val("ceiling_status", {})
             common = [reason for i, _, ok, reason in checks if i not in ("height", "health", "front_mask", "mode") and not ok]
             ceiling_checks = [
-                (flight.get("mode") == "ALTCTL", "吸顶请求需从 ALTCTL 模式发起"),
+                (flight.get("mode") == "POSCTL", "吸顶请求需从 POSCTL 模式发起"),
                 (runtime.get("ceiling_enabled"), "吸顶节点未启用；请在落地后重新启动基础程序"),
                 (status["ceiling_status"]["fresh"] and ceiling.get("state_name") == "NORMAL_FLIGHT", "吸顶决策未待命或反馈过期"),
                 (runtime.get("ceiling_distance_gate_enabled") or (health.get("ceiling_valid") and status["ceiling"]["fresh"]), "顶部雷达无效或过期"),
                 ((runtime.get("ceiling_distance_gate_enabled") or (isinstance(val("ceiling", {}).get("range_m"), (int,float)) and 0 < val("ceiling", {}).get("range_m", 99) < runtime.get("ceiling_activation_distance_m", .5))), "需手动接近顶部至激活距离内"),
             ]
+            if runtime.get("ceiling_motion_enabled"):
+                ceiling_checks += [
+                    (ceiling.get("motion_control_enabled") and ceiling.get("motion_ready"), "等待有效光流、位置与速度反馈"),
+                    (ceiling.get("baseline_ready"), "等待稳定POSCTL平衡姿态和推力基准"),
+                ]
             ceiling_blockers = common + [reason for ok, reason in ceiling_checks if not ok]
             ceiling_pending = getattr(self, "ceiling_pending_since", None)
             if ceiling_pending is not None and now-ceiling_pending < 5:
@@ -222,7 +227,18 @@ class ConsoleState:
                     request.update(state="ACTIVE",reason="PX4已确认OFFBOARD，吸顶流程执行中")
                 elif self.ceiling_request_seen and val("operator",{}).get("mode")==1 and val("phase") in ("IDLE","LOCKED"):
                     request.update(state="RELEASED",reason=val("reason") or "吸顶请求已释放，请核对急停和飞控状态")
-            return {"mavros_repair": dict(getattr(self, "mavros_repair", {"state": "IDLE", "reason": "尚未执行连接修复"})), "ceiling_request":request,"can_ceiling": not ceiling_blockers, "ceiling_blockers": ceiling_blockers,
+            incline_blockers = [reason for key, _, ok, reason in checks if key != "mode" and not ok]
+            if wall.get("horizontal_velocity_enabled") and not (wall.get("horizontal_velocity_ready") and estimator.get("horizontal_velocity")):
+                incline_blockers.append("斜墙水平速度接管条件未就绪")
+            if self.launch_error:
+                incline_blockers.append(self.launch_error)
+            if flight.get("mode") != "POSCTL":
+                incline_blockers.append("斜墙请求需从POSCTL发起")
+            if not wall.get("incline_ready"):
+                incline_blockers.append("斜墙未启用、推力未标定或自动接近/水平反馈未启用")
+            if pending or self.starting:
+                incline_blockers.append("已有启动请求等待中")
+            return {"can_incline": not incline_blockers, "incline_blockers": incline_blockers, "mavros_repair": dict(getattr(self, "mavros_repair", {"state": "IDLE", "reason": "尚未执行连接修复"})), "ceiling_request":request,"can_ceiling": not ceiling_blockers, "ceiling_blockers": ceiling_blockers,
                     "can_ceiling_detach": ceiling_detach_ok, "status": status, "checks": [{"id": i, "label": label, "ok": ok, "reason": reason}
                     for i, label, ok, reason in checks], "blockers": blockers, "can_wall": not blockers and not self.starting,
                     "success": bool(success), "starting": self.starting, "pending": pending,
@@ -263,7 +279,20 @@ class ConsoleState:
             if not self.snapshot()["can_ceiling_detach"]:
                 raise ValueError("离顶要求当前吸顶保持、OFFBOARD及新鲜有效反馈")
             publish("detach")
-            self.event("已发送离顶请求；按气压计相对吸顶保持高度下降0.50m后直接交回ALTCTL")
+            self.event("已发送离顶请求；按气压计相对吸顶保持高度下降0.50m后恢复悬停，稳定后交回POSCTL")
+
+    def send_incline(self, publish):
+        with self.lock:
+            current = self.snapshot()
+            if not current["can_incline"]:
+                raise ValueError("；".join(current["incline_blockers"]))
+            self.pending_since = self.clock()
+            try:
+                publish("incline")
+            except Exception:
+                self.pending_since = None
+                raise
+            self.event("斜墙请求已确认接收，等待接近准入")
 
     def send_wall(self, publish):
         # Serialize the preflight check and dispatch across tabs and double clicks.

@@ -1,6 +1,9 @@
 <launch>
   <arg name="rc_wall_toggle_enabled" default="false" />
   <arg name="rc_wall_channel_index" default="11" />
+  <arg name="rc_mode_selector_enabled" default="true" />
+  <arg name="rc_mode_channel_index" default="7" />
+  <arg name="rc_mode_up_is_high" default="false" />
   <!-- Explicit default lets rospy cache this setting instead of querying Master per log. -->
   <param name="/rosout_disable_topics_generation" value="false" />
   <!--
@@ -69,6 +72,8 @@
   <rosparam command="load"
             file="$(find px4_wall_ceiling_control)/config/wall_perch.yaml" />
   <rosparam command="load"
+            file="$(find px4_wall_ceiling_control)/config/incline_attachment.yaml" />
+  <rosparam command="load"
             file="$(find px4_wall_ceiling_control)/config/wall_sensor_fusion.yaml" />
   <rosparam command="load"
             file="$(find px4_wall_ceiling_control)/config/attachment_output.yaml" />
@@ -102,6 +107,9 @@
         name="terminal_operator_node" output="screen">
     <param name="rc_wall_toggle_enabled" value="$(arg rc_wall_toggle_enabled)" />
     <param name="rc_wall_channel_index" value="$(arg rc_wall_channel_index)" />
+    <param name="rc_mode_selector_enabled" value="$(arg rc_mode_selector_enabled)" />
+    <param name="rc_mode_channel_index" value="$(arg rc_mode_channel_index)" />
+    <param name="rc_mode_up_is_high" value="$(arg rc_mode_up_is_high)" />
     <param name="kill_guard_enabled" value="$(arg kill_guard_enabled)" />
   </node>
 

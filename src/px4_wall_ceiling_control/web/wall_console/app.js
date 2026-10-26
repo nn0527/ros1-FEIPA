@@ -56,11 +56,14 @@ function paint(s){
   const ceilingStatus=fresh(s,"ceiling_status");
   const request=s.ceiling_request;
   text("ceilingRequestState", "吸顶请求："+(request?.reason || "尚未发送"));
+  $("inclineAction").disabled=requestBusy || !s.session?.feedback_live || !s.session?.control || !s.can_incline;
+  const incline=fresh(s,"wall");
+  text("inclineReason",incline?.incline_active?"斜墙："+incline.incline_phase+" · "+incline.reason:(s.incline_blockers||[]).join("；")||"斜墙已就绪");
   $("ceilingAction").disabled=requestBusy || !s.session?.feedback_live || !s.session?.control || !s.can_ceiling;
   $("ceilingDetach").disabled=requestBusy || !s.session?.feedback_live || !s.session?.control || !s.can_ceiling_detach;
   text("ceilingBlockReason",s.can_ceiling?"吸顶入口条件已满足":(s.ceiling_blockers || ["等待吸顶服务升级"]).join("；"));
-  const ceilingNames={NORMAL_FLIGHT:"待命",CEILING_ARMED:"吸顶准备",APPROACH:"向上接近",ATTACH_CONTROL:"接触控制",SURFACE_HOLD:"吸顶保持",DETACH:"脱离顶部",RECOVERY_HOVER:"恢复悬停",FAULT:"故障"};
-  text("ceilingStage",ceilingStatus?"吸顶："+(ceilingNames[ceilingStatus.state_name]||ceilingStatus.state_name)+" · "+ceilingStatus.reason+" · 顶距 "+n(ceilingStatus.ceiling_distance_filtered_m,3)+" m"+(fresh(s,"runtime")?.front_sensor_masked?" · 前部雷达已屏蔽（ALTCTL接管后恢复）":"")+(typeof ceilingStatus.descended_height_m === "number"?" · 已下降 "+n(ceilingStatus.descended_height_m*100,1)+" / 50 cm":""):"吸顶：无新鲜状态反馈");
+  const ceilingNames={NORMAL_FLIGHT:"待命",CEILING_ARMED:"吸顶准备",APPROACH:"向上接近",ATTACH_CONTROL:"接触控制",SURFACE_HOLD:"吸顶保持",DETACH:"脱离顶部",RECOVERY_HOVER:"恢复悬停",ABORT:"中止"};
+  text("ceilingStage",ceilingStatus?"吸顶："+(ceilingNames[ceilingStatus.state_name]||ceilingStatus.state_name)+" · "+ceilingStatus.reason+" · 顶距 "+n(ceilingStatus.ceiling_distance_filtered_m,3)+" m"+(fresh(s,"runtime")?.front_sensor_masked?" · 前部雷达已屏蔽（POSCTL接管后恢复）":"")+(typeof ceilingStatus.descended_height_m === "number"?" · 已下降 "+n(ceilingStatus.descended_height_m*100,1)+" / 50 cm":""):"吸顶：无新鲜状态反馈");
   if(!loaded || fresh(s,"runtime")?.enabled){for(const input of form.elements) if(input.name in s.config) input.value=s.config[input.name];loaded=true;}
   const ssh=s.ssh.connected, session=s.session || {}, live=!!session.feedback_live, control=!!session.control, state=fresh(s,"state"), runtime=fresh(s,"runtime"), phase=fresh(s,"phase"), wall=fresh(s,"wall"), health=fresh(s,"health"), odom=fresh(s,"odom");
   text("rcTakeoverStatus",fresh(s,"rc_takeover") || "");
@@ -166,7 +169,7 @@ function paint(s){
 $("control").addEventListener("click",()=>action(latest?.session?.control?"/api/release":"/api/acquire",{}));
 $("push").addEventListener("click",()=>action("/api/push",{enabled:!latest?.session?.push}));
 async function action(path, data){
-  if(requestBusy)return;requestBusy=true;$("rcTakeover").disabled=true;$("setRangeHeight").disabled=true;$("ceilingAction").disabled=true;$("ceilingDetach").disabled=true;$("stop").disabled=true;$("start").disabled=true;$("wall").disabled=true;$("detach").disabled=true;
+  if(requestBusy)return;requestBusy=true;$("rcTakeover").disabled=true;$("inclineAction").disabled=true;$("setRangeHeight").disabled=true;$("ceilingAction").disabled=true;$("ceilingDetach").disabled=true;$("stop").disabled=true;$("start").disabled=true;$("wall").disabled=true;$("detach").disabled=true;
   message(path==="/api/set-range-height"?"正在提交固定高度目标…":path==="/api/rc-takeover"?"正在请求遥控器平滑接管…":path==="/api/stop"?"正在终止现有进程…":path==="/api/wall"?"正在发送 wall…":path==="/api/detach"?"正在发送 detach…":path==="/api/start"?"正在请求启动…":path==="/api/ceiling"?"正在发送吸顶请求并等待节点回执…":path==="/api/ceiling-detach"?"正在发送离顶请求…":"正在更新连接设置…");
   try{
     const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Console-Token":token},body:JSON.stringify(data),signal:AbortSignal.timeout(9000)});
@@ -182,6 +185,7 @@ $("start").addEventListener("click",()=>{
 });
 $("ceilingAction").addEventListener("click",()=>action("/api/ceiling",{}));
 $("ceilingDetach").addEventListener("click",()=>action("/api/ceiling-detach",{}));
+$("inclineAction").addEventListener("click",()=>action("/api/incline",{}));
 $("wall").addEventListener("click",()=>action("/api/wall",{}));
 $("rcTakeover").addEventListener("click",()=>action("/api/rc-takeover",{}));
 $("detach").addEventListener("click",()=>action("/api/detach",{}));
@@ -197,7 +201,7 @@ async function poll(){
     const response=await fetch("/api/status",{cache:"no-store",signal:AbortSignal.timeout(2500)});
     if(!response.ok)throw new Error("本机服务响应异常");paint(await response.json());
   }catch(error){
-    $("setRangeHeight").disabled=true;$("ceilingAction").disabled=true;$("ceilingDetach").disabled=true;text("ceilingStage","吸顶：实时反馈中断");$("stop").disabled=true;$("control").disabled=true;$("push").disabled=true;text("connectionText","本机服务无响应");$("rcTakeover").disabled=true;$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;
+    $("inclineAction").disabled=true;$("setRangeHeight").disabled=true;$("ceilingAction").disabled=true;$("ceilingDetach").disabled=true;text("ceilingStage","吸顶：实时反馈中断");$("stop").disabled=true;$("control").disabled=true;$("push").disabled=true;text("connectionText","本机服务无响应");$("rcTakeover").disabled=true;$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;
     if(!$("successNote").hidden)text("successNote","本轮曾成功进入贴墙保持；当前反馈中断，不能确认现在的状态。");
     text("stageTitle","反馈中断");text("stageReason","无法确认当前阶段，请核对飞控状态");
     text("killState","急停反馈中断，动作禁用");text("detachCondition","实时反馈中断，离墙禁用");

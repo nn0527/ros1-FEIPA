@@ -9,12 +9,12 @@
 <section class="panel sharing"><h2>连接与控制权</h2><p id="sessionText" role="status">等待共享服务</p><div class="sessionActions"><button id="control" disabled>申请控制权</button><button id="push" disabled>暂停实时反馈</button></div><p class="configHelp">多台电脑共享反馈，只有控制端可操作。暂停只停止本机的数据推送；飞行程序与日志继续运行。</p></section>
 <section class="panel operations"><h2>试飞操作</h2><div class="actions">
 <button id="start" class="start" disabled><span>01</span><strong id="startLabel">启动基础程序</strong></button>
-<button id="wall" class="wall" disabled><span>02</span><strong>一键贴墙</strong></button>
+<button id="inclineAction" disabled>斜面吸附</button><p id="inclineReason" role="status">斜墙：等待反馈</p><button id="wall" class="wall" disabled><span>02</span><strong>一键贴墙</strong></button>
 <button id="detach" class="wall" disabled><span>03</span><strong>一键离墙</strong></button></div>
 <div class="actions"><button id="ceilingAction" class="wall" disabled><strong>一键贴顶</strong></button><button id="ceilingDetach" class="wall" disabled><strong>一键离顶</strong></button></div>
 <p id="ceilingRequestState" role="status">吸顶请求：尚未发送</p>
 <p id="ceilingBlockReason" class="errorText" role="status"></p><p id="ceilingStage" role="status">吸顶：等待反馈</p>
-<p class="configHelp">飞手先在 ALTCTL 下达到测试高度，再点击吸顶。按钮先提交等待请求，节点回执会显示在上方；有效顶距≤1 m连续0.30秒后申请OFFBOARD并向上接近。测距尚未满足时保留请求，继续由飞手控制ALTCTL；顶距≤5.6 cm连续1秒、至少3个近距样本后进入保持，推力目标0.50。离顶以吸顶保持时记录的气压高度为基准，气压换算下降≥0.50 m后立即请求交回ALTCTL，不要求速度稳定、恢复悬停或顶部雷达确认。气压数据缺失或过期时无法确认离顶完成。顶部雷达异常仅报错：接近时暂停上升，保持时维持0.50推力，有效数据恢复后继续。从点击贴顶起，前部雷达控制输入屏蔽，飞控确认交回ALTCTL后自动恢复；屏蔽期间禁止侧吸。吸顶与贴墙互斥。</p>
+<p class="configHelp">飞手先在 POSCTL 下稳定飞行，再点击吸顶。一帧有效顶距≤1 m、光流和融合位置速度有效、平衡基准稳定后申请OFFBOARD；冻结位置、航向及悬停支撑推力，以0.15 m/s向上接近并小幅修正水平漂移。收到一帧有效顶距≤6.7 cm直接进入保持，推力0.50。离顶按保持时气压基准先确认下降≥0.50 m，再进入恢复悬停，下降量允许在0.45～0.55 m内波动；高度、速度和姿态持续稳定0.50秒后请求POSCTL，以实际模式反馈确认交接。顶部雷达异常时接近暂停、保持维持0.50推力；水平反馈丢失或姿态运动超限时暂停竖直运动，持续异常锁存故障。从点击吸顶起屏蔽前部雷达控制输入，确认交回POSCTL后恢复；期间禁止侧吸。目标限制不保证实际漂移或姿态绝不超限。</p>
 <button id="setRangeHeight" class="wall" disabled>一键定高至 1.50 m</button><p id="setRangeHeightReason" role="status"></p><p class="configHelp">离墙回平后手动提交启动配置中的固定目标，仅覆盖高度目标。原始测距和首帧证据保留；每轮只接受一次，沿用推力限幅和变化率限制，15秒未达到则异常退出。超时后须重新通过准入检查，记录为异常后的人工恢复。</p>
 <button id="rcTakeover" class="wall" disabled>一键遥控器接管</button><p id="rcTakeoverStatus" role="status"></p><p class="configHelp">支持 ABORT：从当前姿态平滑跟随摇杆，完成后交回原 ALTCTL / POSCTL。接管接受后不恢复旧吸附任务。</p>
 <button id="stop" class="stopProcess" disabled>终止现有进程</button><p class="configHelp">停止试验控制、MAVROS、雷达与日志记录后可重新启动。请先落地并停止电机；此按钮不代替遥控器急停。</p>
@@ -30,7 +30,7 @@
 <div><label>横滚 / 俯仰</label><strong id="angles">—</strong><small>°</small></div>
 <div><label>输出推力</label><strong id="thrust">—</strong><small>%</small></div></div>
 <div class="secondaryReadings"><span>模式 <b id="mode">—</b></span><span>相对起飞高度 <b id="height">—</b> m</span><span>竖直速度 <b id="velocity">—</b> m/s</span><span>电池 <b id="battery">—</b> V</span><span>输出归属 <b id="owner">—</b></span></div><p id="rangeHeightState" role="status">测距离墙闭环：未开始</p><p id="rangeHeightEvidence" class="configHelp">等待首帧证据</p><p id="horizontalVelocityState" role="status">水平速度闭环：等待反馈</p><p id="wallSensorFusionState" role="status">光流 / 测距参数切换：等待反馈</p><details><summary>光流 / 测距参数切换详情</summary><p id="wallSensorFusionReason" role="status">等待参数管理状态</p><div class="secondaryReadings"><span>原值 / 请求值 / 确认值</span><span>EKF2_OF_CTRL <b id="wallSensorFusionFlow">—</b></span><span>EKF2_RNG_CTRL <b id="wallSensorFusionRange">—</b></span></div><p id="wallSensorFusionTiming" class="configHelp">等待时间记录</p><p class="configHelp">时间为ROS时间。此处仅报告参数切换与应用缓冲，实际光流、测距高度、测距地形融合须分别核对ULog。水平制动仍需新鲜反馈和原稳定条件。</p></details><p id="rangeWarning" class="errorText" role="status"></p></section>
-<section class="panel"><h2>急停与离墙条件</h2><p id="killState" role="status">等待急停反馈</p><p id="detachCondition" role="status">等待贴墙保持</p><p class="configHelp">新测距离墙闭环中的竖直速度来自测距序列；其他阶段显示飞控融合世界竖直速度。台架离墙恢复不由顶部雷达、估计高度偏差或速度幅值阻挡；普通实飞保留检查。侧吸确认 POSCTL（吸顶为 ALTCTL）后由飞手接管，再按正常流程落地上锁。</p></section>
+<section class="panel"><h2>急停与离墙条件</h2><p id="killState" role="status">等待急停反馈</p><p id="detachCondition" role="status">等待贴墙保持</p><p class="configHelp">新测距离墙闭环中的竖直速度来自测距序列；其他阶段显示飞控融合世界竖直速度。台架离墙恢复不由顶部雷达、估计高度偏差或速度幅值阻挡；普通实飞保留检查。侧吸或吸顶确认 POSCTL 后由飞手接管，再按正常流程落地上锁。</p></section>
 <section class="panel records"><h2>操作记录</h2><div class="tableHead"><span>时间</span><span>事件</span></div>
 <div id="events" role="log" aria-live="off"><p class="empty">等待树莓派实时反馈</p></div></section>
 </div><aside>

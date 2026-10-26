@@ -1,105 +1,80 @@
-# 吸顶决策与控制逻辑
+# 吸顶 POSCTL 流程与参数（2026-10-25）
 
-## 当前控制台接近流程（2026-10-13）
+本文对应本机 test1024 的统一控制台入口 `launch/system/wall_console_flight.launch`。
+本轮仅修改本机文件，未连接树莓派、未部署。吸顶入口和交回模式均为 POSCTL。
+参数以 YAML、launch 覆盖及运行时配置为准；以下推力按默认 `hover_thrust=0.49` 计算。
 
-`wall_console_flight.launch` 的接近入口独立使用 `approach_contact_distance_m=0.07`：
-顶部最近 3 个有效样本的中位数 ≤7 cm 时进入 `ATTACH_CONTROL`。
-后续贴顶确认使用 `wall_contact_distance_m=0.067`：原始顶距和最近 3 点中位数
-均 ≤6.7 cm，连续 1 秒后进入 `SURFACE_HOLD`。
+## HOLD超时自动降落（树莓派test1024）
 
-有效接近时间超过 `approach_timeout_s=12.0` 后进入锁存 `FAULT`，状态消息的
-`approach_timed_out=true` 明确请求模式管理器交回 ALTCTL。同一请求不自动重入接近。
-FAULT 保持姿态/悬停推力候选和输出归属，模式管理器在飞控、里程计、姿态/竖直速度估计、
-连续输出及遥控输入有效时请求 ALTCTL。该退出不需要保持气压基准，也不等待下降速度稳定。
-MAVROS 服务返回成功只代表请求已发送；确认新鲜、已连接的飞控实际反馈 ALTCTL 后，
-终端请求回到待机，决策释放归属。提前取消请求也不会在 ALTCTL 确认前释放本次超时 FAULT。
-实际遥控响应仍需真机验证；程序不把服务成功当作遥控器实际接管证据。
+`hold_timeout_s=5.0`：进入SURFACE_HOLD后超过5秒，若仍未启动DETACH，则进入锁存ABORT并发布机构释放请求。模式管理器进入CEILING_LANDING，立即请求PX4 AUTO.LAND，不等待正常脱离的0.50 m气压下降或恢复稳定条件。
 
-## 参考程序的状态链
+- 同一周期已有脱离或取消请求时优先正常DETACH；进入DETACH后不再使用HOLD计时器。
+- 顶部测距失效不暂停HOLD超时。ABORT清除水平积分，等待模式交接期间保持受限姿态和0.50支撑推力。
+- 降落请求要求本轮新鲜ABORT状态、连接且解锁的OFFBOARD飞控反馈，以及急停未生效；异步服务调用前再次检查本轮身份和实际模式。拒绝后按现有重试间隔重试；服务成功不视为实际降落已开始。
+- 只有新的飞控AUTO.LAND反馈才确认降落模式。飞手切换POSCTL等其他模式、遥控器接管、急停或解除武装时停止自动请求；已结束的本轮ABORT不得自动重入。
+- 新增状态消息字段，编译后需在落地上锁时重启整套控制链路，使所有节点使用同一消息版本。本次修改及测试不发送真实飞行降落指令。
 
-原始外部参考程序 `ceiling_controller.cpp` 实现的是接触式吸顶，不是简单定距悬停：
+## 状态与前置条件
 
-```text
-NORMAL_FLIGHT
-  -> CEILING_ARMED
-  -> APPROACH
-  -> ATTACH_CONTROL
-  -> SURFACE_HOLD
-  -> DETACH
-  -> RECOVERY_HOVER
-  -> NORMAL_FLIGHT
-```
-
-- `CEILING_ARMED`：等待顶距进入捕获范围且垂直速度足够低。
-- `APPROACH`：先短暂悬停稳定，再以固定速度向上接近。
-- `ATTACH_CONTROL`：用悬停推力的倍率生成接触锁定推力。
-- `SURFACE_HOLD`：用另一个推力倍率保持贴顶。
-- `DETACH`：目标距离逐渐退回接触距离，并计算距离 PID 候选推力。
-- `RECOVERY_HOVER`：安全分离后等待固定时间，再回正常飞行。
-
-## ROS 移植版
-
-实现位于 `scripts/decisions/ceiling_attachment_decision_node.py`。当前直接输入：
-
-```text
-/sensor/ceiling/range
-/operator/command
-/mock_mavros/local_position/odom（台架测试）
-/mavros/state
-/attachment/mechanism_status
-```
-
-决策输出为：
-
-```text
-/ceiling_attachment/status             诊断状态
-/ceiling_attachment/control_candidate  通用飞控候选
-```
-
-状态消息保留接近速度、固定姿态和归一化 body-z 推力，兼容现有监控；统一输出层只
-订阅 `AttachmentControlCandidate`，不再理解吸顶状态枚举。两路传感器由上游
-`sensor_range_manager_node` 独立校验和转发；吸顶决策只订阅顶部输出。
-
-机构动作先发布到 `/attachment/mechanism_candidate`，必须经过独立的机构输出门后
-才能到达 `/attachment/mechanism_command`。真机机构输出默认关闭；统一链路还要求
-当前 owner 为 ceiling。
-
-## 决策下游输出
-
-`scripts/standalone/ceiling_attachment_output_node.py` 是独立吸顶链路的 MAVROS
-适配出口；统一链路使用 `scripts/outputs/attachment_output_mux_node.py`：
-
-| 决策状态 | 输出接口 | 含义 |
+| 阶段 | 进入条件 | 行为及主要参数 |
 |---|---|---|
-| `CEILING_ARMED` | `PositionTarget` | 零速度等待 |
-| `APPROACH` | `PositionTarget` | ENU z 正方向向上接近 |
-| `ATTACH_CONTROL` / `SURFACE_HOLD` | `AttitudeTarget` | 保持进入动作时捕获的姿态并输出归一化推力 |
-| `DETACH` | `AttitudeTarget` | 机构释放确认后，输出低于悬停值的距离 PID 脱离推力 |
-| `RECOVERY_HOVER` | `PositionTarget` | 零速度恢复悬停 |
+| POSCTL 待命 / 等待请求 | 飞手已起飞、已解锁并稳定在 POSCTL；提交吸顶请求 | 单帧有效顶距≤1.00 m；位置/水平及竖直速度/姿态估计有效，光流连续有效0.30 s；水平速度≤0.20 m/s、角速度≤20°/s时采样平衡姿态。至少3个FCU目标样本跨越0.50 s，总倾角≤5°、轴向分散≤1.5°；等待期间继续由飞手控制POSCTL。 |
+| CEILING_ARMED 接管准备 | 满足入口检查，完成预发送；飞控实际反馈本次 OFFBOARD | 请求OFFBOARD前冻结平衡姿态及FCU推力，最多保留2 s，防止接管前后反馈回显污染基准；OFFBOARD确认时捕获本地x/y和航向。零竖直速度等待；顶距准入、反馈有效且未暂停后进入接近。 |
+| APPROACH 上升接近 | 顶距准入、运动反馈有效、未暂停 | 向上目标0.15 m/s，竖直目标加速度0.15 m/s²；冻结航向，弱位置环加水平速度PI纠偏。单帧有效原始顶距≤0.067 m直接进入SURFACE_HOLD，不经过接触渐增推力阶段。控制台无额外起步等待；有效接近超时12 s进入ABORT。顶部测距失效时暂停上升并暂停接近计时。 |
+| ATTACH_CONTROL 兼容状态 | 当前控制台正常流程跳过此阶段 | 保留普通分支接触控制；控制台若处于此状态，单帧≤0.067 m同样直接进入保持。 |
+| SURFACE_HOLD 吸顶保持 | 接近阶段收到一帧有效顶距≤0.067 m，运动反馈有效且未暂停 | 推力目标固定0.50，保持捕获航向及受限姿态；不运行水平位置积分。记录进入保持时气压作为离顶高度基准；超过5秒未开始DETACH则进入ABORT并请求AUTO.LAND。顶部雷达暂时失效仅告警并维持保持推力；恢复后重新评估。 |
+| DETACH 受控脱离 | 离顶命令、取消吸顶、接触失败或接触安全条件失效 | 先请求机构释放；若启用机构回执则必须同序号确认。以保持气压基准下降0.50 m，最大向下目标0.15 m/s，临近阈值至少0.05 m/s以确保有限时间到达。顶距≥0.10 m持续0.20 s后允许水平纠偏；确认下降0.50 m进入恢复。超时20 s进入ABORT。接触失败未进入保持时，单独捕获当前气压作为中止脱离基准。 |
+| RECOVERY_HOVER 稳定恢复 | 气压确认已下降≥0.50 m | 对下降目标高度制动并稳定；高度误差≤0.05 m（下降量0.45～0.55 m）、竖直速度绝对值≤0.15 m/s、水平速度≤0.15 m/s、水平漂移≤0.30 m、总倾角≤10°、角速度模≤20°/s、航向误差≤10°，全部在不同新反馈样本上连续0.50 s才允许请求POSCTL。超时15 s进入ABORT。 |
+| POSCTL 交回 / NORMAL_FLIGHT | 恢复条件成立且位置估计、RC、连续输出等交回检查有效 | 模式管理器请求POSCTL并继续保留本轮输出；服务成功不视为完成。确认新鲜且已连接的飞控实际反馈POSCTL后释放控制归属、恢复前部雷达输入并清理基准。重新启动前须释放旧请求。 |
 
-节点在决策、MAVROS state 超时，以及未连接、未解锁、非 OFFBOARD 时禁止开始
-动作；运行中故障进入锁存的恢复/FAULT，输入恢复后也不会从中间状态继续。操作
-开关在贴顶时释放后，控制权会保留到 `DETACH` 和
-`RECOVERY_HOVER` 完成，避免直接遗留上一条贴顶推力。
+此入口默认机构硬件输出关闭、`require_mechanism_ack=false`，所以“释放”是现有控制协议动作，不能据此认定真实机构已经释放。真实机构启用回执时按同序号确认执行。
 
-台架入口将结果隔离在 `/mock_mavros/setpoint_raw/*`；真机入口
-`launch/standalone/ceiling_attachment_mavros.launch` 默认保持
-`output_enabled=false`。
+单帧门槛使用有效原始顶距，不受低通或中位数阻挡，不要求持续时间和多帧确认。同一决策周期内的合格帧保留到处理或测距超时，后续偏大帧不会吞掉该触发；无效帧、健康状态失效或新请求会清理旧触发。距离满足只解除距离门槛，光流、位置、平衡基准和飞控等安全准入仍保留。
 
-## 对参考程序的修正
+下降≥0.50 m为本轮一次性达标条件：未达到时，即使下降0.49 m且稳定也不能交回；达到后可回弹到0.45～0.55 m范围内稳定，再按原速度、姿态及0.50 s连续新样本条件申请POSCTL。
 
-1. 所有时间参数统一使用秒，避免原程序中 `1000`、微秒和秒的混用。
-2. 脱离目标距离每周期只累加一次，避免参考程序在状态机和 PID 中重复累加。
-3. 使用接收时间进行 range/odom/operator 超时判断，而非只看单次订阅是否更新。
-4. `ATTACH_CONTROL -> SURFACE_HOLD` 默认要求不同真实测量样本在确认时间内持续达到压缩阈值；参考程序虽然计算了 `attach_confirmed`，但没有用于状态跳转。
-5. L1 错误帧不会刷新有效顶距；超时后贴顶状态进入脱离，接近阶段回到正常状态。
-6. 脱离使用独立的安全分离距离和持续确认，推力限制在标定的脱离最小值与悬停值之间；超时进入 FAULT。
-7. 完成或故障后必须先释放吸顶开关才能再次启动。
+## 水平与姿态初始限制
 
-## 上机前必须标定
+以下参数已经生成并启用，采用本轮约定的较宽初值。
 
-- `contact_distance_m`：机构首次触顶时雷达读数；
-- `target_compression_m`：机构允许压缩量；
-- 两个推力倍率及真实悬停推力；
-- 接近速度、姿态限制和接近超时；
-- 雷达安装外参、倾角补偿和天花板材质下的有效更新率。
+| 参数 | 初值与作用 |
+|---|---|
+| `horizontal_position_deadband_m` / `horizontal_position_kp` | 0.10 m / 0.30 s⁻¹；死区内不追点，但保留速度制动 |
+| `horizontal_max_speed_mps` | 纠偏目标速度模上限0.20 m/s |
+| `horizontal_velocity_kp` / `horizontal_velocity_ki` | 1.50 / 0.30；使用飞控融合ENU水平速度，光流质量及估计器状态共同准入 |
+| `horizontal_max_acceleration_mps2` / `horizontal_integral_limit_mps2` | 0.40 / 0.20 m/s² |
+| `horizontal_target_acceleration_mps2` | 目标速度变化加速度0.10 m/s² |
+| `horizontal_drift_warn_m` / `horizontal_drift_pause_m` / `horizontal_drift_resume_m` | 0.30 / 0.50 / 0.30 m |
+| `attitude_max_tilt_deg` / `contact_max_tilt_deg` | 最终目标总倾角10° / 接触保持5°；接触RC微调另受原±2°限制 |
+| `yaw_max_offset_deg` | 最终目标航向相对接管航向±10°；默认保持接管航向 |
+| `attitude_tilt_slew_deg_s` / `attitude_yaw_slew_deg_s` | 最终目标推力轴和航向各15°/s；所有RC修正之后统一限幅 |
+| `actual_tilt_pause_deg` / `actual_tilt_resume_deg` | 实测总倾角15° / 12° |
+| `actual_body_rate_pause_deg_s` / `actual_body_rate_resume_deg_s` | 实测角速度模30°/s / 20°/s |
+| `motion_limit_confirm_s` / `motion_resume_hold_s` | 超限确认0.20 s；降回恢复阈值连续0.50 s才恢复运动 |
+| `vertical_speed_kp` / `vertical_target_acceleration_mps2` | 竖直速度反馈增益0.30，目标速度加速度0.15 m/s² |
+
+自由飞行竖直支撑来自接管前实际FCU推力及平衡推力轴，并加倾角补偿和速度反馈；接触/保持仍使用上表固定或渐增推力。水平积分仅在确认最终输出属于吸顶且有新鲜实际输出反馈时累积，暂停、失联或接触时清除。
+
+这些值约束控制目标及触发程序响应，不能保证真实漂移、姿态角或角速度始终不超限。尤其硬倾角包络优先时，入口姿态投影可能优先于目标变化率限制。实际稳定程度仍取决于光流/EKF、飞控姿态环、推力标定、气压扰动及机构特性，需仿真和受控实测验证。
+
+## 暂停与故障
+
+- 自由飞行时反馈无效立即暂停竖直运动、清除水平积分；有效新样本连续0.30 s才重新准入。光流接收和源时间戳均检查，超时0.60 s、质量阈值1，拒绝重复源样本；估计器超时1.50 s。
+- 漂移、实测倾角或角速度超限确认0.20 s后暂停竖直运动，保留反馈可信时的有限水平纠偏；恢复阈值连续0.50 s后解除暂停。反馈持续失效2 s或运动暂停持续8 s进入锁存ABORT。
+- 接触/保持时不做水平追点；确认姿态或角速度危险时受控脱离。
+- 位置相邻样本跳变超过0.75 m加当前速度可解释的位移，或航向跳变超过20°，本轮锁存ABORT，停止追赶旧位置参考。源时间异常不能用接收时间刷新掩盖。
+- 接近超时及运动故障不自动重入；模式管理器在位置估计、遥控输入和连续输出等交回条件有效时请求POSCTL。条件无效时维持故障及受限候选，不能宣称已经安全交接。失去实际姿态/高度反馈后的稳定控制无法由本逻辑保证。
+- 气压无效时不确认下降完成；恢复确认必须有不同的新压力、里程计和光流样本，定时器重复运行不能凑足稳定时间。
+
+## 实现与验证入口
+
+- 决策：`scripts/decisions/ceiling_attachment_decision_node.py`。
+- 运动反馈适配：`src/px4_wall_ceiling_control/adapters/ceiling_motion.py`。
+- 运动控制与包络：`src/px4_wall_ceiling_control/domain/ceiling_motion.py`。
+- 接管交回：`scripts/operator/flight_mode_manager_node.py`。
+- 最终输出：`scripts/outputs/attachment_output_mux_node.py`。启用运动控制时各自由飞行阶段也输出姿态/推力候选。
+- 参数：`config/ceiling_attachment.yaml`；上述流程数值包含 `wall_console_flight.launch` 的覆盖，单独加载YAML不是同一配置。
+- `CeilingAttachmentStatus` 新增运动、暂停、恢复确认和实测限制字段；候选消息增加航向基准。ROS端必须重新生成消息并让所有节点使用同一消息版本。
+- 原始备份：`test1024/backups/ceiling-posctl-stability-20261025/px4_wall_ceiling_control`；离线验证说明位于 `test1024/validation/README.md`。
+
+统一中止阶段使用 `ABORT=7`（原 FAULT 编号），不再有独立 FAULT 或编号8的ABORT。普通异常保留原FAULT的受限水平/竖直支撑、禁止继续动作及POSCTL接管逻辑，不发自动降落或新增机构释放请求；仅HOLD超时的ABORT设置 `abort_land_requested=true`，锁存并请求AUTO.LAND。候选控制消息携带同一帧降落标记，输出端据此选择原故障包络或接触支撑包络。

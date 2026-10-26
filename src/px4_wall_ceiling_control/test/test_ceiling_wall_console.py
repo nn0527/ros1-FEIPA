@@ -36,6 +36,9 @@ class FakeRuntime:
     def wall(self):
         self.commands.append('wall')
         return {"message":"fake wall"}
+    def incline(self):
+        self.commands.append('incline')
+        return {"message":"fake incline accepted"}
     def detach(self):
         self.commands.append('detach')
         return {"message":"fake detach"}
@@ -59,6 +62,17 @@ class FakeRuntime:
 
 
 class HTTPTests(unittest.TestCase):
+    def test_incline_endpoint_requires_authority_and_live_push(self):
+        a, at = self.login('pilot'); b, bt = self.login('observer')
+        self.assertEqual(self.request('/api/incline', {}, a, at)[0], 409)
+        self.request('/api/acquire', {}, a, at)
+        self.assertEqual(self.request('/api/incline', {}, b, bt)[0], 409)
+        self.request('/api/push', {'enabled': False}, a, at)
+        self.assertEqual(self.request('/api/incline', {}, a, at)[0], 409)
+        self.request('/api/push', {'enabled': True}, a, at)
+        self.assertEqual(self.request('/api/incline', {}, a, at)[0], 200)
+        self.assertEqual(self.runtime.commands, ['incline'])
+
     def test_fixed_height_endpoint_preserves_auth_control_and_pause_guards(self):
         a, at = self.login('pilot'); b, bt = self.login('observer')
         self.assertEqual(self.request('/api/set-range-height', {}, a, at)[0], 409)

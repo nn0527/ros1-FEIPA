@@ -12,14 +12,15 @@ function view(s,busy=false){
   const complete=required.every(key=>fresh(s,key)!==null);
   const editable=control && !enabled && !s.starting && !busy && !state?.armed;
   let stage="等待基础链路",reason=s.launch_error||"应用初始条件后，由飞手起飞并稳定",step=-1;
-  const names={NORMAL_FLIGHT:"顶吸待命",CEILING_ARMED:"准备顶吸",APPROACH:"向上接近",ATTACH_CONTROL:"确认顶部接触",SURFACE_HOLD:"顶吸保持",DETACH:"脱离顶部",RECOVERY_HOVER:"恢复悬停",FAULT:"顶吸故障"};
-  const steps={NORMAL_FLIGHT:0,CEILING_ARMED:1,APPROACH:2,ATTACH_CONTROL:2,SURFACE_HOLD:3,DETACH:4,RECOVERY_HOVER:4};
+  const names={NORMAL_FLIGHT:"顶吸待命",CEILING_ARMED:"准备顶吸",APPROACH:"向上接近",ATTACH_CONTROL:"确认顶部接触",SURFACE_HOLD:"顶吸保持",DETACH:"脱离顶部",RECOVERY_HOVER:"恢复悬停",ABORT:"顶吸中止"};
+  const steps={NORMAL_FLIGHT:0,CEILING_ARMED:1,APPROACH:2,ATTACH_CONTROL:2,SURFACE_HOLD:3,DETACH:4,RECOVERY_HOVER:5};
   if(s.starting){stage="基础链路启动中";reason="等待 MAVROS、雷达和控制节点就绪";}
   else if(enabled && ceiling){stage=names[ceiling.state_name]||ceiling.state_name;reason=ceiling.reason||"等待节点反馈";step=steps[ceiling.state_name]??-1;}
   if(["PRESTREAM","ENTERING"].includes(phase)){stage="正在接管飞行";reason=fresh(s,"reason")||"等待飞控确认 OFFBOARD";step=1;}
-  if(phase==="RETURNING"){stage="等待遥控接管";reason="等待飞控确认 ALTCTL，当前尚未完成交接";step=5;}
+  if(phase==="RETURNING"){stage="等待遥控接管";reason="等待飞控确认 POSCTL，当前尚未完成交接";step=6;}
   if(phase==="LOCKED"){stage="动作受阻";reason=fresh(s,"reason")||"请检查飞行状态";step=-1;}
-  if(ceiling?.fault_detected){stage="顶吸故障";reason=ceiling.reason;step=-1;}
+  if(ceiling?.fault_detected){stage=ceiling.state_name==="ABORT"?"顶吸中止":"顶吸故障";reason=ceiling.reason;step=-1;}
+  if(phase==="CEILING_LANDING" || (ceiling?.state_name==="ABORT" && ceiling?.abort_land_requested)){stage="顶吸中止 · 自动降落";reason=fresh(s,"reason")||ceiling?.reason||"等待飞控确认AUTO.LAND";step=-1;}
   if(kill?.active){stage="急停已生效";reason="动作禁用，请核对飞控状态";step=-1;}
   if(!live){stage="等待实时反馈";reason=s.ssh?.error||"反馈中断，无法确认当前飞行状态";step=-1;}
   else if(enabled && !ceiling){stage="顶吸反馈过期";reason="等待新的控制状态，动作禁用";step=-1;}
@@ -132,6 +133,9 @@ function paint(s){
   text("repairStatus",m.repairReason||(s.mavros_repair&&s.mavros_repair.state!=="IDLE"?s.mavros_repair.reason:"先确认落地、上锁且电机停止；自动清理旧控制、雷达和日志，再重启 MAVROS。成功后手动启动基础链路。"));
   $("start").disabled=!v.canStart;$("attach").disabled=!v.canAttach;$("detach").disabled=!v.canDetach;
   $("stop").disabled=!m.canStop;$("stop").title=m.stopReason;text("stopStatus",m.stopReason||"落地上锁后可停止；飞控反馈过期时需人工确认电机已停止。");
+  $("inclineAction").disabled=busy || !s.session?.control || !s.session?.feedback_live || !s.can_incline;
+  const incline=fresh(s,"wall");
+  text("inclineReason",incline?.incline_active?"斜墙："+incline.incline_phase+" · "+incline.reason:(s.incline_blockers||[]).join("；")||"斜墙已就绪");
   $("wallAction").disabled=!w.canWall;$("wallDetach").disabled=!w.canDetach;
   $("cancelWait").hidden=!s.can_cancel_wait;$("cancelWait").disabled=!w.canCancel;
   text("wallBlockReason",w.canWall?"贴墙入口已就绪":summarize(w.blockers)||"等待贴墙入口条件");
@@ -144,14 +148,16 @@ function paint(s){
   text("source",v.enabled?"现场配置":"启动配置");
   let stage=v.stage,reason=v.reason;
   if(v.live&&v.ceiling?.state_name==="DETACH")wasDetaching=true;
-  if(wasDetaching&&v.live&&v.ceiling?.state_name==="NORMAL_FLIGHT"&&v.state?.mode==="ALTCTL"&&v.owner===0&&v.phase==="IDLE"){
-    stage="已交还遥控";reason="飞控已确认 ALTCTL 且输出归属已释放，由飞手接管降落";
+  if(wasDetaching&&v.live&&v.ceiling?.state_name==="NORMAL_FLIGHT"&&v.state?.mode==="POSCTL"&&v.owner===0&&v.phase==="IDLE"){
+    stage="已交还遥控";reason="飞控已确认 POSCTL 且输出归属已释放，由飞手接管降落";
   }
   if(w.selected||w.returned){stage=w.title;reason=w.reason;}
   if(v.live&&v.phase==="RC_TAKEOVER"){stage="遥控接管中";reason=fresh(s,"rc_takeover")||fresh(s,"reason")||"等待接管反馈和原遥控模式确认";}
   if(s.mavros_repair?.state==="RUNNING"){stage="MAVROS 连接修复中";reason=s.mavros_repair.reason;}
   if(paused){stage="实时反馈已暂停";reason="仅暂停本设备的反馈；飞行程序和日志继续运行。恢复反馈后才能发送动作。";}
   text("stage",stage);text("reason",reason);text("phase",v.live?v.phase||"等待节点":"离线");
+  const cm=v.ceiling;
+  text("ceilingMotion",cm?.motion_control_enabled?"水平漂移 "+n(cm.horizontal_drift_m)+" m；水平速度 "+n(cm.horizontal_speed_mps)+" m/s；实测倾角 "+n(cm.actual_tilt_deg)+"°；角速度 "+n(cm.actual_body_rate_deg_s)+"°/s；"+(cm.motion_paused?"竖直运动暂停；":"")+(cm.motion_reason||""):"水平稳定控制：等待反馈");
   text("receipt","顶吸回执："+(s.ceiling_request?.reason||"尚未发送")+(!v.live?"（历史回执）":""));
   document.querySelectorAll("#ceilingSteps li").forEach((el,i)=>el.classList.toggle("current",v.live&&i===v.step));
   const hw=w.wall;
@@ -215,6 +221,7 @@ async function action(path,data={},recovery=false){
 }
 $("control").addEventListener("click",()=>action(latest?.session?.control?"/api/release":"/api/acquire"));
 $("push").addEventListener("click",()=>action("/api/push",{enabled:latest?.session?.push===false}));
+$("inclineAction").addEventListener("click",()=>{if(latest?.can_incline)action("/api/incline");});
 $("wallAction").addEventListener("click",()=>{if(latest&&wallView(latest,busy).canWall)action("/api/wall");});
 $("wallDetach").addEventListener("click",()=>{if(latest&&wallView(latest,busy).canDetach)action("/api/detach");});
 $("setRangeHeight").addEventListener("click",()=>{if(latest&&rangeView(latest,busy).canSetHeight)action("/api/set-range-height");});

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ALTCTL -> OFFBOARD -> completed detach -> ALTCTL handover.
+"""Pilot position/altitude mode -> OFFBOARD -> controlled pilot-mode handover.
 
 The output mux remains the sole MAVROS setpoint publisher. This node requests
 its attitude prestream and uses MAVROS only to change flight modes.
@@ -71,6 +71,7 @@ class FlightModeManagerNode(RCTakeoverManager):
         self.sensor_timeout_s = float(rospy.get_param("~sensor_timeout_s", 0.5))
         self.wall_manual_approach = bool(rospy.get_param("~wall_manual_approach", False))
         self.ceiling_baro_handover_enabled = bool(rospy.get_param("~ceiling_baro_handover_enabled", False))
+        self.ceiling_motion_enabled = bool(rospy.get_param("/ceiling_attachment_decision_node/motion_control_enabled", False))
         self.ceiling_distance_gate_enabled = bool(rospy.get_param("~ceiling_distance_gate_enabled", False))
         self.wall_pilot_mode = str(rospy.get_param("~wall_pilot_mode", "ALTCTL")).upper()
         self.wall_horizontal_velocity_enabled = bool(rospy.get_param("/wall_perch_decision_node/horizontal_velocity_enabled",False))
@@ -260,6 +261,17 @@ class FlightModeManagerNode(RCTakeoverManager):
             time.sleep(2)
 
     def _on_flight(self, message):
+        if (getattr(self, "ceiling_motion_enabled", False)
+                and getattr(self, "selected_mode", None) == OperatorCommand.MODE_CEILING):
+            now = rospy.Time.now()
+            previous = getattr(self, "ceiling_flight_source", None)
+            if (not is_fresh_source(message.header.stamp, self.state_timeout_s, now)
+                    or (previous is not None and message.header.stamp <= previous)):
+                return
+            request_at = getattr(self, "ceiling_posctl_request_at", None)
+            if message.mode.upper() == 'POSCTL' and request_at is not None and message.header.stamp.to_sec() <= request_at:
+                return
+            self.ceiling_flight_source = message.header.stamp
         if self._wall_range_mode() and message.connected and message.armed:
             now = rospy.Time.now()
             identity = self._wall_range_identity()
@@ -426,6 +438,8 @@ class FlightModeManagerNode(RCTakeoverManager):
             return None
         if self.operator is None or not self.operator.enable_control:
             return None
+        if self.operator.mode == OperatorCommand.MODE_INCLINE:
+            return OperatorCommand.MODE_WALL  # Shared physical output owner.
         if self.operator.mode in (
             OperatorCommand.MODE_CEILING,
             OperatorCommand.MODE_WALL,
@@ -434,6 +448,11 @@ class FlightModeManagerNode(RCTakeoverManager):
         return None
 
     def _preflight_failure_reason(self, now, selected):
+        if self._incline_intent():
+            wall = getattr(self, 'wall', None)
+            if (wall is None or not is_fresh(getattr(self, 'wall_at', None), self.status_timeout_s, now)
+                    or not getattr(wall, 'incline_active', False) or not wall.incline_ready):
+                return '斜墙未就绪：请启用模式、标定推力上限并启用自动接近/水平反馈'
         if not self.enabled:
             return "flight mode handover disabled"
         if self.flight is None:
@@ -473,6 +492,8 @@ class FlightModeManagerNode(RCTakeoverManager):
             or getattr(self, "ignore_range_loss_during_attachment", False)
         ):
             return None  # Range faults are diagnostic; automatic takeover does not require ranges.
+        if selected == OperatorCommand.MODE_CEILING and not self._ceiling_position_ready(now):
+            return "吸顶POSCTL接管需要新鲜有效的水平位置及速度估计"
         if selected == OperatorCommand.MODE_CEILING and getattr(self, "ceiling_distance_gate_enabled", False):
             return None  # Decision pauses on range loss; takeover still requires its valid gate.
         if self.sensor is None:
@@ -490,8 +511,10 @@ class FlightModeManagerNode(RCTakeoverManager):
     def _pilot_mode(self, selected=None):
         if getattr(self, "phase", None) == "RC_TAKEOVER":
             return self.rc_takeover_return_mode
+        if self._incline_intent() or getattr(getattr(self, 'wall', None), 'incline_active', False):
+            return 'POSCTL'
         selected = getattr(self,"selected_mode",None) if selected is None else selected
-        return getattr(self,"wall_pilot_mode","ALTCTL") if selected == OperatorCommand.MODE_WALL else "ALTCTL"
+        return getattr(self,"wall_pilot_mode","ALTCTL") if selected == OperatorCommand.MODE_WALL else "POSCTL"
 
     def _wall_horizontal_ready(self, now, stable=False):
         if not getattr(self,"wall_horizontal_velocity_enabled",False):return True
@@ -512,31 +535,54 @@ class FlightModeManagerNode(RCTakeoverManager):
         if message.data and self.phase == self.WAITING_WALL:
             self.manual_wait_canceled = True
 
+    def _ceiling_position_ready(self, now):
+        e = getattr(self, "estimator", None)
+        return bool(e is not None and is_fresh(getattr(self, "estimator_at", None), self.estimator_timeout_s, now)
+            and e.attitude_status_flag and e.velocity_vert_status_flag and e.velocity_horiz_status_flag
+            and (e.pos_horiz_rel_status_flag or e.pos_horiz_abs_status_flag) and not e.const_pos_mode_status_flag
+            and (not getattr(self, "ceiling_motion_enabled", False)
+                 or is_fresh_source(e.header.stamp, self.estimator_timeout_s, now)))
+
     def _ceiling_takeover_ready(self, now):
         if not getattr(self, "ceiling_distance_gate_enabled", False) or self.selected_mode != OperatorCommand.MODE_CEILING:
             return True
         status = self.ceiling
         if not (status is not None and is_fresh(self.ceiling_at,self.status_timeout_s,now) and status.activation_ready):return False
+        if getattr(self, "ceiling_motion_enabled", False) and not (
+                status.motion_control_enabled and status.motion_ready and status.baseline_ready
+                and is_fresh_source(status.header.stamp, self.status_timeout_s, now, future_tolerance_s=0.)
+                and self._ceiling_position_ready(now)):
+            return False
         if self.odom is None or not is_fresh(self.odom_at,self.odom_timeout_s,now) or not odometry_is_finite(self.odom):return False
         speed=vertical_speed_enu_mps(self.odom,self.odom_twist_in_child_frame)
         return math.isfinite(speed)
 
     def _ceiling_wait_reason(self,now):
         if self.ceiling is None or not is_fresh(self.ceiling_at,self.status_timeout_s,now):
-            return "吸顶请求已接收：等待新鲜吸顶状态；仍由飞手控制ALTCTL"
+            return "吸顶请求已接收：等待新鲜吸顶状态；仍由飞手控制POSCTL"
         if not self.ceiling.activation_ready:
-            return "吸顶请求已接收：等待有效顶距≤1m连续0.30秒；仍由飞手控制ALTCTL"
+            return "吸顶请求已接收：等待一帧有效顶距≤1m；仍由飞手控制POSCTL"
         if self.odom is None or not is_fresh(self.odom_at,self.odom_timeout_s,now) or not odometry_is_finite(self.odom):
-            return "吸顶请求已接收：等待新鲜有效里程计；仍由飞手控制ALTCTL"
-        return "吸顶请求已接收：等待有效竖直速度估计；仍由飞手控制ALTCTL"
+            return "吸顶请求已接收：等待新鲜有效里程计；仍由飞手控制POSCTL"
+        return "吸顶请求已接收：等待有效竖直速度估计；仍由飞手控制POSCTL"
+
+    def _incline_intent(self):
+        return getattr(getattr(self, 'operator', None), 'mode', None) == OperatorCommand.MODE_INCLINE
 
     def _auto_wall_selected(self):
-        return getattr(self, "wall_auto_approach", False) and self.selected_mode == OperatorCommand.MODE_WALL
+        return (getattr(self, "wall_auto_approach", False) or self._incline_intent()) and self.selected_mode == OperatorCommand.MODE_WALL
 
     def _gated_wall_selected(self):
         return self._manual_wall_selected() or self._auto_wall_selected()
 
     def _wall_takeover_ready(self, now):
+        if self._incline_intent():
+            wall = getattr(self, 'wall', None)
+            return bool(wall is not None and is_fresh(getattr(self, 'wall_at', None), self.status_timeout_s, now)
+                and is_fresh_source(wall.header.stamp, self.status_timeout_s, now, future_tolerance_s=0.)
+                and wall.incline_active and wall.incline_ready and wall.state == WallPerchStatus.STATE_IDLE
+                and wall.front_ready and wall.front_range_fresh and wall.top_range_fresh
+                and wall.horizontal_equilibrium_valid and wall.entry_height_ready)
         if not self._auto_wall_selected():
             return self._manual_wall_ready(now)
         wall = self.wall
@@ -556,7 +602,7 @@ class FlightModeManagerNode(RCTakeoverManager):
                     and self.sensor.front_valid)
 
     def _manual_wall_selected(self):
-        return getattr(self, "wall_manual_approach", False) and self.selected_mode == OperatorCommand.MODE_WALL
+        return not self._incline_intent() and getattr(self, "wall_manual_approach", False) and self.selected_mode == OperatorCommand.MODE_WALL
 
     def _manual_wall_ready(self, now):
         wall = self.wall
@@ -590,13 +636,56 @@ class FlightModeManagerNode(RCTakeoverManager):
             and is_fresh(self.owner_at, self.output_timeout_s, now)
         )
 
-    def _entry_stream_failed(self, now, monotonic_now):
+    def _ceiling_entry_owner_expected(self, monotonic_now):
+        return bool(
+            self.phase == self.ENTERING
+            and self.selected_mode == OperatorCommand.MODE_CEILING
+            and self.owner == 1  # AttachmentControlCandidate.SOURCE_CEILING
+            and self._current_offboard_request(monotonic_now)
+        )
+
+    def _entry_stream_ready(self, now, monotonic_now):
+        """Accept prestream or this attempt's confirmed ceiling ownership.
+
+        Keep _stream_ready strict: before entry, only the owner-free prestream
+        may authorize an OFFBOARD request. Ownership changes during entry are
+        a separate handshake, not proof that the publisher has stopped.
+        """
         if self._stream_ready(now):
+            return True
+        if not self._ceiling_entry_owner_expected(monotonic_now):
+            return False
+        flight, status = self.flight, getattr(self, "ceiling", None)
+        return bool(
+            self.output_mode == 2
+            and is_fresh(self.output_at, self.output_timeout_s, now)
+            and is_fresh(self.owner_at, self.output_timeout_s, now)
+            and flight is not None and flight.connected and flight.armed
+            and flight.mode.upper() == "OFFBOARD"
+            and is_fresh(self.flight_at, self.state_timeout_s, now)
+            and is_fresh_source(flight.header.stamp, self.state_timeout_s, now, future_tolerance_s=0.)
+            and status is not None
+            and is_fresh(getattr(self, "ceiling_at", None), self.status_timeout_s, now)
+            and is_fresh_source(status.header.stamp, self.status_timeout_s, now, future_tolerance_s=0.)
+            and status.state in (CeilingAttachmentStatus.STATE_CEILING_ARMED,
+                                 CeilingAttachmentStatus.STATE_APPROACH,
+                                 CeilingAttachmentStatus.STATE_ATTACH_CONTROL,
+                                 CeilingAttachmentStatus.STATE_SURFACE_HOLD)
+            and status.enabled and status.candidate_valid and status.keep_ownership
+            and not status.fault_detected and not status.detach_failed
+            and not status.approach_timed_out and not status.abort_land_requested
+        )
+
+    def _entry_stream_failed(self, now, monotonic_now):
+        if self._entry_stream_ready(now, monotonic_now):
             self.entry_stream_loss_since = None
             return False
-        # No grace for missing feedback, owner changes or a stale publisher.
+        # Missing/stale output or an unrelated owner is always a hard failure.
+        # Only the current ceiling handoff may wait for independently delivered
+        # flight/status callbacks, using the existing bounded dropout grace.
         if (not is_fresh(self.output_at, self.output_timeout_s, now)
-                or not is_fresh(self.owner_at, self.output_timeout_s, now) or self.owner != 0):
+                or not is_fresh(self.owner_at, self.output_timeout_s, now)
+                or (self.owner != 0 and not self._ceiling_entry_owner_expected(monotonic_now))):
             return True
         if getattr(self, "entry_stream_loss_since", None) is None:
             self.entry_stream_loss_since = monotonic_now
@@ -766,7 +855,12 @@ class FlightModeManagerNode(RCTakeoverManager):
         return bool(getattr(self, "ceiling_baro_handover_enabled", False)
                     and self.selected_mode == OperatorCommand.MODE_CEILING
                     and status is not None and is_fresh(self.ceiling_at, self.status_timeout_s, now)
-                    and status.state == CeilingAttachmentStatus.STATE_DETACH
+                    and status.state == CeilingAttachmentStatus.STATE_RECOVERY_HOVER
+                    and status.recovery_ready
+                    and self._ceiling_position_ready(now)
+                    and (not getattr(self, "ceiling_motion_enabled", False) or (
+                        status.motion_control_enabled and status.motion_ready and not status.motion_paused
+                        and is_fresh_source(status.header.stamp, self.status_timeout_s, now, future_tolerance_s=0.)))
                     and status.detach_height_ready and status.baro_fresh
                     and status.baro_reference_ready and not status.detach_failed
                     and not status.fault_detected)
@@ -777,8 +871,10 @@ class FlightModeManagerNode(RCTakeoverManager):
             self.selected_mode == OperatorCommand.MODE_CEILING
             and status is not None
             and is_fresh(self.ceiling_at, self.status_timeout_s, now)
-            and status.state == CeilingAttachmentStatus.STATE_FAULT
-            and getattr(status, "approach_timed_out", False)
+            and status.state == CeilingAttachmentStatus.STATE_ABORT
+            and not getattr(status, "abort_land_requested", False)
+            and (getattr(status, "approach_timed_out", False)
+                 or getattr(status, "motion_control_enabled", False))
         )
 
     def _wall_approach_timeout_requested(self, now):
@@ -1003,9 +1099,11 @@ class FlightModeManagerNode(RCTakeoverManager):
             self.odom_at, self.odom_timeout_s, now
         ) or not finite:
             return False
+        if getattr(self, "selected_mode", None) == OperatorCommand.MODE_CEILING and not self._ceiling_position_ready(now):
+            return False
         if getattr(self, "ceiling_approach_timeout_returning", False):
             # This is an aborted approach, so there is no HOLD pressure baseline.
-            # Keep the FAULT stream until a live ALTCTL response. Valid RC input
+            # Keep the FAULT stream until a live POSCTL response. Valid RC input
             # is required, but descent speed/centering must not prevent return.
             return bool(
                 self._ceiling_approach_timeout_requested(now)
@@ -1066,7 +1164,7 @@ class FlightModeManagerNode(RCTakeoverManager):
             status, received_at = self.ceiling, self.ceiling_at
             if status is None or not is_fresh(received_at, self.status_timeout_s, now):
                 return
-            if status.state == CeilingAttachmentStatus.STATE_FAULT or status.detach_failed:
+            if status.state == CeilingAttachmentStatus.STATE_ABORT or status.detach_failed:
                 self.fault_seen = True
             if status.state == CeilingAttachmentStatus.STATE_DETACH:
                 self.detach_seen = True
@@ -1074,6 +1172,8 @@ class FlightModeManagerNode(RCTakeoverManager):
                     self.completed = True
             elif self.detach_seen and status.state == CeilingAttachmentStatus.STATE_RECOVERY_HOVER:
                 self.recovery_seen = True
+                if self._ceiling_baro_handover_ready(now):
+                    self.completed = True
             elif (
                 self.recovery_seen
                 and status.state == CeilingAttachmentStatus.STATE_NORMAL_FLIGHT
@@ -1185,12 +1285,14 @@ class FlightModeManagerNode(RCTakeoverManager):
         try:
             if mode == 'AUTO.LAND':
                 rospy.wait_for_service('/mavros/set_mode', timeout=.2)
-                if not self._wall_abort_land_live(rospy.Time.now(), attempt):
+                ceiling_landing = self._ceiling_abort_land_live(rospy.Time.now(), attempt)
+                if not ceiling_landing and not self._wall_abort_land_live(rospy.Time.now(), attempt):
                     return
                 request = SetModeRequest()
                 request.custom_mode = 'AUTO.LAND'
-                if getattr(self, 'wall_land_request_at', None) is None:
-                    self.wall_land_request_at = rospy.Time.now().to_sec()
+                request_stamp = 'ceiling_land_request_at' if ceiling_landing else 'wall_land_request_at'
+                if getattr(self, request_stamp, None) is None:
+                    setattr(self, request_stamp, rospy.Time.now().to_sec())
                 response = self.set_mode(request)
                 if not response.mode_sent:
                     rospy.logwarn('PX4 did not accept AUTO.LAND mode request')
@@ -1253,6 +1355,10 @@ class FlightModeManagerNode(RCTakeoverManager):
                 if not self._handover_ready(rospy.Time.now()):
                     return
                 self.range_posctl_request = (self._wall_range_identity(), rospy.Time.now().to_sec())
+            if mode == 'POSCTL' and getattr(self, "selected_mode", None) == OperatorCommand.MODE_CEILING:
+                # Retain the first request epoch across retries, so heartbeats are not starved.
+                if getattr(self, "ceiling_posctl_request_at", None) is None:
+                    self.ceiling_posctl_request_at = rospy.Time.now().to_sec()
             response = self.set_mode(request)
             if not response.mode_sent:
                 rospy.logwarn("PX4 did not accept %s mode request", mode)
@@ -1270,6 +1376,8 @@ class FlightModeManagerNode(RCTakeoverManager):
             self.request_in_flight = False
 
     def _reset(self, lock=False, reason=None):
+        self.ceiling_posctl_request_at = None
+        self.ceiling_flight_source = None
         self.wall_approach_timeout_returning = False
         self.wall_timeout_stable_since = self.wall_timeout_last_odom = None
         self.wall_timeout_safe_samples = 0
@@ -1328,7 +1436,7 @@ class FlightModeManagerNode(RCTakeoverManager):
             self.wall_land_request_at = None
             self.wall_land_confirmed = False
             self.last_request_at = None
-            self._set_phase('WALL_LANDING', reason='detach最终俯仰为负，立即请求PX4 AUTO.LAND')
+            self._set_phase('WALL_LANDING', reason='脱离中止，立即请求PX4 AUTO.LAND：' + getattr(s, 'reason', ''))
         flight = getattr(self, 'flight', None)
         fresh = (flight is not None and is_fresh(self.flight_at, self.state_timeout_s, now)
                  and is_fresh_source(flight.header.stamp, self.state_timeout_s, now, future_tolerance_s=0.))
@@ -1354,6 +1462,67 @@ class FlightModeManagerNode(RCTakeoverManager):
         self.phase_reason_pub.publish(String(data=self.phase_reason))
         return True
 
+    def _ceiling_land_status_identity(self):
+        return getattr(getattr(self, 'ceiling', None), 'abort_maneuver_id', '')
+
+    def _ceiling_abort_land_live(self, now, attempt=None):
+        s, flight = getattr(self, 'ceiling', None), getattr(self, 'flight', None)
+        return bool(self.phase == 'CEILING_LANDING'
+            and (attempt is None or attempt == getattr(self, 'takeover_attempt', 0))
+            and not getattr(self, 'rc_takeover_requested', False)
+            and kill_clear(self, now)
+            and getattr(self, 'ceiling_land_identity', None) == self._ceiling_land_status_identity()
+            and s is not None and s.state == CeilingAttachmentStatus.STATE_ABORT
+            and getattr(s, 'abort_land_requested', False)
+            and is_fresh(getattr(self, 'ceiling_at', None), self.status_timeout_s, now)
+            and is_fresh_source(s.header.stamp, self.status_timeout_s, now, future_tolerance_s=0.)
+            and flight is not None and flight.connected and flight.armed
+            and flight.mode.upper() == 'OFFBOARD'
+            and is_fresh(self.flight_at, self.state_timeout_s, now)
+            and is_fresh_source(flight.header.stamp, self.state_timeout_s, now, future_tolerance_s=0.))
+
+    def _tick_ceiling_abort_land(self, now):
+        s = getattr(self, 'ceiling', None)
+        identity = self._ceiling_land_status_identity()
+        if self.phase != 'CEILING_LANDING':
+            if (getattr(self, 'selected_mode', None) != OperatorCommand.MODE_CEILING
+                    or s is None or s.state != CeilingAttachmentStatus.STATE_ABORT
+                    or not getattr(s, 'abort_land_requested', False)
+                    or not identity
+                    or identity == getattr(self, 'ceiling_land_retired_identity', None)
+                    or not is_fresh(getattr(self, 'ceiling_at', None), self.status_timeout_s, now)
+                    or not is_fresh_source(s.header.stamp, self.status_timeout_s, now, future_tolerance_s=0.)):
+                return False
+            self.ceiling_land_identity = identity
+            self.ceiling_land_request_at = None
+            self.ceiling_land_confirmed = False
+            self.last_request_at = None
+            self._set_phase('CEILING_LANDING', reason='吸顶HOLD超时中止，立即请求PX4 AUTO.LAND：' + getattr(s, 'reason', ''))
+        flight = getattr(self, 'flight', None)
+        fresh = (flight is not None and is_fresh(self.flight_at, self.state_timeout_s, now)
+                 and is_fresh_source(flight.header.stamp, self.state_timeout_s, now, future_tolerance_s=0.))
+        if fresh and (not flight.connected or not flight.armed):
+            self.ceiling_land_retired_identity = self.ceiling_land_identity
+            self._reset(lock=True, reason='降落分支结束：飞控断连或已解除武装')
+        elif fresh and flight.mode.upper() != 'OFFBOARD':
+            request_at = self.ceiling_land_request_at
+            if (flight.mode.upper() == 'AUTO.LAND' and request_at is not None
+                    and flight.header.stamp.to_sec() > request_at and self.flight_at.to_sec() > request_at):
+                self.ceiling_land_confirmed = True
+                self.phase_reason = 'PX4 AUTO.LAND新鲜反馈已确认，降落由飞控执行'
+            elif flight.mode.upper() != 'AUTO.LAND':
+                self.ceiling_land_retired_identity = self.ceiling_land_identity
+                self._reset(lock=True, reason='飞手/外部模式接管，停止自动降落请求')
+        elif fresh and getattr(self, 'ceiling_land_confirmed', False):
+            self.ceiling_land_retired_identity = self.ceiling_land_identity
+            self._reset(lock=True, reason='已确认降落后的模式改变，禁止再次自动接管')
+        elif self._ceiling_abort_land_live(now):
+            self._request_mode('AUTO.LAND')
+        self.prestream_pub.publish(Bool(data=False))
+        self.phase_pub.publish(String(data=self.phase))
+        self.phase_reason_pub.publish(String(data=self.phase_reason))
+        return True
+
     def _on_timer(self, _event):
         now = rospy.Time.now()
         self._publish_range_handover_readiness(now)
@@ -1369,6 +1538,8 @@ class FlightModeManagerNode(RCTakeoverManager):
             self.prestream_pub.publish(Bool(data=False))
             self.phase_pub.publish(String(data=self.phase))
             self.phase_reason_pub.publish(String(data=self.phase_reason))
+            return
+        if self._tick_ceiling_abort_land(now):
             return
         if self._tick_wall_abort_land(now):
             return
@@ -1495,7 +1666,7 @@ class FlightModeManagerNode(RCTakeoverManager):
             elif flight_fresh and flight_mode == "OFFBOARD":
                 if not self._current_offboard_request(monotonic_now):
                     self._begin_entry_cancel("未确认本次OFFBOARD请求", monotonic_now)
-                elif not self._stream_ready(now):
+                elif not self._entry_stream_ready(now, monotonic_now):
                     self.phase_reason = "本次OFFBOARD已反馈；等待短暂输出间断恢复，禁止开始侧吸"
                 elif (self._manual_wall_selected() and not self._manual_wall_ready(now)
                         and not self._wall_flip_started(now)):
@@ -1534,7 +1705,7 @@ class FlightModeManagerNode(RCTakeoverManager):
                     if self._handover_ready(now):self._request_mode(self._pilot_mode())
                 elif self._ceiling_approach_timeout_requested(now):
                     self.ceiling_approach_timeout_returning = True
-                    self._set_phase(self.RETURNING, reason="吸顶接近超时：FAULT锁存，等待ALTCTL确认后交回遥控器")
+                    self._set_phase(self.RETURNING, reason="吸顶故障退出：FAULT锁存，等待POSCTL确认后交回遥控器")
                     if self._handover_ready(now):
                         self._request_mode(self._pilot_mode())
                 elif self._ceiling_baro_handover_ready(now):
@@ -1581,7 +1752,7 @@ class FlightModeManagerNode(RCTakeoverManager):
                     detail=self._wall_timeout_handover_failure(now) or "等待姿态及竖直速度连续安全0.30秒"
                     self.phase_reason="接近超时：受控交回" + self._pilot_mode() + "；" + detail
                 elif getattr(self, "ceiling_approach_timeout_returning", False):
-                    self.phase_reason = "吸顶接近超时：保持FAULT，等待有效遥控输入、飞控估计和连续输出后请求ALTCTL"
+                    self.phase_reason = "吸顶故障退出：保持FAULT，等待有效位置/速度估计、遥控输入及连续输出后请求POSCTL"
                 elif self._wall_return_requires_exit() and not self._wall_return_exit_ready(now):
                     self.phase_reason = (('姿态稳定条件重新确认中：保持受控输出，等待有效EXIT后交回'
                         if self._captured_recovery() else '离墙条件重新确认中：保持受控输出，等待新的有效EXIT后交回')

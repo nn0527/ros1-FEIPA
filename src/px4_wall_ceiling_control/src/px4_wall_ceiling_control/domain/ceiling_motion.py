@@ -1,0 +1,135 @@
+"""Ceiling-specific motion envelope; positions/velocities use world ENU."""
+import math
+from dataclasses import dataclass, fields
+
+from px4_wall_ceiling_control.domain.horizontal_velocity import HorizontalVelocityController
+from px4_wall_ceiling_control.domain.recovery_attitude_limits import (
+    attitude_from_axis_yaw, cone_axis, limit_recovery_attitude,
+)
+
+
+@dataclass(frozen=True)
+class CeilingMotionSettings:
+    horizontal_position_deadband_m: float = .10
+    horizontal_position_kp: float = .30
+    horizontal_max_speed_mps: float = .20
+    horizontal_velocity_kp: float = 1.5
+    horizontal_velocity_ki: float = .30
+    horizontal_integral_limit_mps2: float = .20
+    horizontal_max_acceleration_mps2: float = .40
+    horizontal_target_acceleration_mps2: float = .10
+    horizontal_drift_warn_m: float = .30
+    horizontal_drift_pause_m: float = .50
+    horizontal_drift_resume_m: float = .30
+    attitude_max_tilt_deg: float = 10.
+    contact_max_tilt_deg: float = 5.
+    yaw_max_offset_deg: float = 10.
+    attitude_tilt_slew_deg_s: float = 15.
+    attitude_yaw_slew_deg_s: float = 15.
+    actual_tilt_pause_deg: float = 15.
+    actual_tilt_resume_deg: float = 12.
+    actual_body_rate_pause_deg_s: float = 30.
+    actual_body_rate_resume_deg_s: float = 20.
+    motion_limit_confirm_s: float = .20
+    motion_resume_hold_s: float = .50
+    motion_feedback_timeout_s: float = 2.
+    motion_pause_timeout_s: float = 8.
+    motion_flow_timeout_s: float = .60
+    motion_flow_future_tolerance_s: float = .10
+    motion_flow_quality_min: float = 1.
+    motion_estimator_timeout_s: float = 1.5
+    motion_reacquire_time_s: float = .30
+    motion_equilibrium_window_s: float = .50
+    motion_equilibrium_speed_mps: float = .20
+    motion_fcu_target_timeout_s: float = .35
+    motion_capture_timeout_s: float = 2.
+    vertical_speed_kp: float = .30
+    vertical_target_acceleration_mps2: float = .15
+    detach_min_down_speed_mps: float = .05
+    recovery_height_kp: float = .50
+    recovery_height_tolerance_m: float = .05
+    recovery_vertical_speed_mps: float = .15
+    recovery_horizontal_speed_mps: float = .15
+    recovery_max_tilt_deg: float = 10.
+    recovery_max_rate_deg_s: float = 20.
+    recovery_stable_time_s: float = .50
+    recovery_timeout_s: float = 15.
+    contact_release_distance_m: float = .10
+    contact_release_hold_s: float = .20
+    odom_position_jump_m: float = .75
+    odom_yaw_jump_deg: float = 20.
+
+    @classmethod
+    def read(cls, getter):
+        return cls(**{f.name: float(getter('~' + f.name, f.default)) for f in fields(cls)})
+
+    def __post_init__(self):
+        if any(not math.isfinite(getattr(self, f.name)) or getattr(self, f.name) <= 0
+               for f in fields(self) if f.name != 'motion_flow_future_tolerance_s'):
+            raise ValueError('ceiling motion parameters must be finite and positive')
+        if (not 0 <= self.motion_flow_future_tolerance_s <= .10
+                or not 1 <= self.motion_flow_quality_min <= 255
+                or not self.horizontal_position_deadband_m < self.horizontal_drift_warn_m < self.horizontal_drift_pause_m
+                or not self.horizontal_position_deadband_m < self.horizontal_drift_resume_m < self.horizontal_drift_pause_m
+                or not self.contact_max_tilt_deg <= self.attitude_max_tilt_deg < self.actual_tilt_pause_deg < 45
+                or not self.actual_tilt_resume_deg < self.actual_tilt_pause_deg
+                or not self.actual_body_rate_resume_deg_s < self.actual_body_rate_pause_deg_s
+                or self.horizontal_max_speed_mps > .30
+                or self.recovery_max_tilt_deg > self.actual_tilt_pause_deg
+                or self.recovery_stable_time_s >= self.recovery_timeout_s):
+            raise ValueError('invalid ceiling motion envelope/hysteresis')
+
+
+class CeilingMotionController:
+    def __init__(self, settings):
+        self.settings = settings
+        self.horizontal = HorizontalVelocityController(
+            settings.horizontal_velocity_kp, settings.horizontal_max_acceleration_mps2,
+            settings.horizontal_target_acceleration_mps2, settings.horizontal_velocity_ki,
+            settings.horizontal_integral_limit_mps2)
+        self.reset()
+
+    def reset(self):
+        self.horizontal.reset()
+        self.xy = None
+        self.yaw = 0.
+        self.axis = (0., 0., 1.)
+        self.vertical_support = None
+        self.vz_target = 0.
+
+    def capture(self, xy, yaw, axis, thrust):
+        self.reset()
+        self.xy, self.yaw, self.axis = tuple(xy), yaw, tuple(axis)
+        self.vertical_support = thrust * axis[2]
+
+    def drift(self, xy):
+        return math.hypot(*(a-b for a, b in zip(self.xy, xy))) if self.xy is not None else math.inf
+
+    def attitude(self, xy, velocity, dt, integrate=False, integral_dt=0., applied_axis=None):
+        s = self.settings
+        error = tuple(a-b for a, b in zip(self.xy, xy))
+        distance = math.hypot(*error)
+        speed = min(s.horizontal_max_speed_mps,
+                    s.horizontal_position_kp * max(0., distance-s.horizontal_position_deadband_m))
+        desired = tuple(v*speed/distance for v in error) if distance > 0 else (0., 0.)
+        return self.horizontal.attitude(desired, velocity, self.yaw, dt, self.axis,
+            integrate=integrate, integral_dt=integral_dt,
+            max_tilt=math.radians(s.attitude_max_tilt_deg), applied_axis=applied_axis)
+
+    def vertical_target(self, desired, dt):
+        step = self.settings.vertical_target_acceleration_mps2 * max(0., min(.05, dt))
+        self.vz_target += max(-step, min(step, desired-self.vz_target))
+        return self.vz_target
+
+
+def limit_ceiling_attitude(desired, previous, dt, yaw_reference, settings, contact=False):
+    """Limit the FINAL target, after RC trim; a hard cone overrides slew on entry."""
+    from px4_wall_ceiling_control.domain.geometry import rotate_vector, euler_from_quaternion
+    yaw = euler_from_quaternion(desired)[2]
+    offset = math.atan2(math.sin(yaw-yaw_reference), math.cos(yaw-yaw_reference))
+    offset = max(-math.radians(settings.yaw_max_offset_deg),
+                 min(math.radians(settings.yaw_max_offset_deg), offset))
+    tilt = math.radians(settings.contact_max_tilt_deg if contact else settings.attitude_max_tilt_deg)
+    target = attitude_from_axis_yaw(cone_axis(rotate_vector(desired, (0., 0., 1.)), tilt), yaw_reference+offset)
+    return limit_recovery_attitude(target, previous, min(.05, max(0., dt)), tilt,
+        math.radians(settings.attitude_tilt_slew_deg_s), math.radians(settings.attitude_yaw_slew_deg_s))[0]

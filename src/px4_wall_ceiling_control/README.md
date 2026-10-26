@@ -135,6 +135,7 @@ should not acquire additional deployment-specific topic names.
 - [System architecture](docs/architecture.md)
 - [Ceiling behavior](docs/behaviors/ceiling_attachment.md)
 - [Wall behavior](docs/behaviors/wall_perch.md)
+- [斜面吸附与脱离实现及参数](docs/incline_implementation_20261026.md)
 - [Disarmed PX4 observation](docs/px4_disarmed_observation.md)
 - [Real PX4 motor bench procedure](../../bench_test_procedure.txt)
 - [Terminal flight handover](docs/terminal_flight.md)

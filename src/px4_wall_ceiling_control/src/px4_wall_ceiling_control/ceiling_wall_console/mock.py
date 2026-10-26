@@ -10,11 +10,11 @@ from px4_wall_ceiling_control.wall_console import ConsoleState, validate_config
 
 SCENARIOS = {
     'grounded': '落地待命 / 启动配置',
-    'ceiling_ready': '顶吸：ALTCTL 入口',
+    'ceiling_ready': '顶吸：POSCTL 入口',
     'ceiling_approach': '顶吸：向上接近',
     'ceiling_hold': '顶吸：保持',
     'ceiling_detach': '顶吸：气压下降脱离',
-    'ceiling_returned': '顶吸：ALTCTL 已确认',
+    'ceiling_returned': '顶吸：POSCTL 已确认',
     'wall_ready': '侧吸：POSCTL 入口',
     'wall_wait': '侧吸：手动接近等待',
     'wall_hold': '侧吸：贴墙保持 / 融合暂停',
@@ -58,7 +58,7 @@ class MockRuntime:
         returned = name in ('ceiling_returned', 'range_returned', 'manual_returned')
         active = name not in ('grounded', 'ceiling_ready', 'wall_ready', 'wall_wait') and not returned
         armed = name != 'grounded'
-        mode = 'OFFBOARD' if active else 'ALTCTL' if ceiling else 'POSCTL'
+        mode = 'OFFBOARD' if active else 'POSCTL'
         phase = 'WAITING_WALL' if name == 'wall_wait' else 'ACTIVE' if active else 'IDLE'
         owner = (1 if ceiling else 2) if active else 0
         wall_state = {'wall_hold': 'WALL_HOLD', 'range_rotating': 'DETACH_ROTATE',

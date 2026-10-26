@@ -281,7 +281,7 @@ class RemoteRuntime:
             value = {"ceiling_valid": msg.ceiling_valid, "front_valid": msg.front_valid,
                      "ceiling_age_s": msg.ceiling_age_s, "front_age_s": msg.front_age_s}
         elif name == "ceiling_status":
-            value = {key: getattr(msg, key) for key in ("state_name", "reason", "fault_detected", "attach_confirmed", "distance_stable", "range_fresh", "odom_fresh", "candidate_valid", "ceiling_distance_filtered_m", "compression_m", "target_distance_m", "detach_failed", "activation_ready", "detach_start_height_m", "descended_height_m", "detach_height_ready", "height_source", "baro_fresh", "baro_reference_ready", "baro_pressure_pa", "hold_pressure_pa")}
+            value = {key: getattr(msg, key) for key in ("state_name", "reason", "fault_detected", "attach_confirmed", "distance_stable", "range_fresh", "odom_fresh", "candidate_valid", "ceiling_distance_filtered_m", "compression_m", "target_distance_m", "detach_failed", "activation_ready", "detach_start_height_m", "descended_height_m", "detach_height_ready", "height_source", "baro_fresh", "baro_reference_ready", "baro_pressure_pa", "hold_pressure_pa", "motion_control_enabled", "motion_ready", "baseline_ready", "motion_paused", "recovery_ready", "horizontal_drift_m", "horizontal_speed_mps", "actual_tilt_deg", "actual_body_rate_deg_s", "yaw_reference_rad", "recovery_target_height_m", "target_vertical_speed_mps", "motion_reason", "abort_land_requested", "hold_timed_out", "abort_maneuver_id", "hold_elapsed_s", "hold_timeout_s")}
         elif name == "wall_sensor_fusion":
             # Parameter ACKs are not proof that the EKF fused a measurement.
             value = {key: getattr(msg, key) for key in (
@@ -323,6 +323,9 @@ class RemoteRuntime:
                      "angles": [math.degrees(v) for v in euler_from_quaternion((q.x, q.y, q.z, q.w))] if finite else None}
         else:
             return
+        if name == "wall":
+            value.update({key: getattr(msg, key) for key in (
+                "incline_active", "incline_ready", "incline_phase", "incline_fault_reason", "incline_thrust_limit")})
         self.state.update(name, finite_json(value))
 
     def roslog(self, msg):
@@ -379,6 +382,7 @@ class RemoteRuntime:
                     and self.ros.get_param("/wall_perch_decision_node/ignore_range_loss_during_attachment", False)
                     and self.ros.get_param("/flight_mode_manager_node/ignore_range_loss_during_attachment",
                         self.ros.get_param("/wall_perch_decision_node/ignore_range_loss_during_attachment", False))), "wall_pilot_mode": self.ros.get_param("/flight_mode_manager_node/wall_pilot_mode","ALTCTL"), "front_sensor_masked": self.ros.get_param("/attachment/front_sensor_masked", False), "ceiling_distance_gate_enabled": self.ros.get_param("/flight_mode_manager_node/ceiling_distance_gate_enabled", False), "ceiling_enabled": "/ceiling_attachment_decision_node" in nodes,
+                "ceiling_motion_enabled": self.ros.get_param("/ceiling_attachment_decision_node/motion_control_enabled", False),
                 "ceiling_activation_distance_m": self.ros.get_param("/ceiling_attachment_decision_node/activation_distance_m", .5),
                 "enabled": bool(enabled), "test_profile": profile, "nodes": sorted(nodes),
                 "missing": sorted(required - nodes), "logger": "/attachment_flight_logger" in nodes}
@@ -710,7 +714,7 @@ class RemoteRuntime:
             if not slot["event"].wait(2.5):
                 raise ValueError("未收到吸顶节点回执，执行情况未确认；请检查实时阶段，勿重复点击。若为旧节点，请在落地上锁后重启基础程序")
             reply=slot["reply"]
-            if reply.get("accepted") is not True or reply.get("mode") != 2 or reply.get("enable_control") is not True:
+            if reply.get("accepted") is not True or reply.get("mode") != (5 if command == "incline" else 2) or reply.get("enable_control") is not True:
                 error=ValueError("吸顶节点拒绝："+str(reply.get("reason","未提供原因")))
                 error.command_rejected=True
                 raise error
@@ -729,6 +733,10 @@ class RemoteRuntime:
             self.publisher.publish(command)
         self.state.send_ceiling_detach(publish)
         return {"message": "离顶请求已提交；等待吸顶节点确认"}
+
+    def incline(self):
+        self.state.send_incline(self._publish_ceiling_request)
+        return {"message": "斜墙请求已确认接收，等待50cm接近准入"}
 
     def wall(self):
         def publish(command):
@@ -1096,6 +1104,11 @@ class SSHTransport:
             ceiling_detach_sources = tuple(n for n in ceiling_sources if n not in ("health", "ceiling")) + ("setpoint",)
             if not connected or not self.session.get("control") or any(not result["status"][n]["fresh"] for n in ceiling_detach_sources):
                 result["can_ceiling_detach"] = False
+            incline_sources = required_feedback + ("front", "ceiling")
+            if (not connected or not self.session.get("control")
+                    or any(not result["status"][key]["fresh"] for key in incline_sources)):
+                result["can_incline"] = False
+                result["incline_blockers"] = ["斜墙所需实时反馈或控制权缺失"]
             result["config"] = config
             if not connected or stale:
                 result["can_cancel_wait"] = False
@@ -1116,7 +1129,7 @@ class SSHTransport:
                 raise ValueError("SSH 未连接，操作未发送")
             if action == "stop" and not self.session.get("control"):
                 raise ValueError("需要控制权，终止未发送")
-            if action in ("start", "wall", "detach", "cancel_wait", "rc_takeover", "set_range_height") and (not self.push_enabled or not self.session.get("control") or time.monotonic() - self.arrived >= 2):
+            if action in ("start", "wall", "incline", "detach", "cancel_wait", "rc_takeover", "set_range_height") and (not self.push_enabled or not self.session.get("control") or time.monotonic() - self.arrived >= 2):
                 raise ValueError("需要控制权和有效的实时反馈，操作未发送")
             if action == "push":
                 self.push_enabled = bool(config["enabled"])
@@ -1203,6 +1216,8 @@ def http_main(args):
                     result = transport.request("push", data)
                 elif self.path in ("/api/ceiling", "/api/ceiling-detach"):
                     result = transport.request("ceiling" if self.path == "/api/ceiling" else "ceiling_detach")
+                elif self.path == "/api/incline":
+                    result = transport.request("incline")
                 elif self.path == "/api/wall":
                     result = transport.request("wall")
                 elif self.path == "/api/rc-takeover":

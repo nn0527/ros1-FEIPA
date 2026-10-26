@@ -1,7 +1,7 @@
 const assert=require('node:assert/strict');
 const {view}=require('../../web/ceiling_wall_console/app.js');
 function snapshot(){
-  const values={runtime:{enabled:true},state:{armed:true,connected:true,mode:'ALTCTL'},odom:{},estimator:{},operator:{},phase:'IDLE',owner:0,kill:{valid:true,active:false},ceiling_status:{state_name:'NORMAL_FLIGHT'},setpoint:{thrust:.45}};
+  const values={runtime:{enabled:true},state:{armed:true,connected:true,mode:'POSCTL'},odom:{},estimator:{},operator:{},phase:'IDLE',owner:0,kill:{valid:true,active:false},ceiling_status:{state_name:'NORMAL_FLIGHT'},setpoint:{thrust:.45}};
   return {status:Object.fromEntries(Object.entries(values).map(([key,value])=>[key,{fresh:true,value}])),ssh:{connected:true},session:{control:true,feedback_live:true},can_ceiling:true,can_ceiling_detach:false,ceiling_blockers:[]};
 }
 let checks=0;
@@ -25,4 +25,8 @@ initial.status.state.value.armed=false;initial.starting=true;check(!view(initial
 check(!view(snapshot()).editable);
 const bootstrap=snapshot();bootstrap.status.runtime={fresh:false,value:null};bootstrap.status.state={fresh:false,value:null};check(view(bootstrap).canStart);
 const returning=snapshot();returning.status.phase.value='RETURNING';check(view(returning).stage==='等待遥控接管');
+const abort=snapshot();abort.status.ceiling_status.value={state_name:'ABORT',fault_detected:true,abort_land_requested:false,reason:'ordinary fault'};
+check(view(abort).stage==='顶吸中止');
+abort.status.ceiling_status.value.abort_land_requested=true;
+check(view(abort).stage==='顶吸中止 · 自动降落');
 console.log(`${checks} UI state assertions passed`);
