@@ -161,6 +161,7 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
         if not math.isfinite(self.hold_timeout_s) or self.hold_timeout_s <= 0:
             raise ValueError("hold_timeout_s must be finite and positive")
         self.hold_timed_out = False
+        self.abort_land_on_fault = bool(rospy.get_param('~abort_land_on_fault', False))
         self.abort_maneuver_id = ''
         self.hold_elapsed_at_abort = 0.
         self.detach_baro_height_enabled = bool(rospy.get_param("~detach_baro_height_enabled", False))
@@ -722,7 +723,7 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
 
     def _landing_abort(self):
         return (self.state == CeilingAttachmentStatus.STATE_ABORT
-                and getattr(self, "hold_timed_out", False))
+                and (getattr(self, "hold_timed_out", False) or getattr(self, "abort_land_on_fault", False)))
 
     def _update_state_machine(self, now):
         # Latch landing ABORT through flight-mode handoff; ordinary recovery must
@@ -735,6 +736,16 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
                 self._enter_state(CeilingAttachmentStatus.STATE_NORMAL_FLIGHT, now,
                                   "ceiling abort finished after disarm and request release")
             return
+        # Safety faults outrank detach/CH12, including faults during OFFBOARD entry.
+        if getattr(self, 'abort_land_on_fault', False):
+            critical = (self.state not in (CeilingAttachmentStatus.STATE_NORMAL_FLIGHT, CeilingAttachmentStatus.STATE_ABORT)
+                        or (self._mode_requested(now) and getattr(self, 'motion_manager_phase', '') in ('ENTERING', 'ACTIVE')))
+            if critical:
+                fault = self._ceiling_safety_fault(now)
+                if fault:
+                    self.fault_count += 1
+                    self._enter_state(CeilingAttachmentStatus.STATE_ABORT, now, fault)
+                    return
         # A normal detach/cancel accepted on this tick has priority. Once DETACH
         # starts its own timeout/recovery applies, never the HOLD watchdog.
         if (self.state == CeilingAttachmentStatus.STATE_SURFACE_HOLD
@@ -768,7 +779,7 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
             return
         if (getattr(self, "motion_enabled", False) and self.motion_fatal
                 and self.state != CeilingAttachmentStatus.STATE_ABORT
-                and self._flight_ready(now)
+                and (self._flight_ready(now) or getattr(self, "abort_land_on_fault", False))
                 and (self._mode_requested(now) or self.motion_controller.xy is not None)):
             self.detach_failed = self.state in (CeilingAttachmentStatus.STATE_DETACH, CeilingAttachmentStatus.STATE_RECOVERY_HOVER)
             self._enter_state(CeilingAttachmentStatus.STATE_ABORT, now, self.motion_fatal)
@@ -782,26 +793,20 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
             CeilingAttachmentStatus.STATE_SURFACE_HOLD,
         )
 
-        if attached_state and (self.detach_requested or not mode_requested):
-            self._enter_state(
-                CeilingAttachmentStatus.STATE_DETACH,
-                now,
-                "detach requested or ceiling mode released",
-            )
-        elif attached_state and (
-            (not range_fresh and not profile)
-            or not odom_fresh
-            or self._tilt_fault(now)
-            or getattr(self, "motion_contact_unsafe", False)
-            or (range_fresh and self._contact_lost())
-        ):
+        contact_fault = attached_state and (
+            (not range_fresh and not profile) or not odom_fresh
+            or self._tilt_fault(now) or getattr(self, "motion_contact_unsafe", False)
+            or (range_fresh and self._contact_lost()))
+        if contact_fault and getattr(self, 'abort_land_on_fault', False):
             self.fault_count += 1
-            target = (
-                CeilingAttachmentStatus.STATE_DETACH
-                if flight_ready
-                else CeilingAttachmentStatus.STATE_ABORT
-            )
-            self._enter_state(target, now, "attached input or contact safety lost")
+            self._enter_state(CeilingAttachmentStatus.STATE_ABORT, now, "接触安全异常：ABORT，请求PX4 AUTO.LAND")
+            return
+        if attached_state and (self.detach_requested or not mode_requested):
+            self._enter_state(CeilingAttachmentStatus.STATE_DETACH, now, "detach requested or ceiling mode released")
+        elif contact_fault:
+            self.fault_count += 1
+            self._enter_state(CeilingAttachmentStatus.STATE_DETACH if flight_ready else CeilingAttachmentStatus.STATE_ABORT,
+                              now, "attached input or contact safety lost")
 
         if (self.range_wait_active and mode_requested and arm_requested
                 and flight_ready and odom_fresh and not self._tilt_fault(now)
@@ -890,7 +895,7 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
                 self._enter_state(
                     CeilingAttachmentStatus.STATE_ABORT,
                     now,
-                    "approach timeout; waiting for confirmed POSCTL handover",
+                    "approach timeout; ABORT safety handover",
                 )
             elif (profile and self._attach_confirmed(now)
                   and (not getattr(self, "motion_enabled", False) or (self.motion_ready and not self.motion_paused))):
@@ -927,7 +932,7 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
             elif self._state_age_s(now) >= self.attach_control_timeout_s:
                 self.fault_count += 1
                 self._enter_state(
-                    CeilingAttachmentStatus.STATE_DETACH,
+                    (CeilingAttachmentStatus.STATE_ABORT if getattr(self, "abort_land_on_fault", False) else CeilingAttachmentStatus.STATE_DETACH),
                     now,
                     "attachment failed to reach stable ceiling range",
                 )
@@ -988,6 +993,8 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
                 self._enter_state(CeilingAttachmentStatus.STATE_NORMAL_FLIGHT, now, "recovery hover complete")
 
         elif self.state == CeilingAttachmentStatus.STATE_ABORT:
+            if self._landing_abort():
+                return
             # Never resume a maneuver from a recovered input stream. The pilot
             # must first release the ceiling switch and take over/re-arm.
             timeout_handover_confirmed = (not getattr(self, "approach_timed_out", False) and not getattr(self, "motion_enabled", False)) or bool(

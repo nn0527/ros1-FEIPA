@@ -50,7 +50,7 @@ function ceilingDetailView(s){
     const timed=Number.isFinite(c.hold_elapsed_s)&&Number.isFinite(c.hold_timeout_s)&&c.hold_timeout_s>0;
     hold=timed?"已保持 "+number(c.hold_elapsed_s,1)+" / "+number(c.hold_timeout_s,1)+" s；剩余 "+number(Math.max(0,c.hold_timeout_s-c.hold_elapsed_s),1)+" s，请及时脱离":"保持中；等待节点计时反馈";
   }
-  if(c.abort_land_requested)hold=state?.mode==="AUTO.LAND"?"飞控已确认 AUTO.LAND":"保持超时中止；正在请求 AUTO.LAND，尚未确认";
+  if(c.abort_land_requested)hold=!state?.connected?"飞控通信不可用；ABORT已锁存，依靠PX4内部失联保护，无法确认降落":state?.mode==="AUTO.LAND"?"飞控已确认 AUTO.LAND":"安全异常中止；正在请求 AUTO.LAND，尚未确认";
   let descent="尚未进入脱离下降";
   if(["DETACH","RECOVERY_HOVER"].includes(c.state_name)){
     const fused=c.height_source==="px4_fused_hold_relative";

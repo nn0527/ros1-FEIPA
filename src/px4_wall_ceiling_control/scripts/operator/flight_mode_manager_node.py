@@ -67,6 +67,10 @@ class FlightModeManagerNode(RCTakeoverManager):
         self.state_timeout_s = float(rospy.get_param("~state_timeout_s", 1.5))
         self.odom_timeout_s = float(rospy.get_param("~odom_timeout_s", 0.5))
         self.estimator_timeout_s = float(rospy.get_param("~estimator_timeout_s", 1.5))
+        self.ceiling_failsafe_guard_required = bool(rospy.get_param('~ceiling_failsafe_guard_required', False))
+        self.ceiling_failsafe_ready = False
+        self.ceiling_failsafe_at = None
+        rospy.Subscriber('/attachment/ceiling_failsafe_ready', Bool, self._on_ceiling_failsafe, queue_size=1)
         self.operator_timeout_s = float(rospy.get_param("~operator_timeout_s", 0.5))
         self.sensor_timeout_s = float(rospy.get_param("~sensor_timeout_s", 0.5))
         self.wall_manual_approach = bool(rospy.get_param("~wall_manual_approach", False))
@@ -447,7 +451,14 @@ class FlightModeManagerNode(RCTakeoverManager):
             return self.operator.mode
         return None
 
+    def _on_ceiling_failsafe(self, message):
+        self.ceiling_failsafe_ready, self.ceiling_failsafe_at = message.data, rospy.Time.now()
+
     def _preflight_failure_reason(self, now, selected):
+        if (selected == OperatorCommand.MODE_CEILING and getattr(self, 'ceiling_failsafe_guard_required', False)
+                and not (getattr(self, 'ceiling_failsafe_ready', False)
+                         and is_fresh(getattr(self, 'ceiling_failsafe_at', None), 1., now))):
+            return '顶吸接管被阻止：PX4内部失联自动降落参数尚未核验（需连接飞控并解除武装）'
         if self._incline_intent():
             wall = getattr(self, 'wall', None)
             if (wall is None or not is_fresh(getattr(self, 'wall_at', None), self.status_timeout_s, now)
@@ -1507,7 +1518,7 @@ class FlightModeManagerNode(RCTakeoverManager):
             and is_fresh(getattr(self, 'ceiling_at', None), self.status_timeout_s, now)
             and is_fresh_source(s.header.stamp, self.status_timeout_s, now, future_tolerance_s=0.)
             and flight is not None and flight.connected and flight.armed
-            and flight.mode.upper() == 'OFFBOARD'
+            and (flight.mode.upper() == 'OFFBOARD' or (getattr(self, 'ceiling_land_from_entry', False) and flight.mode.upper() == 'POSCTL'))
             and is_fresh(self.flight_at, self.state_timeout_s, now)
             and is_fresh_source(flight.header.stamp, self.state_timeout_s, now, future_tolerance_s=0.))
 
@@ -1523,21 +1534,28 @@ class FlightModeManagerNode(RCTakeoverManager):
                     or not is_fresh(getattr(self, 'ceiling_at', None), self.status_timeout_s, now)
                     or not is_fresh_source(s.header.stamp, self.status_timeout_s, now, future_tolerance_s=0.)):
                 return False
+            self.ceiling_land_from_entry = self.phase in (self.PRESTREAM, self.ENTERING)
+            self.ceiling_land_started_at = now.to_sec()
             self.ceiling_land_identity = identity
             self.ceiling_land_request_at = None
             self.ceiling_land_confirmed = False
             self.last_request_at = None
-            self._set_phase('CEILING_LANDING', reason='吸顶HOLD超时中止，立即请求PX4 AUTO.LAND：' + getattr(s, 'reason', ''))
+            self._set_phase('CEILING_LANDING', reason='顶吸安全中止，立即请求PX4 AUTO.LAND：' + getattr(s, 'reason', ''))
         flight = getattr(self, 'flight', None)
         fresh = (flight is not None and is_fresh(self.flight_at, self.state_timeout_s, now)
                  and is_fresh_source(flight.header.stamp, self.state_timeout_s, now, future_tolerance_s=0.))
-        if fresh and (not flight.connected or not flight.armed):
+        if fresh and flight.connected and flight.mode.upper() == 'OFFBOARD':
+            self.ceiling_land_from_entry = False  # A later POSCTL change is a pilot override.
+        if not fresh or not flight.connected:
+            self.phase_reason = 'ABORT降落意图已锁存；飞控通信不可用，无法发送或确认AUTO.LAND；依靠PX4内部失联保护'
+        elif not flight.armed:
             self.ceiling_land_retired_identity = self.ceiling_land_identity
-            self._reset(lock=True, reason='降落分支结束：飞控断连或已解除武装')
-        elif fresh and flight.mode.upper() != 'OFFBOARD':
+            self._reset(lock=True, reason='降落分支结束：飞控已确认解除武装')
+        elif flight.mode.upper() != 'OFFBOARD' and not (getattr(self, 'ceiling_land_from_entry', False) and flight.mode.upper() == 'POSCTL'):
             request_at = self.ceiling_land_request_at
-            if (flight.mode.upper() == 'AUTO.LAND' and request_at is not None
-                    and flight.header.stamp.to_sec() > request_at and self.flight_at.to_sec() > request_at):
+            confirm_after = request_at if request_at is not None else self.ceiling_land_started_at
+            if (flight.mode.upper() == 'AUTO.LAND'
+                    and flight.header.stamp.to_sec() > confirm_after and self.flight_at.to_sec() > confirm_after):
                 self.ceiling_land_confirmed = True
                 self.phase_reason = 'PX4 AUTO.LAND新鲜反馈已确认，降落由飞控执行'
             elif flight.mode.upper() != 'AUTO.LAND':

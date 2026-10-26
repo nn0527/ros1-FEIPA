@@ -1,3 +1,17 @@
+## 当前顶吸 ABORT 自动降落规则（2026-10-26）
+
+实际顶吸配置启用 `abort_land_on_fault` 和 `ekf_abort_guard_enabled`。
+
+- 接触安全异常（接触丢失、姿态超限、里程计失效等）优先进入 ABORT，优先级高于同一周期的正常脱离请求；接触确认超时也直接 ABORT。
+- 脱离下降、恢复悬停以及接管上升中进入 ABORT 后锁存 `abort_land_requested` 和本轮唯一 ID，立即请求 `AUTO.LAND`，不等待下降达标、恢复稳定或第三次 CH12，不再转为正常 POSCTL 交接。
+- 从 `/mavlink/from` 读取目标飞控的 MAVLink `ESTIMATOR_STATUS` 原始磁创新比；首个有效报告 `mag_ratio > 1`、非有限磁创新比、姿态估计无效或加速度异常即锁存故障。错误发送端、过期/未来时间、重复源时间不刷新监视器。磁安全反馈缺失超过 2 秒会阻止准入或使运行中的动作 ABORT。只能在飞控报告后检测，不能保证在物理磁干扰发生的同一瞬间识别。
+- FCU `connected=false` 或状态源/接收时间超时后立即 ABORT。USB 拔出后 ROS 无法通过断开的链路发送降落命令：降落意图保持锁存，重连后继续处理；仅新的实际 `AUTO.LAND` 模式反馈才确认飞控进入降落。
+- `ceiling_failsafe_guard_node` 仅在飞控连接且未解锁时，通过定向 MAVLink 请求读回、设置并独立读回确认 `COM_OBL_RC_ACT=4`、`COM_OF_LOSS_T=0.2`；旧固件存在 `COM_OBL_ACT` 时要求其为 `0`。只有核实为 PX4 1.14+ 时才允许缺少旧参数；未知/旧固件不能用参数超时当作“不存在”。失联后清除核验，下一次地面连接重新核验。未核验或守护节点心跳过期会阻止新的顶吸接管。
+- 0.2 秒是 Offboard 失联动作的参数值，并非 USB 拔出到落地或切换模式的保证总延迟。最终行为由 PX4 内部检测、状态估计有效性和其他 failsafe 决策决定。
+- 急停、确认解除武装和飞手明确改变模式保留原有优先级。未收到新的实际模式反馈前，不把模式服务调用成功显示为“已自动降落”。
+
+依据：[PX4 Offboard](https://docs.px4.io/main/en/flight_modes_mc/offboard)、[PX4 参数](https://docs.px4.io/main/en/advanced_config/parameter_reference#COM_OBL_RC_ACT)、[MAVLink ESTIMATOR_STATUS](https://mavlink.io/en/messages/common.html#ESTIMATOR_STATUS)。
+
 # 吸顶 POSCTL 流程与参数（2026-10-25）
 
 > 2026-10-26 更新：当前测试台的正常高度控制和下降判断使用 PX4 融合高度/竖直速度，气压仅作辅助对照。下文旧版气压专用描述属于历史实现，以 `ceiling_fused_height_20261026.md` 和现行源码为准；下降、恢复稳定、锁定姿态及第三次 CH12 确认的阶段顺序保留。

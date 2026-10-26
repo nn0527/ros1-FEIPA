@@ -120,6 +120,8 @@ ceiling_attachment_decision_node:
   mechanism_timeout_s: 1.0
 
   # POSCTL capture and free-flight stabilization (ENU). Limits are initial values.
+  abort_land_on_fault: true
+  ekf_abort_guard_enabled: true
   motion_control_enabled: true
   detach_fused_height_enabled: true
   odom_vertical_jump_m: 0.25

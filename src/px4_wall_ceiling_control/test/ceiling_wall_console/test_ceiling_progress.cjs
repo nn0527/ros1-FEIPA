@@ -1,6 +1,6 @@
 const assert=require('node:assert/strict');
 const {view,ceilingDetailView}=require('../../web/ceiling_wall_console/app.js');
-function state(c={}){return {ssh:{connected:true},session:{control:true,feedback_live:true},status:{runtime:{fresh:true,value:{enabled:true}},state:{fresh:true,value:{mode:'OFFBOARD'}},ceiling_status:{fresh:true,value:{state_name:'SURFACE_HOLD',...c}},phase:{fresh:true,value:'ACTIVE'},owner:{fresh:true,value:1},operator:{fresh:true,value:{mode:2}}}};}
+function state(c={}){return {ssh:{connected:true},session:{control:true,feedback_live:true},status:{runtime:{fresh:true,value:{enabled:true}},state:{fresh:true,value:{mode:'OFFBOARD',connected:true}},ceiling_status:{fresh:true,value:{state_name:'SURFACE_HOLD',...c}},phase:{fresh:true,value:'ACTIVE'},owner:{fresh:true,value:1},operator:{fresh:true,value:{mode:2}}}};}
 let s=state({hold_elapsed_s:3.2,hold_timeout_s:5});
 assert.match(ceilingDetailView(s).hold,/剩余 1.8 s/);
 s.status.ceiling_status.value.hold_elapsed_s=5.5;
@@ -9,6 +9,7 @@ assert.doesNotMatch(ceilingDetailView(s).hold,/已确认 AUTO.LAND/);
 s=state({state_name:'ABORT',abort_land_requested:true});
 assert.match(ceilingDetailView(s).hold,/尚未确认/);
 s.status.state.value.mode='AUTO.LAND';assert.match(ceilingDetailView(s).hold,/已确认 AUTO.LAND/);
+s.status.state.value.connected=false;assert.match(ceilingDetailView(s).hold,/通信不可用/);assert.doesNotMatch(ceilingDetailView(s).hold,/已确认 AUTO.LAND/);
 s=state({rc_manual_coordination_enabled:true,rc_manual_feedback_ready:true,rc_manual_active:true,rc_position_weight:.25});
 assert.match(ceilingDetailView(s).manual,/人工修正中/);assert.match(ceilingDetailView(s).manual,/0.25/);
 s.status.ceiling_status.value.rc_manual_active=false;assert.match(ceilingDetailView(s).manual,/恢复中/);

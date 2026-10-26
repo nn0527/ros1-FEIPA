@@ -61,6 +61,7 @@ catkin_install_python(PROGRAMS
   scripts/operator/operator_gate_node.py
   scripts/operator/rc_takeover.py
   scripts/operator/terminal_operator_node.py
+  scripts/operator/ceiling_failsafe_guard_node.py
   scripts/operator/flight_mode_manager_node.py
   scripts/operator/wall_console_server.py
   scripts/operator/ceiling_wall_console.py
@@ -147,6 +148,7 @@ if(CATKIN_ENABLE_TESTING)
   catkin_add_nosetests(test/test_ceiling_entry_ownership.py)
   catkin_add_nosetests(test/test_ceiling_motion.py)
   catkin_add_nosetests(test/test_ceiling_hold_abort.py)
+  catkin_add_nosetests(test/test_ceiling_fault_land.py)
   catkin_add_nosetests(test/test_ceiling_console_flow.py)
   catkin_add_nosetests(test/test_ceiling_approach_timeout.py)
 endif()
