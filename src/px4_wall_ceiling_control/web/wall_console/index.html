@@ -15,7 +15,7 @@
 <p id="ceilingRequestState" role="status">吸顶请求：尚未发送</p>
 <p id="ceilingBlockReason" class="errorText" role="status"></p><p id="ceilingStage" role="status">吸顶：等待反馈</p>
 <p class="configHelp">飞手先在 POSCTL 下稳定飞行，再点击吸顶。一帧有效顶距≤1 m、光流和融合位置速度有效、平衡基准稳定后申请OFFBOARD；冻结位置、航向及悬停支撑推力，以0.15 m/s向上接近并小幅修正水平漂移。收到一帧有效顶距≤6.7 cm直接进入保持，推力0.50。离顶按保持时气压基准先确认下降≥0.50 m，再进入恢复悬停，下降量允许在0.45～0.55 m内波动；高度、速度和姿态持续稳定0.50秒后请求POSCTL，以实际模式反馈确认交接。顶部雷达异常时接近暂停、保持维持0.50推力；水平反馈丢失或姿态运动超限时暂停竖直运动，持续异常锁存故障。从点击吸顶起屏蔽前部雷达控制输入，确认交回POSCTL后恢复；期间禁止侧吸。目标限制不保证实际漂移或姿态绝不超限。</p>
-<button id="setRangeHeight" class="wall" disabled>一键定高至 1.50 m</button><p id="setRangeHeightReason" role="status"></p><p class="configHelp">离墙回平后手动提交启动配置中的固定目标，仅覆盖高度目标。原始测距和首帧证据保留；每轮只接受一次，沿用推力限幅和变化率限制，15秒未达到则异常退出。超时后须重新通过准入检查，记录为异常后的人工恢复。</p>
+
 <button id="rcTakeover" class="wall" disabled>一键遥控器接管</button><p id="rcTakeoverStatus" role="status"></p><p class="configHelp">支持 ABORT：从当前姿态平滑跟随摇杆，完成后交回原 ALTCTL / POSCTL。接管接受后不恢复旧吸附任务。</p>
 <button id="stop" class="stopProcess" disabled>终止现有进程</button><p class="configHelp">停止试验控制、MAVROS、雷达与日志记录后可重新启动。请先落地并停止电机；此按钮不代替遥控器急停。</p>
 <p class="configHelp">侧吸光流速度控制：POSCTL稳定飞行后提交贴墙；前距≤0.50 m持续0.40秒后申请OFFBOARD，以接管航向为基准前向0.05 m/s、横向0，目标速度平滑变化。原前距≤0.20 m持续0.30秒触发翻转；翻转、贴墙保持和大角度回正不使用树莓派水平闭环。首次进入WALL_HOLD后异步暂停PX4光流与对地测距融合；离墙向水平回正、实测总倾角≤80°时请求恢复本轮参数原值，等待应用缓冲与新鲜数据。参数确认不代表实际融合，实际融合时机须由ULog核实。回正末段实际倾角≤10°、角速度≤45°/s，新光流和水平估计连续有效后恢复水平制动；实测总倾角≤5°、水平速度≤0.10 m/s、角速度≤10°/s持续1秒，且原恢复条件满足后请求POSCTL。光流失效暂停自主接近并报错，恢复阶段等待有效反馈；现有20秒接近总时限保留。5°与变化率限制约束目标姿态，不能保证实际速度或倾角绝不超限。遥控修正继续服从最终目标限制；新闭环取消固定右倾补偿。</p>
@@ -41,7 +41,6 @@
 <label for="ceiling_port">顶部雷达</label><input id="ceiling_port" name="ceiling_port" value="/dev/serial/by-path/wall-top" required>
 <label for="front_port">前向雷达</label><input id="front_port" name="front_port" value="/dev/serial/by-path/wall-front" required>
 <label for="hover_thrust">悬停推力</label><input id="hover_thrust" name="hover_thrust" type="number" min="0.01" max="0.85" step="0.01" value="0.49" required>
-<label for="detach_range_manual_target_m">一键定高目标（m）</label><input id="detach_range_manual_target_m" name="detach_range_manual_target_m" type="number" min="0.03" max="5.78" step="0.01" value="1.5" required>
 </form><p class="configHelp">沿用当前串口配置。启动时保存，下次自动载入。悬停推力请使用实测值。</p></section>
 <section class="panel readiness"><h2>飞行就绪检查</h2><div class="flightState"><span>飞控</span><strong id="flightConnection">—</strong><span>解锁</span><strong id="armed">—</strong></div>
 <div id="checks"></div><div class="note">基础程序不解锁、不自动起飞。飞手先在 ALTCTL 下稳定飞行，再点击贴墙。</div>

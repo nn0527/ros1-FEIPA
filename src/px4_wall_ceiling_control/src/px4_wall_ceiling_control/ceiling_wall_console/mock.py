@@ -22,9 +22,7 @@ SCENARIOS = {
     'range_control': '离墙：阶段 2 / 测距闭环',
     'range_handover': '离墙：阶段 3 / 等待 POSCTL',
     'range_returned': '离墙：POSCTL 已确认',
-    'range_fault': '离墙：超时 / 人工定高重新准入',
-    'manual_height': '离墙：人工固定目标',
-    'manual_returned': '离墙：异常后人工恢复完成',
+    'range_fault': '离墙：控制超时',
     'sensor_loss': '离墙：测距失效 / 速度无效',
     'fusion_restore': '离墙：等待光流参数恢复',
     'kill': '急停已触发',
@@ -38,7 +36,6 @@ class MockRuntime:
         self.state = ConsoleState()
         self.scenario = 'grounded'
         self.running = False
-        self.manual_recovery = False
         self.episode_started = time.time()-4.
         self._refresh()
 
@@ -47,15 +44,14 @@ class MockRuntime:
             raise ValueError('未知离线场景')
         self.scenario = scenario
         self.running = scenario != 'grounded'
-        self.manual_recovery = scenario in ('range_fault', 'manual_returned')
         self.episode_started = time.time()-4.
         self._refresh()
 
     def _refresh(self):
         name, now = self.scenario, time.time()
         ceiling = name.startswith('ceiling_')
-        range_task = name.startswith(('range_', 'manual_')) or name in ('sensor_loss', 'fusion_restore')
-        returned = name in ('ceiling_returned', 'range_returned', 'manual_returned')
+        range_task = name.startswith('range_') or name in ('sensor_loss', 'fusion_restore')
+        returned = name in ('ceiling_returned', 'range_returned')
         active = name not in ('grounded', 'ceiling_ready', 'wall_ready', 'wall_wait') and not returned
         armed = name != 'grounded'
         mode = 'OFFBOARD' if active else 'POSCTL'
@@ -66,14 +62,12 @@ class MockRuntime:
         task = ('COMPLETED' if returned else 'ROTATING_TO_RANGE_ENTRY' if name == 'range_rotating'
                 else 'HANDOVER_READY' if name == 'range_handover' else 'FAULT' if name == 'range_fault'
                 else 'RANGE_HEIGHT_CONTROL') if range_task else 'NONE'
-        manual = name in ('manual_height', 'manual_returned')
         valid = range_task and name not in ('sensor_loss', 'range_rotating')
-        target = self.state.config['detach_range_manual_target_m'] if manual else 1.24
-        height = target if name in ('range_handover', 'range_returned', 'manual_returned') else 1.10
+        target = 1.24
+        height = target if name in ('range_handover', 'range_returned') else 1.10
         reason = SCENARIOS[name]+'（离线模拟）'
-        manual_available = name in ('range_control', 'range_handover', 'range_fault')
         wall = dict(state_name=wall_state, reason=reason, fault_detected=name == 'range_fault',
-                    fault_recovery_completed=name == 'manual_returned',
+                    fault_recovery_completed=False,
                     hold_achieved=range_task or name == 'wall_hold', reached_state_name=wall_state,
                     detach_completed=name == 'range_returned', recovery_completed=name == 'range_returned',
                     altitude_reference_valid=True, height_above_takeoff_m=2.4, min_entry_height_m=.3, entry_height_ready=True,
@@ -102,12 +96,8 @@ class MockRuntime:
                     detach_range_stable_elapsed_s=1.2 if task == 'HANDOVER_READY' else 0.,
                     detach_range_stable_samples=5 if task == 'HANDOVER_READY' else 0,
                     detach_range_handover_ready=task == 'HANDOVER_READY', detach_range_block_reason=reason,
-                    detach_range_manual_available=manual_available, detach_range_manual_block_reason='' if manual_available else reason,
-                    detach_range_manual_target_m=self.state.config['detach_range_manual_target_m'],
-                    detach_range_target_revision=1 if manual else 0,
-                    detach_range_target_source='manual_fixed_range_height' if manual else 'range_first_qualified_message',
-                    detach_range_manual_recovery=manual and self.manual_recovery,
-                    detach_range_previous_fault='测距闭环总时间预算超时' if self.manual_recovery else '')
+                    detach_range_target_revision=0,
+                    detach_range_target_source='range_first_qualified_message')
         cstate = {'ceiling_approach': 'APPROACH', 'ceiling_hold': 'SURFACE_HOLD', 'ceiling_detach': 'DETACH'}.get(name, 'NORMAL_FLIGHT')
         fusion_phase = 'SUSPENDED' if name == 'wall_hold' else 'RESTORING' if name in ('range_rotating', 'fusion_restore') else 'READY'
         values = dict(runtime=dict(enabled=self.running, ceiling_enabled=True, wall_pilot_mode='POSCTL',
@@ -163,14 +153,6 @@ class MockRuntime:
     def cancel_wait(self):
         return self._action('can_cancel_wait', 'wall_ready', '已取消贴墙等待')
 
-    def set_range_height(self):
-        self._refresh()
-        if not self.state.snapshot()['can_set_range_height']:
-            raise ValueError('当前场景不能定高或本轮已提交')
-        self.manual_recovery = self.scenario == 'range_fault'
-        self.scenario = 'manual_height'
-        self._refresh()
-        return {'message': '离线模拟：固定目标 %.2f m，首帧保留；等待高度及交回条件' % self.state.config['detach_range_manual_target_m']}
 
     def stop(self, config=None):
         if self.state.snapshot()['status']['state']['value']['armed']:

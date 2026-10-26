@@ -299,7 +299,7 @@ class RemoteRuntime:
                       "hold_achieved", "reached_state_name", "detach_ready", "detach_completed", "recovery_completed",
                       "detach_pending", "detach_block_reason", "flip_ready", "front_range_fresh", "top_range_fresh",
                       "auto_approach_enabled", "approach_paused", "horizontal_velocity_enabled", "approach_takeover_thrust", "approach_base_vertical_thrust", "horizontal_velocity_ready", "horizontal_velocity_active", "horizontal_velocity_stable", "horizontal_velocity_reason", "horizontal_forward_target_mps", "horizontal_forward_measured_mps", "horizontal_integral_x_enu_mps2", "horizontal_integral_y_enu_mps2", "horizontal_integral_active", "horizontal_integral_reason", "horizontal_control_saturated",  "horizontal_velocity_x_enu_mps", "horizontal_velocity_y_enu_mps", "horizontal_target_x_enu_mps", "horizontal_target_y_enu_mps", "optical_flow_quality", "horizontal_equilibrium_enabled", "horizontal_equilibrium_valid", "horizontal_equilibrium_frozen", "horizontal_equilibrium_reason", "horizontal_prestream_valid", "fault_recovery_completed", "recover_attitude_locked", "recover_stable", "detach_final_pitch_deg", "abort_land_requested", "recovery_support_valid", "recovery_thrust_limit", "detach_vertical_active", "detach_vertical_reason", "detach_vertical_base_source", "detach_vertical_base_thrust", "detach_vertical_integral", "detach_vertical_integral_active", "detach_vertical_saturated", "detach_vertical_slew_limited", "detach_vertical_requested_thrust", "detach_vertical_support_weight", "detach_height_error_m", "departure_clearance_ready", "departure_clearance_distance_m", "departure_clearance_reason", "recovery_horizontal_integral_x", "recovery_horizontal_integral_y", "recovery_horizontal_integral_active",
-                      "detach_task_phase", "detach_task_phase_name", "detach_range_height_enabled", "detach_range_episode", "detach_range_maneuver_id", "detach_request_time", "detach_rotation_start_time", "detach_range_target_locked", "detach_range_source", "detach_range_target_m", "detach_range_height_m", "detach_range_raw_m", "detach_range_projected_m", "detach_range_velocity_mps", "detach_range_velocity_valid", "detach_range_valid", "detach_range_height_invalid_since_s", "detach_range_velocity_age_s", "detach_range_velocity_invalid_since_s", "detach_range_velocity_reason", "detach_range_fast_velocity_mps", "detach_range_fast_velocity_valid", "detach_range_fast_velocity_age_s", "detach_range_fast_velocity_reason", "detach_range_current_tilt_deg", "detach_range_sample_tilt_deg", "detach_range_pose_match_dt_s", "detach_range_pose_before_dt_s", "detach_range_pose_after_dt_s", "detach_range_pose_span_s", "detach_range_pose_wait_s", "detach_range_entry_tilt_deg", "detach_range_source_time", "detach_range_received_time", "detach_range_lock_source_time", "detach_range_lock_received_time", "detach_range_lock_raw_m", "detach_range_lock_height_m", "detach_range_lock_tilt_deg", "detach_range_velocity_samples", "detach_range_age_s", "detach_range_stable_elapsed_s", "detach_range_stable_samples", "detach_range_handover_ready", "detach_range_block_reason", "detach_range_config_json", "detach_range_rejections_json", "detach_posctl_request_time", "detach_posctl_confirmed_time", "detach_range_manual_target_m", "detach_range_target_revision", "detach_range_target_source", "detach_range_action_started_time", "detach_range_manual_request_id", "detach_range_manual_recovery", "detach_range_previous_fault", "detach_range_manual_available", "detach_range_manual_block_reason")}
+                      "detach_task_phase", "detach_task_phase_name", "detach_range_height_enabled", "detach_range_episode", "detach_range_maneuver_id", "detach_request_time", "detach_rotation_start_time", "detach_range_target_locked", "detach_range_source", "detach_range_target_m", "detach_range_height_m", "detach_range_raw_m", "detach_range_projected_m", "detach_range_velocity_mps", "detach_range_velocity_valid", "detach_range_valid", "detach_range_height_invalid_since_s", "detach_range_velocity_age_s", "detach_range_velocity_invalid_since_s", "detach_range_velocity_reason", "detach_range_fast_velocity_mps", "detach_range_fast_velocity_valid", "detach_range_fast_velocity_age_s", "detach_range_fast_velocity_reason", "detach_range_current_tilt_deg", "detach_range_sample_tilt_deg", "detach_range_pose_match_dt_s", "detach_range_pose_before_dt_s", "detach_range_pose_after_dt_s", "detach_range_pose_span_s", "detach_range_pose_wait_s", "detach_range_entry_tilt_deg", "detach_range_source_time", "detach_range_received_time", "detach_range_lock_source_time", "detach_range_lock_received_time", "detach_range_lock_raw_m", "detach_range_lock_height_m", "detach_range_lock_tilt_deg", "detach_range_velocity_samples", "detach_range_age_s", "detach_range_stable_elapsed_s", "detach_range_stable_samples", "detach_range_handover_ready", "detach_range_block_reason", "detach_range_config_json", "detach_range_rejections_json", "detach_posctl_request_time", "detach_posctl_confirmed_time", "detach_range_target_revision", "detach_range_target_source", "detach_range_action_started_time")}
             for key in ('detach_request_time', 'detach_rotation_start_time', 'detach_range_source_time', 'detach_range_received_time', 'detach_range_lock_source_time', 'detach_range_lock_received_time', 'detach_posctl_request_time', 'detach_posctl_confirmed_time', 'detach_range_action_started_time'):
                 value[key] = getattr(msg, key).to_sec()
         elif name in ("front_diagnostic", "ceiling_diagnostic", "kill"):
@@ -369,8 +369,7 @@ class RemoteRuntime:
                     running.update(fcu_port=port, baud=int(baud),
                         ceiling_port=self.ros.get_param("/ceiling_lidar_node/serial_port", running["ceiling_port"]),
                         front_port=self.ros.get_param("/front_lidar_node/serial_port", running["front_port"]),
-                        hover_thrust=self.ros.get_param("/wall_perch_decision_node/hover_thrust", running["hover_thrust"]),
-                        detach_range_manual_target_m=self.ros.get_param("/wall_perch_decision_node/detach_range_manual_target_m", running["detach_range_manual_target_m"]))
+                        hover_thrust=self.ros.get_param("/wall_perch_decision_node/hover_thrust", running["hover_thrust"]))
                     for name, alias in STABLE_PORTS.items():
                         if Path(running[name]).resolve() == Path(alias).resolve():
                             running[name] = alias
@@ -759,24 +758,6 @@ class RemoteRuntime:
         self.state.send_detach(publish)
         return {"message": "离墙请求已发送；控制节点等待连续稳定后旋转，8 秒未满足会取消"}
 
-    def set_range_height(self):
-        from px4_wall_ceiling_control.srv import SetRangeHeight, SetRangeHeightRequest
-        if self.ros is None:
-            raise ValueError("ROS 尚未连接")
-        with self.state.lock:
-            snapshot = self.state.snapshot()
-            if not snapshot["can_set_range_height"]:
-                raise ValueError(snapshot["set_range_height_blockers"][0])
-            wall = snapshot["status"]["wall"]["value"]
-            request = SetRangeHeightRequest(request_id=secrets.token_hex(12),
-                maneuver_id=wall["detach_range_maneuver_id"], episode=wall["detach_range_episode"],
-                expected_target_revision=wall["detach_range_target_revision"], requested_at=self.ros.Time.now())
-        self.ros.wait_for_service("/wall_perch/set_range_height", timeout=.2)
-        reply = self.ros.ServiceProxy("/wall_perch/set_range_height", SetRangeHeight)(request)
-        if not reply.success:
-            raise ValueError(reply.message)
-        self.state.event(reply.message)
-        return {"message": reply.message}
 
     def rc_takeover(self):
         from std_srvs.srv import Trigger
@@ -1141,10 +1122,6 @@ class SSHTransport:
                     for check in result["checks"]:
                         check["ok"] = False
             detach_sources = required_feedback + (("setpoint",) if range_diagnostic_only else ("health", "setpoint"))
-            manual_sources = ("runtime", "state", "wall", "kill", "owner", "operator", "setpoint")
-            if not connected or not self.session.get("control") or any(not result["status"][n]["fresh"] for n in manual_sources):
-                result["can_set_range_height"] = False
-                result["set_range_height_blockers"] = ["定高所需实时反馈或控制权缺失"]
             if not connected or any(not result["status"][n]["fresh"] for n in detach_sources):
                 if not connected or result["can_detach"]:
                     result["detach_blockers"] = ["离墙所需实时反馈中断或过期"]
@@ -1183,7 +1160,7 @@ class SSHTransport:
                 raise ValueError("SSH 未连接，操作未发送")
             if action == "stop" and not self.session.get("control"):
                 raise ValueError("需要控制权，终止未发送")
-            if action in ("start", "wall", "incline", "detach", "cancel_wait", "rc_takeover", "set_range_height") and (not self.push_enabled or not self.session.get("control") or time.monotonic() - self.arrived >= 2):
+            if action in ("start", "wall", "incline", "detach", "cancel_wait", "rc_takeover") and (not self.push_enabled or not self.session.get("control") or time.monotonic() - self.arrived >= 2):
                 raise ValueError("需要控制权和有效的实时反馈，操作未发送")
             if action == "push":
                 self.push_enabled = bool(config["enabled"])
@@ -1282,8 +1259,6 @@ def http_main(args):
                     result = transport.request("stop", data)
                 elif self.path == "/api/detach":
                     result = transport.request("detach")
-                elif self.path == "/api/set-range-height":
-                    result = transport.request("set_range_height")
                 else:
                     return self.respond(404, {"error": "Not found"})
                 return self.respond(200, result)

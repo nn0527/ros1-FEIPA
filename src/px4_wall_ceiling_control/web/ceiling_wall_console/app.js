@@ -120,8 +120,8 @@ function wallView(s,busy=false){
     title=taskNames[task]||title;reason=wall.detach_range_block_reason||wall.reason;
     if(task==="COMPLETED"){
       returned=!!(state?.connected&&state.mode==="POSCTL"&&owner===0&&["IDLE","LOCKED"].includes(phase));
-      title=returned?(wall.detach_range_manual_recovery?"人工定高恢复完成，已交回 POSCTL":"离墙完成，已交回 POSCTL"):"等待 POSCTL 及输出释放确认";
-      reason=returned?(wall.detach_range_manual_recovery?"异常后的人工恢复已完成，原故障记录保留":"飞控已确认 POSCTL，ROS 输出已释放"):"完成状态仍需新鲜飞控模式与输出归属反馈";
+      title=returned?("离墙完成，已交回 POSCTL"):"等待 POSCTL 及输出释放确认";
+      reason=returned?("飞控已确认 POSCTL，ROS 输出已释放"):"完成状态仍需新鲜飞控模式与输出归属反馈";
     }
     step=returned?8:task==="ROTATING_TO_RANGE_ENTRY"?6:task==="FAULT"?-1:7;
   }
@@ -139,13 +139,9 @@ function wallView(s,busy=false){
     holdAchieved:!!s.status?.wall?.value?.hold_achieved};
 }
 function rangeView(s,busy=false){
-  const wall=fresh(s,"wall"),flight=fresh(s,"state"),kill=fresh(s,"kill"),phase=fresh(s,"phase");
+  const wall=fresh(s,"wall");
   const active=!!(s.ssh?.connected&&s.session?.feedback_live&&s.session?.push!==false&&wall?.detach_range_height_enabled&&wall.detach_task_phase_name&&wall.detach_task_phase_name!=="NONE");
-  const canSetHeight=!!(s.ssh?.connected&&s.session?.feedback_live&&s.session?.push!==false&&s.session?.control&&!busy&&
-    kill?.valid&&!kill.active&&flight?.connected&&flight.armed&&flight.mode==="OFFBOARD"&&fresh(s,"owner")===2&&fresh(s,"setpoint")&&
-    ["ACTIVE","RETURNING"].includes(phase)&&s.can_set_range_height&&wall?.detach_range_manual_available);
-  return {active,wall,canSetHeight,target:wall?.detach_range_manual_target_m??s.config?.detach_range_manual_target_m??1.5,
-    reason:canSetHeight?"可提交固定目标；保留实测高度和首帧证据":s.set_range_height_blockers?.[0]||wall?.detach_range_manual_block_reason||"等待离墙回平、有效测距及控制权限"};
+  return {active,wall};
 }
 if(typeof module!=="undefined")module.exports={view,fresh,wallView,rangeView,maintenanceView,ceilingDetailView};
 if(typeof document!=="undefined"){
@@ -196,10 +192,8 @@ function paint(s){
   document.querySelectorAll("#ceilingSteps li").forEach((el,i)=>el.classList.toggle("current",v.live&&i===(stage==="已交还遥控"?6:v.step)));
   const hw=w.wall;
   const range=rangeView(s,busy),r=range.wall;
-  $("setRangeHeight").disabled=!range.canSetHeight;
-  text("setRangeHeight","一键定高至 "+n(range.target)+" m");text("setRangeHeightReason",range.reason);
-  text("rangeHeightState",range.active?"本轮 "+r.detach_range_episode+" · 原始距离 "+n(r.detach_range_raw_m)+" m · 测距高度 "+n(r.detach_range_height_m)+" m · 目标 "+(r.detach_range_target_locked?n(r.detach_range_target_m)+" m":"等待首帧")+" · "+(r.detach_range_target_source==="manual_fixed_range_height"?"人工固定目标":"首条合格测距目标")+" · "+(r.detach_range_valid?"反馈有效":"反馈无效"):"测距离墙任务：未开始或反馈过期");
-  text("rangeHeightEvidence",range.active?"首帧原值 / 几何高度 / 倾角："+n(r.detach_range_lock_raw_m)+" m / "+n(r.detach_range_lock_height_m)+" m / "+n(r.detach_range_lock_tilt_deg)+"°；源 / 接收时间："+n(r.detach_range_lock_source_time,3)+" / "+n(r.detach_range_lock_received_time,3)+(r.detach_range_manual_recovery?"；异常后人工恢复，原故障："+r.detach_range_previous_fault:""):"等待首帧证据；原相对起飞高度仅作融合诊断");
+  text("rangeHeightState",range.active?"本轮 "+r.detach_range_episode+" · 原始距离 "+n(r.detach_range_raw_m)+" m · 测距高度 "+n(r.detach_range_height_m)+" m · 目标 "+(r.detach_range_target_locked?n(r.detach_range_target_m)+" m":"等待首帧")+" · "+(r.detach_range_target_source==="recover_entry_range_height"?"恢复入口高度":"首条合格测距目标")+" · "+(r.detach_range_valid?"反馈有效":"反馈无效"):"测距离墙任务：未开始或反馈过期");
+  text("rangeHeightEvidence",range.active?"首帧原值 / 几何高度 / 倾角："+n(r.detach_range_lock_raw_m)+" m / "+n(r.detach_range_lock_height_m)+" m / "+n(r.detach_range_lock_tilt_deg)+"°；源 / 接收时间："+n(r.detach_range_lock_source_time,3)+" / "+n(r.detach_range_lock_received_time,3):"等待首帧证据；原相对起飞高度仅作融合诊断");
   text("rangeHeightGate",range.active?"测距速度 "+(r.detach_range_velocity_valid?n(r.detach_range_velocity_mps)+" m/s":"未就绪")+" · 快速观察 "+(r.detach_range_fast_velocity_valid?n(r.detach_range_fast_velocity_mps)+" m/s":"未就绪")+" · 反馈年龄 "+n(r.detach_range_age_s)+" s · 姿态跨度/等待 "+n(r.detach_range_pose_span_s)+" / "+n(r.detach_range_pose_wait_s)+" s · 连续稳定 "+n(r.detach_range_stable_elapsed_s)+" s / "+r.detach_range_stable_samples+" 条新测距 · "+(r.detach_range_block_reason||"等待条件"):"等待测距及交回条件");
   const fusion=v.live?fresh(s,"wall_sensor_fusion"):null,fusionNames={READY:"参数就绪",SUSPENDED:"融合已暂停",RESTORING:"请求恢复中",SETTLING:"等待应用缓冲与确认",ERROR:"异常",DISABLING:"请求暂停中",INITIALIZING:"读取原值",DISABLED:"未启用"};
   text("wallFusionState",fusion?"光流 / 测距融合："+(fusionNames[fusion.phase]||fusion.phase)+" · 实测倾角 "+n(fusion.measured_tilt_deg)+"° · "+(fusion.control_ready?"恢复条件已确认":"等待确认"):"光流 / 测距融合：无新鲜反馈");
@@ -258,11 +252,10 @@ $("push").addEventListener("click",()=>action("/api/push",{enabled:latest?.sessi
 $("inclineAction").addEventListener("click",()=>{if(latest?.can_incline)action("/api/incline");});
 $("wallAction").addEventListener("click",()=>{if(latest&&wallView(latest,busy).canWall)action("/api/wall");});
 $("wallDetach").addEventListener("click",()=>{if(latest&&wallView(latest,busy).canDetach)action("/api/detach");});
-$("setRangeHeight").addEventListener("click",()=>{if(latest&&rangeView(latest,busy).canSetHeight)action("/api/set-range-height");});
 $("mockScenario").addEventListener("change",()=>action("/api/mock-scenario",{scenario:$("mockScenario").value}));
 $("cancelWait").addEventListener("click",()=>{if(latest&&wallView(latest,busy).canCancel)action("/api/cancel-wait");});
 $("repairMavros").addEventListener("click",()=>{if(!latest||!maintenanceView(latest,busy,recoveryBusy).canRepair)return;if(confirm("确认飞机已落地、上锁且电机已停止？反馈过期时必须现场核实。将停止控制、雷达和日志，清理旧链路并重启 MAVROS；成功后需手动启动基础链路。"))action("/api/repair-mavros",{grounded_confirmed:true},true);});
-$("start").addEventListener("click",()=>{if(!latest||!view(latest,busy).canStart||!form.reportValidity())return;const data=Object.fromEntries(new FormData(form));data.baud=Number(data.baud);data.hover_thrust=Number(data.hover_thrust);data.detach_range_manual_target_m=Number(data.detach_range_manual_target_m);action("/api/start",data);});
+$("start").addEventListener("click",()=>{if(!latest||!view(latest,busy).canStart||!form.reportValidity())return;const data=Object.fromEntries(new FormData(form));data.baud=Number(data.baud);data.hover_thrust=Number(data.hover_thrust);action("/api/start",data);});
 $("attach").addEventListener("click",()=>{if(latest&&view(latest,busy).canAttach){wasDetaching=false;action("/api/ceiling");}});
 $("detach").addEventListener("click",()=>{if(latest&&view(latest,busy).canDetach)action("/api/ceiling-detach");});
 $("stop").addEventListener("click",()=>{const detail=fresh(latest,"runtime")?.rc_startup_enabled?"将停止控制、雷达和记录，保留遥控启动监听，可直接拨杆重新启动。":"将停止控制、MAVROS、雷达和日志。";if(confirm("确认飞机已落地且电机已停止？"+detail))action("/api/stop",{grounded_confirmed:true});});

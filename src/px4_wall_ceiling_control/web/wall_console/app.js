@@ -83,9 +83,6 @@ function paint(s){
   text("startLabel",s.starting?"正在启动…":enabled?"基础程序已启动":"启动基础程序");
   $("wall").disabled=requestBusy || !live || !control || !s.can_wall;
   $("detach").disabled=requestBusy || !live || !control || !s.can_detach;
-  $("setRangeHeight").disabled=requestBusy || !live || !control || !s.can_set_range_height;
-  text("setRangeHeight", "一键定高至 "+n(wall?.detach_range_manual_target_m ?? s.config.detach_range_manual_target_m)+" m");
-  text("setRangeHeightReason", s.can_set_range_height ? "可提交固定目标；测距反馈保持实测值" : (s.set_range_height_blockers?.[0] || "等待离墙测距控制就绪"));
   $("stop").disabled=requestBusy || !ssh || !control;
   text("detachBlockReason",s.can_detach?"可提交离墙请求；控制节点确认连续稳定后才旋转": "离墙："+(s.detach_blockers?.[0] || "等待贴墙保持"));
   $("detachBlockReason").classList.toggle("ready",!!s.can_detach);
@@ -125,7 +122,7 @@ function paint(s){
   if(returned){title=history?.fault_detected?"异常恢复完成，已交还遥控":"离墙完成，已交还遥控";reason="已确认 "+pilotMode+"，输出已释放，由飞手接管";}
   const rangeTask=wall?.detach_range_height_enabled && wall.detach_task_phase_name!=="NONE";
   if(rangeTask && !["CANCELING_ENTRY","RC_TAKEOVER"].includes(phase)){
-    const taskNames={ROTATING_TO_RANGE_ENTRY:"阶段 1：离墙翻转",RANGE_HEIGHT_CONTROL:"阶段 2：测距闭环",HANDOVER_READY:"阶段 3：稳定、准备交回",FAULT:"离墙异常",COMPLETED:wall.detach_range_manual_recovery?"人工定高恢复完成，POSCTL 已确认":"离墙完成，POSCTL 已确认"};
+    const taskNames={ROTATING_TO_RANGE_ENTRY:"阶段 1：离墙翻转",RANGE_HEIGHT_CONTROL:"阶段 2：测距闭环",HANDOVER_READY:"阶段 3：稳定、准备交回",FAULT:"离墙异常",COMPLETED:"离墙完成，POSCTL 已确认"};
     title=taskNames[wall.detach_task_phase_name] || title;
     reason=wall.detach_task_phase_name==="COMPLETED"?"飞控已确认 POSCTL，ROS 控制已释放":wall.detach_range_block_reason || wall.detach_vertical_reason || wall.reason;
     if(wall.detach_task_phase_name==="RANGE_HEIGHT_CONTROL" && wall.state_name==="DETACH_ROTATE")reason+="；姿态轨迹仍在回平";
@@ -144,8 +141,8 @@ function paint(s){
   text("velocity",rangeTask && wall.detach_range_target_locked?(wall.detach_range_velocity_valid?n(wall.detach_range_velocity_mps):"测距速度未就绪"):n(odom?.vertical_speed));text("battery",n(fresh(s,"battery")?.voltage,1));
   text("rangeHeightState",rangeTask?
     "本轮 "+wall.detach_range_episode+" · 测距原值 "+n(wall.detach_range_raw_m)+" m · 对地高度 "+n(wall.detach_range_height_m)+" m · 固定目标 "+(wall.detach_range_target_locked?n(wall.detach_range_target_m)+" m":"等待首帧")+
-    " · 目标来源："+(wall.detach_range_target_source==="manual_fixed_range_height"?"人工固定定高":"首条合格测距")+
-    (wall.detach_range_manual_recovery?" · 异常后的人工恢复":"")+" · "+(wall.detach_range_valid?"反馈有效":"反馈无效")+" · 年龄 "+n(wall.detach_range_age_s,2)+" s · 连续稳定 "+n(wall.detach_range_stable_elapsed_s,2)+" s / "+wall.detach_range_stable_samples+" 条新测距":"测距离墙闭环：未开始");
+    " · 目标来源："+(wall.detach_range_target_source==="recover_entry_range_height"?"恢复入口高度":"首条合格测距")+
+    ("")+" · "+(wall.detach_range_valid?"反馈有效":"反馈无效")+" · 年龄 "+n(wall.detach_range_age_s,2)+" s · 连续稳定 "+n(wall.detach_range_stable_elapsed_s,2)+" s / "+wall.detach_range_stable_samples+" 条新测距":"测距离墙闭环：未开始");
   text("rangeHeightEvidence",rangeTask?
     "首帧原值 / 几何高度 / 采样倾角："+n(wall.detach_range_lock_raw_m)+" m / "+n(wall.detach_range_lock_height_m)+" m / "+n(wall.detach_range_lock_tilt_deg,2)+"°；源 / 接收时间："+n(wall.detach_range_lock_source_time,6)+" / "+n(wall.detach_range_lock_received_time,6)+
     "；快速速度 "+(wall.detach_range_fast_velocity_valid?n(wall.detach_range_fast_velocity_mps,3)+" m/s":"未就绪")+"；入口 "+n(wall.detach_range_entry_tilt_deg,1)+"°；当前采样角 "+n(wall.detach_range_sample_tilt_deg,2)+"°；姿态跨度/等待 "+n(wall.detach_range_pose_span_s,3)+" / "+n(wall.detach_range_pose_wait_s,3)+" s。快速速度仅并行观察，不接管推力。":"首帧按消息源时间与姿态匹配；距离字段无独立硬件测距时间时，不代表硬件首次测距瞬间。");
@@ -169,8 +166,8 @@ function paint(s){
 $("control").addEventListener("click",()=>action(latest?.session?.control?"/api/release":"/api/acquire",{}));
 $("push").addEventListener("click",()=>action("/api/push",{enabled:!latest?.session?.push}));
 async function action(path, data){
-  if(requestBusy)return;requestBusy=true;$("rcTakeover").disabled=true;$("inclineAction").disabled=true;$("setRangeHeight").disabled=true;$("ceilingAction").disabled=true;$("ceilingDetach").disabled=true;$("stop").disabled=true;$("start").disabled=true;$("wall").disabled=true;$("detach").disabled=true;
-  message(path==="/api/set-range-height"?"正在提交固定高度目标…":path==="/api/rc-takeover"?"正在请求遥控器平滑接管…":path==="/api/stop"?"正在终止现有进程…":path==="/api/wall"?"正在发送 wall…":path==="/api/detach"?"正在发送 detach…":path==="/api/start"?"正在请求启动…":path==="/api/ceiling"?"正在发送吸顶请求并等待节点回执…":path==="/api/ceiling-detach"?"正在发送离顶请求…":"正在更新连接设置…");
+  if(requestBusy)return;requestBusy=true;$("rcTakeover").disabled=true;$("inclineAction").disabled=true;$("ceilingAction").disabled=true;$("ceilingDetach").disabled=true;$("stop").disabled=true;$("start").disabled=true;$("wall").disabled=true;$("detach").disabled=true;
+  message(path==="/api/rc-takeover"?"正在请求遥控器平滑接管…":path==="/api/stop"?"正在终止现有进程…":path==="/api/wall"?"正在发送 wall…":path==="/api/detach"?"正在发送 detach…":path==="/api/start"?"正在请求启动…":path==="/api/ceiling"?"正在发送吸顶请求并等待节点回执…":path==="/api/ceiling-detach"?"正在发送离顶请求…":"正在更新连接设置…");
   try{
     const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Console-Token":token},body:JSON.stringify(data),signal:AbortSignal.timeout(9000)});
     const result=await response.json();if(!response.ok)throw new Error(result.error || "操作失败");message(result.message);
@@ -181,7 +178,7 @@ $("start").addEventListener("click",()=>{
   if(!form.reportValidity())return;
   const data=Object.fromEntries(new FormData(form));
   if(latest && fresh(latest,"runtime")?.enabled){action("/api/start",latest.config);return;}
-  data.baud=Number(data.baud);data.hover_thrust=Number(data.hover_thrust);data.detach_range_manual_target_m=Number(data.detach_range_manual_target_m);action("/api/start",data);
+  data.baud=Number(data.baud);data.hover_thrust=Number(data.hover_thrust);action("/api/start",data);
 });
 $("ceilingAction").addEventListener("click",()=>action("/api/ceiling",{}));
 $("ceilingDetach").addEventListener("click",()=>action("/api/ceiling-detach",{}));
@@ -189,7 +186,6 @@ $("inclineAction").addEventListener("click",()=>action("/api/incline",{}));
 $("wall").addEventListener("click",()=>action("/api/wall",{}));
 $("rcTakeover").addEventListener("click",()=>action("/api/rc-takeover",{}));
 $("detach").addEventListener("click",()=>action("/api/detach",{}));
-$("setRangeHeight").addEventListener("click",()=>action("/api/set-range-height",{}));
 $("stop").addEventListener("click",()=>{
   if(window.confirm("确认飞机已落地且电机已停止？此操作将终止试验控制、MAVROS、雷达和日志记录进程。"))
     action("/api/stop",{grounded_confirmed:true});
@@ -201,7 +197,7 @@ async function poll(){
     const response=await fetch("/api/status",{cache:"no-store",signal:AbortSignal.timeout(2500)});
     if(!response.ok)throw new Error("本机服务响应异常");paint(await response.json());
   }catch(error){
-    $("inclineAction").disabled=true;$("setRangeHeight").disabled=true;$("ceilingAction").disabled=true;$("ceilingDetach").disabled=true;text("ceilingStage","吸顶：实时反馈中断");$("stop").disabled=true;$("control").disabled=true;$("push").disabled=true;text("connectionText","本机服务无响应");$("rcTakeover").disabled=true;$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;
+    $("inclineAction").disabled=true;$("ceilingAction").disabled=true;$("ceilingDetach").disabled=true;text("ceilingStage","吸顶：实时反馈中断");$("stop").disabled=true;$("control").disabled=true;$("push").disabled=true;text("connectionText","本机服务无响应");$("rcTakeover").disabled=true;$("connectionDot").classList.remove("ok");$("wall").disabled=true;$("start").disabled=true;$("detach").disabled=true;
     if(!$("successNote").hidden)text("successNote","本轮曾成功进入贴墙保持；当前反馈中断，不能确认现在的状态。");
     text("stageTitle","反馈中断");text("stageReason","无法确认当前阶段，请核对飞控状态");
     text("killState","急停反馈中断，动作禁用");text("detachCondition","实时反馈中断，离墙禁用");
@@ -213,7 +209,6 @@ async function poll(){
     text("horizontalVelocityState","水平速度闭环：实时反馈中断");
     text("rangeHeightState","测距离墙闭环：实时反馈中断，当前高度/速度及交回资格无法确认");
     text("rangeHeightEvidence","首帧历史证据请以记录为准，等待新鲜反馈");
-    text("setRangeHeightReason","实时反馈中断，定高禁用");
     text("recording","试飞日志：无法确认");
   }finally{polling=false;}
 }

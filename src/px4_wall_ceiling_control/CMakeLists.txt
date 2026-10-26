@@ -33,7 +33,6 @@ add_message_files(
   SupervisorState.msg
 )
 
-add_service_files(FILES SetRangeHeight.srv)
 
 generate_messages(
   DEPENDENCIES

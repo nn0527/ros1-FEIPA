@@ -16,6 +16,9 @@ LEGACY_PORTS = {"fcu_port": "/dev/ttyUSB0", "ceiling_port": "/dev/ttyUSB1", "fro
 
 def migrate_legacy_ports(values):
     """Upgrade this bench's old defaults; preserve explicit alternate layouts."""
+    if isinstance(values, dict):
+        values = dict(values)
+        values.pop("detach_range_manual_target_m", None)  # Retired saved setting.
     if isinstance(values, dict) and all(values.get(k) == v for k, v in LEGACY_PORTS.items()):
         return dict(values, **STABLE_PORTS)
     return values
@@ -24,7 +27,6 @@ def migrate_legacy_ports(values):
 DEFAULT_CONFIG = {
     **STABLE_PORTS, "baud": 230400,
     "hover_thrust": 0.49,
-    "detach_range_manual_target_m": 1.5,
     "test_profile": "flight",
 }
 LIMITS = {"state": 1.5, "odom": 0.5, "estimator": 1.5, "rc": 0.2,
@@ -53,9 +55,6 @@ def validate_config(values):
         raise ValueError("飞控波特率无效")
     if type(result["hover_thrust"]) not in (int, float) or not math.isfinite(result["hover_thrust"]) or not 0 < result["hover_thrust"] <= 0.85:
         raise ValueError("悬停推力需为 0 到 0.85 之间的标定值")
-    height = result["detach_range_manual_target_m"]
-    if type(height) not in (int, float) or not math.isfinite(height) or not .02 < height < 5.79:
-        raise ValueError("定高目标需在 0.02 到 5.79 米之间；控制节点还会核对实际测距工作范围")
     return result
 
 
@@ -64,7 +63,6 @@ def launch_arguments(config):
     return ["roslaunch", "px4_wall_ceiling_control", "wall_console_flight.launch",
             "ceiling_serial_port:=" + c["ceiling_port"], "front_serial_port:=" + c["front_port"],
             "hover_thrust:=" + str(c["hover_thrust"]),
-            "detach_range_manual_target_m:=" + str(c["detach_range_manual_target_m"]),
             "restrained_bench:=" + ("true" if c["test_profile"] == "restrained_bench" else "false")]
 
 
@@ -178,14 +176,6 @@ class ConsoleState:
                     val("operator", {}).get("mode") in (3, 5) and val("operator", {}).get("enabled")), "贴墙控制链路未就绪"),
             ]
             detach_blockers = [reason for ok, reason in detach_checks if not ok]
-            manual_height_blockers = []
-            if not (runtime.get("enabled") and kill_ok and flight.get("connected") and flight.get("armed")
-                    and flight.get("mode") == "OFFBOARD" and val("owner") == 2
-                    and status["setpoint"]["fresh"] and val("operator", {}).get("mode") == 3
-                    and val("operator", {}).get("enabled")):
-                manual_height_blockers.append("定高需要有效的侧吸OFFBOARD输出权限和急停反馈")
-            if not wall.get("detach_range_manual_available"):
-                manual_height_blockers.append(wall.get("detach_range_manual_block_reason") or "等待离墙测距控制就绪")
             if detach_pending:
                 detach_blockers.insert(0, "离墙请求已发送，等待节点反馈")
             if self.launch_error or self.starting:
@@ -243,8 +233,6 @@ class ConsoleState:
                     for i, label, ok, reason in checks], "blockers": blockers, "can_wall": not blockers and not self.starting,
                     "success": bool(success), "starting": self.starting, "pending": pending,
                     "can_detach": not detach_blockers, "detach_blockers": detach_blockers,
-                    "can_set_range_height": not manual_height_blockers,
-                    "set_range_height_blockers": manual_height_blockers,
                     "detach_pending": detach_pending,
                     "can_cancel_wait": bool(val("phase") == "WAITING_WALL" and val("owner") == 0
                         and flight.get("connected") and flight.get("mode") == runtime.get("wall_pilot_mode","ALTCTL")
