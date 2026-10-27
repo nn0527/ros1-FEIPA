@@ -15,7 +15,7 @@ from sensor_msgs.msg import Range, FluidPressure
 from std_msgs.msg import Bool
 
 from px4_wall_ceiling_control.adapters.odometry import vertical_speed_enu_mps, odometry_is_finite
-from px4_wall_ceiling_control.domain.geometry import euler_from_quaternion
+from px4_wall_ceiling_control.domain.geometry import euler_from_quaternion, rotate_vector
 from px4_wall_ceiling_control.domain.sample_hold import held_samples, record_hold_sample
 from px4_wall_ceiling_control.freshness import clamp, is_fresh, is_valid_range
 from px4_wall_ceiling_control.msg import (
@@ -224,6 +224,26 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
         self.last_reason = "initialized"
 
         self._init_ceiling_motion()
+        self.closed_loop_approach_enabled = bool(rospy.get_param('~closed_loop_approach_enabled', False))
+        self.approach_distance_kp = float(rospy.get_param('~approach_distance_kp', .5))
+        self.approach_max_duration_s = float(rospy.get_param('~approach_max_duration_s', 300.))
+        self.approach_max_ascent_m = float(rospy.get_param('~approach_max_ascent_m', 40.))
+        self.approach_range_loss_timeout_s = float(rospy.get_param('~approach_range_loss_timeout_s', 2.))
+        self.approach_budget_s = self.approach_timeout_s
+        self.approach_started_at = self.approach_start_z = self.approach_ascent_limit_m = None
+        self.approach_range_lost_at = None
+        self.contact_stable_since = self.contact_stable_last = self.contact_processed_sample = None
+        self.last_control_thrust = None
+        if (any(not math.isfinite(v) or v <= 0 for v in (
+                self.approach_distance_kp, self.approach_max_duration_s,
+                self.approach_max_ascent_m, self.approach_range_loss_timeout_s))
+                or (self.closed_loop_approach_enabled and (
+                    not self.console_contact_profile or not self.motion_enabled
+                    or not math.isfinite(self.approach_speed_mps) or self.approach_speed_mps <= 0
+                    or self.stable_time_s >= self.attach_control_timeout_s
+                    or self.approach_max_duration_s <= self.attach_control_timeout_s
+                    or self.wall_contact_distance_m <= self._compressed_target_distance()))):
+            raise ValueError('invalid ceiling closed-loop approach parameters')
 
         range_topic = rospy.get_param("~range_topic", "/sensor/ceiling/range")
         odom_topic = rospy.get_param(
@@ -300,6 +320,24 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
 
     def _attach_thrust(self, dt):
         """Increase ceiling pressure until the range reaches its stable band."""
+        if getattr(self, 'closed_loop_approach_enabled', False):
+            # Keep the arriving support command, then change pressure gradually.
+            upper = min(self.attach_max_thrust, self.max_thrust)
+            lower = min(self._surface_hold_thrust(), self.attach_entry_thrust)
+            thrust = clamp(self.attach_thrust_command, lower, upper)
+            if not self._range_fresh(rospy.Time.now()) or not self.motion_ready or self.motion_paused:
+                return thrust
+            error = self.range_message.range-self._compressed_target_distance()
+            step = self.attach_thrust_ramp_per_s*max(0., dt)
+            if error > self.stable_tolerance_m:
+                thrust = min(upper, thrust+step)
+            elif error < -self.stable_tolerance_m:
+                thrust = max(lower, thrust-step)
+            else:
+                target = self._surface_hold_thrust()
+                thrust += clamp(target-thrust, -step, step)
+            self.attach_thrust_command = thrust
+            return thrust
         lower = min(self._attach_base_thrust(), self._surface_hold_thrust())
         upper = min(self.attach_max_thrust, self.max_thrust)
         thrust = clamp(self.attach_thrust_command, lower, upper)
@@ -559,6 +597,18 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
             self.STATE_NAMES[new_state],
             reason,
         )
+        if getattr(self, 'closed_loop_approach_enabled', False) and new_state == CeilingAttachmentStatus.STATE_ATTACH_CONTROL:
+            arriving = self.last_control_thrust
+            output = self.motion_output
+            if (self.motion_owner == AttachmentControlCandidate.SOURCE_CEILING
+                    and is_fresh(self.motion_owner_at, .3, now)
+                    and output is not None and is_fresh(self.motion_output_at, .2, now)
+                    and is_fresh(output.header.stamp, .2, now)
+                    and math.isfinite(output.thrust) and .1 <= output.thrust <= self.max_thrust):
+                arriving = output.thrust
+            if arriving is None or not math.isfinite(arriving):
+                arriving = self.motion_controller.vertical_support or self.hover_thrust
+            self.attach_entry_thrust = clamp(arriving, self.detach_min_thrust, min(self.attach_max_thrust, self.max_thrust))
         self._motion_enter_state(new_state, now)
         self.state = new_state
         self.state_entered_at = now
@@ -596,6 +646,21 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
         self.stable_last_sample_at = None
         self.detach_clear_since = None
         self.detach_clear_last_sample_at = None
+        self.contact_stable_since = self.contact_stable_last = self.contact_processed_sample = None
+        if getattr(self, 'closed_loop_approach_enabled', False):
+            if new_state == CeilingAttachmentStatus.STATE_CEILING_ARMED:
+                distance = self._approach_vertical_distance(now)
+                self.approach_started_at = now
+                self.approach_start_z = self.odom.pose.pose.position.z
+                self.approach_ascent_limit_m = min(self.approach_max_ascent_m, distance+.30)
+                # A conservative mean climb rate allows low starts without removing the watchdog.
+                self.approach_budget_s = min(self.approach_max_duration_s, max(self.approach_timeout_s,
+                    distance/(.5*self.approach_speed_mps)+self.attach_control_timeout_s+5.))
+                self.approach_range_lost_at = None
+            elif new_state == CeilingAttachmentStatus.STATE_NORMAL_FLIGHT:
+                self.approach_started_at = self.approach_start_z = self.approach_ascent_limit_m = None
+                self.approach_range_lost_at = None
+                self.last_control_thrust = None
 
         if new_state in (
             CeilingAttachmentStatus.STATE_CEILING_ARMED,
@@ -612,7 +677,8 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
             self.mechanism_sequence += 1
             self.detach_failed = False
         elif new_state == CeilingAttachmentStatus.STATE_ATTACH_CONTROL:
-            self.attach_thrust_command = self._attach_base_thrust()
+            self.attach_thrust_command = (self.attach_entry_thrust if getattr(self, 'closed_loop_approach_enabled', False)
+                                          else self._attach_base_thrust())
         elif new_state in (
             CeilingAttachmentStatus.STATE_RECOVERY_HOVER,
             CeilingAttachmentStatus.STATE_ABORT,
@@ -649,8 +715,70 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
         return held_samples(fresh, since, last_sample_at, duration)
 
     def _activation_ready(self, now):
+        if getattr(self, 'closed_loop_approach_enabled', False):
+            return self._range_fresh(now)  # Any valid measured ceiling distance, not a 1 m gate.
         return (self._range_fresh(now)
                 and is_fresh(self.activation_sample_at, self.range_timeout_s, now))
+
+    def _approach_vertical_distance(self, now):
+        if not self._range_fresh(now) or self.range_message is None or self.odom is None:
+            return None
+        # Use the nearer raw/filtered range to avoid LPF lag while closing.
+        q = self.odom.pose.pose.orientation
+        up = rotate_vector((q.x, q.y, q.z, q.w), (0., 0., 1.))[2]
+        return max(0., min(self.range_message.range, self.distance_filtered_m)*clamp(up, 0., 1.))
+
+    def _closed_loop_approach_velocity(self, now):
+        distance = self._approach_vertical_distance(now)
+        if distance is None or not self.motion_ready or self.motion_paused:
+            return 0.
+        remaining = max(0., distance-self._compressed_target_distance())
+        braking = math.sqrt(2.*self.motion_settings.vertical_target_acceleration_mps2*remaining)
+        return min(self.approach_speed_mps, self.approach_distance_kp*remaining, braking)
+
+    def _closed_loop_approach_fault(self, now):
+        if not getattr(self, 'closed_loop_approach_enabled', False) or self.state not in (
+                CeilingAttachmentStatus.STATE_CEILING_ARMED, CeilingAttachmentStatus.STATE_APPROACH,
+                CeilingAttachmentStatus.STATE_ATTACH_CONTROL):
+            return ''
+        if self.approach_started_at is not None and (now-self.approach_started_at).to_sec() >= self.approach_budget_s:
+            return 'ceiling ascent total time budget exceeded'
+        if (self.approach_start_z is not None and self._odom_fresh(now)
+                and self.odom.pose.pose.position.z-self.approach_start_z > self.approach_ascent_limit_m):
+            return 'ceiling ascent travel limit exceeded'
+        if self._range_fresh(now):
+            self.approach_range_lost_at = None
+        else:
+            self.approach_range_lost_at = self.approach_range_lost_at or now
+            if (now-self.approach_range_lost_at).to_sec() >= self.approach_range_loss_timeout_s:
+                return 'ceiling range lost during closed-loop ascent'
+        return ''
+
+    def _closed_loop_contact_ready(self, now):
+        ready = (self._range_fresh(now) and self._odom_fresh(now)
+                 and self.motion_ready and not self.motion_paused and not self.motion_fatal
+                 and self._flight_ready(now))
+        if ready:
+            raw = self.range_message.range
+            vz = vertical_speed_enu_mps(self.odom, self.odom_twist_in_child_frame)
+            ready = (raw <= self.wall_contact_distance_m+1e-7
+                and abs(raw-self._compressed_target_distance()) <= self.stable_tolerance_m
+                and abs(self.distance_filtered_m-self._compressed_target_distance()) <= self.stable_tolerance_m
+                and math.isfinite(vz) and abs(vz) <= self.detach_settled_speed_mps
+                and self.motion_speed <= self.motion_settings.recovery_horizontal_speed_mps
+                and self.motion_tilt <= self.motion_settings.contact_max_tilt_deg
+                and self.motion_rate <= self.motion_settings.recovery_max_rate_deg_s
+                and abs(self.attach_thrust_command-self._surface_hold_thrust()) <= .005)
+        if not ready:
+            self.contact_stable_since = self.contact_stable_last = None
+            return False
+        # Both range and odometry must advance; repeated timer ticks cannot confirm contact.
+        sample = min(self.range_received_at, self.odom_received_at)
+        if sample != self.contact_processed_sample:
+            self.contact_processed_sample = sample
+            self.contact_stable_since, self.contact_stable_last = self._record_hold_sample(
+                True, sample, self.contact_stable_since)
+        return self._held_samples(True, self.contact_stable_since, self.contact_stable_last, self.stable_time_s)
 
     def _height_feedback(self, now):
         if self._fused_height_enabled():
@@ -746,6 +874,12 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
                     self.fault_count += 1
                     self._enter_state(CeilingAttachmentStatus.STATE_ABORT, now, fault)
                     return
+        ascent_fault = self._closed_loop_approach_fault(now)
+        if ascent_fault:
+            self.fault_count += 1
+            self.approach_timed_out = 'time budget' in ascent_fault
+            self._enter_state(CeilingAttachmentStatus.STATE_ABORT, now, ascent_fault)
+            return
         # A normal detach/cancel accepted on this tick has priority. Once DETACH
         # starts its own timeout/recovery applies, never the HOLD watchdog.
         if (self.state == CeilingAttachmentStatus.STATE_SURFACE_HOLD
@@ -889,7 +1023,8 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
                     now,
                     "approach input timeout",
                 )
-            elif self._state_age_s(now) > self.approach_timeout_s:
+            elif self._state_age_s(now) > (self.approach_budget_s if getattr(self, 'closed_loop_approach_enabled', False)
+                                          else self.approach_timeout_s):
                 self.fault_count += 1
                 self.approach_timed_out = True
                 self._enter_state(
@@ -898,10 +1033,16 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
                     "approach timeout; ABORT safety handover",
                 )
             elif (profile and self._attach_confirmed(now)
-                  and (not getattr(self, "motion_enabled", False) or (self.motion_ready and not self.motion_paused))):
+                  and (not getattr(self, "motion_enabled", False) or (self.motion_ready and not self.motion_paused))
+                  and (not getattr(self, 'closed_loop_approach_enabled', False) or (
+                      self.range_message.range <= self.wall_contact_distance_m+1e-7
+                      and abs(vertical_speed_enu_mps(self.odom, self.odom_twist_in_child_frame)) <= self.detach_settled_speed_mps
+                      and self.motion_tilt <= self.motion_settings.contact_max_tilt_deg))):
                 self._enter_state(
-                    CeilingAttachmentStatus.STATE_SURFACE_HOLD, now,
-                    "single ceiling range frame at or below hold threshold",
+                    (CeilingAttachmentStatus.STATE_ATTACH_CONTROL if getattr(self, 'closed_loop_approach_enabled', False)
+                     else CeilingAttachmentStatus.STATE_SURFACE_HOLD), now,
+                    ("ceiling contact reached; confirm stable contact" if getattr(self, 'closed_loop_approach_enabled', False)
+                     else "single ceiling range frame at or below hold threshold"),
                 )
             elif (
                 not profile
@@ -920,10 +1061,13 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
             confirmed = self._attach_confirmed(now)
             stable = self._distance_stable(now)
             time_ready = self._state_age_s(now) >= self.attach_control_time_s
-            if (
-                confirmed if getattr(self, "console_contact_profile", False) else
-                time_ready and stable and (confirmed or not self.require_attach_confirmation)
-            ):
+            if getattr(self, 'closed_loop_approach_enabled', False):
+                attachment_ready = time_ready and self._closed_loop_contact_ready(now)
+            elif getattr(self, 'console_contact_profile', False):
+                attachment_ready = confirmed
+            else:
+                attachment_ready = time_ready and stable and (confirmed or not self.require_attach_confirmation)
+            if attachment_ready:
                 self._enter_state(
                     CeilingAttachmentStatus.STATE_SURFACE_HOLD,
                     now,
@@ -1179,10 +1323,12 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
             status.approach_velocity_z_enu_mps = (
                 0.0
                 if self._state_age_s(now) < self.approach_settle_time_s or not status.range_fresh
-                else abs(self.approach_speed_mps)
+                else (self._closed_loop_approach_velocity(now) if getattr(self, 'closed_loop_approach_enabled', False)
+                      else abs(self.approach_speed_mps))
             )
         elif self.state == CeilingAttachmentStatus.STATE_ATTACH_CONTROL:
-            status.thrust_body_z_normalized = -self._attach_thrust(dt) if status.range_fresh else -self.hover_thrust
+            status.thrust_body_z_normalized = (-self._attach_thrust(dt)
+                if status.range_fresh or getattr(self, 'closed_loop_approach_enabled', False) else -self.hover_thrust)
             status.attitude_setpoint_valid = True
             status.attitude_setpoint = self.q_hover
         elif self.state == CeilingAttachmentStatus.STATE_SURFACE_HOLD:
@@ -1321,6 +1467,8 @@ class CeilingAttachmentDecisionNode(CeilingMotionMixin):
         self._prepare_ceiling_motion(now)
         self._update_state_machine(now)
         status = self._build_status(now, dt)
+        if status.attitude_setpoint_valid and math.isfinite(status.thrust_body_z_normalized):
+            self.last_control_thrust = -status.thrust_body_z_normalized
         self.status_publisher.publish(status)
         self.control_candidate_publisher.publish(
             self._build_control_candidate(status)

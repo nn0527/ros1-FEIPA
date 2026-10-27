@@ -567,6 +567,8 @@ class CeilingMotionMixin:
                 desired_vz = 0.
         if self.motion_paused or not self.motion_ready or self.motion_fatal or self.state == S.STATE_ABORT:
             desired_vz = 0.
+        if getattr(self, 'closed_loop_approach_enabled', False) and self.state in (S.STATE_ATTACH_CONTROL, S.STATE_SURFACE_HOLD):
+            controller.vz_target = 0.  # Contact pressure control must not keep integrating an ascent target.
         target_vz = controller.vertical_target(desired_vz, dt)
         self.motion_last_target_vz = target_vz
         status.target_vertical_speed_mps = target_vz

@@ -58,7 +58,7 @@ ceiling_attachment_decision_node:
   # 5. 靠近阶段
   # 进入 APPROACH 后先等待 approach_settle_time_s，再以固定速度向上靠近。
   # 超过 approach_timeout_s 未接触则锁存 FAULT，由模式管理器交回 POSCTL。
-  # 控制台分支单帧顶距达到 wall_contact_distance_m 后直接进入保持。
+  # 控制台闭环分支达到 wall_contact_distance_m 后进入接触确认，稳定后保持。
   # ===========================================================================
   approach_settle_time_s: 0.50
   approach_speed_mps: 0.15
@@ -66,7 +66,8 @@ ceiling_attachment_decision_node:
 
   # ===========================================================================
   # 6. 接触确认与稳定判定
-  # 控制台分支：单帧有效原始顶距 <= 0.067m，直接进入 SURFACE_HOLD。
+  # 控制台闭环分支：原始顶距 <= 0.067m，低速进入 ATTACH_CONTROL；
+  # 原始/滤波距离、速度、姿态及支撑推力连续稳定后才进入 SURFACE_HOLD。
   # 普通分支：压缩量 >= attach_confirm_compression_m，并持续 attach_confirm_time_s。
   # ===========================================================================
   wall_contact_distance_m: 0.067
@@ -178,3 +179,12 @@ ceiling_attachment_decision_node:
   contact_release_hold_s: 0.2
   odom_position_jump_m: 0.75
   odom_yaw_jump_deg: 20.0
+
+  # Closed-loop console ascent: enabled by wall_console_flight.launch.
+  # Legacy/bench launches retain their previous profile by default.
+  # A valid measured ceiling is required; activation_distance_m is not used in this profile.
+  closed_loop_approach_enabled: false
+  approach_distance_kp: 0.50
+  approach_max_duration_s: 300.0
+  approach_max_ascent_m: 40.0
+  approach_range_loss_timeout_s: 2.0

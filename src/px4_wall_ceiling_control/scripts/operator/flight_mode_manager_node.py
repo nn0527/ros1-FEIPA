@@ -572,7 +572,7 @@ class FlightModeManagerNode(RCTakeoverManager):
         if self.ceiling is None or not is_fresh(self.ceiling_at,self.status_timeout_s,now):
             return "吸顶请求已接收：等待新鲜吸顶状态；仍由飞手控制POSCTL"
         if not self.ceiling.activation_ready:
-            return "吸顶请求已接收：等待一帧有效顶距≤1m；仍由飞手控制POSCTL"
+            return "吸顶请求已接收：等待有效顶部测距及距离准入；仍由飞手控制POSCTL"
         if self.odom is None or not is_fresh(self.odom_at,self.odom_timeout_s,now) or not odometry_is_finite(self.odom):
             return "吸顶请求已接收：等待新鲜有效里程计；仍由飞手控制POSCTL"
         return "吸顶请求已接收：等待有效竖直速度估计；仍由飞手控制POSCTL"

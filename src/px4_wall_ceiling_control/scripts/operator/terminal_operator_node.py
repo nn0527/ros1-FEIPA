@@ -112,7 +112,7 @@ class TerminalOperatorNode:
             else:
                 self._apply_command(String(data=command))
                 accepted = self.mode == (OperatorCommand.MODE_CEILING if command == "ceiling" else OperatorCommand.MODE_INCLINE)
-                reason = (("斜墙请求已接收：等待50cm接近准入" if command == "incline" else "吸顶节点已接收：等待单帧有效顶距≤1m及接管条件") if accepted else "节点安全条件或斜墙配置不满足")
+                reason = (("斜墙请求已接收：等待50cm接近准入" if command == "incline" else "吸顶节点已接收：等待有效顶部测距、稳定反馈及接管条件") if accepted else "节点安全条件或斜墙配置不满足")
                 if accepted:
                     self._publish_intent()  # Confirmed intent is sent immediately, not on the next timer tick.
             reply = {"id":request_id,"command":command,"accepted":accepted,"reason":reason,
